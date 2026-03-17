@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   quality:
     runs-on: ubuntu-latest
@@ -30,3 +33,69 @@ jobs:
 
       - name: Test
         run: pytest --cov=src/flight_layover_lab --cov-report=term-missing --cov-report=xml
+
+      - name: Upload coverage report
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: error
+
+  publish-coverage-badge:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: quality
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download coverage report
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-xml
+          path: .artifacts
+
+      - name: Generate coverage badge payload
+        run: python scripts/generate_coverage_badge.py .artifacts/coverage.xml .artifacts/coverage-badge.json
+
+      - name: Publish badge branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git ls-remote --exit-code origin badges >/dev/null 2>&1; then
+            git fetch origin badges
+            git worktree add -B badges .badge-worktree origin/badges
+          else
+            git worktree add --detach .badge-worktree
+            cd .badge-worktree
+            git switch --orphan badges
+            find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+            cd ..
+          fi
+
+          cd .badge-worktree
+          mkdir -p .github/badges
+          cp ../.artifacts/coverage-badge.json .github/badges/coverage-badge.json
+          touch .nojekyll
+          git add .github/badges/coverage-badge.json .nojekyll
+          if git diff --cached --quiet; then
+            echo "Coverage badge unchanged."
+            exit 0
+          fi
+
+          git commit -m "Update coverage badge data"
+          git push origin HEAD:badges
