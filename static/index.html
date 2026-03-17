@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>FlightFinder Engine</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700;800&family=Space+Grotesk:wght@500;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/styles.css?v=20260315-1" />
+  </head>
+  <body>
+    <main class="page">
+      <section class="hero">
+        <p class="eyebrow">FlightFinder Engine</p>
+        <h1>Find the best flight strategy: direct, layover, or city stopover</h1>
+        <p class="subtitle">
+          Search split-ticket and round-trip routes across multiple destinations. Compare
+          Best, Cheapest, and Fastest outcomes with optional exhaustive hub scanning.
+        </p>
+      </section>
+
+      <section class="panel">
+        <form id="search-form" class="form-grid" autocomplete="off">
+          <label>
+            Origins (IATA, comma-separated)
+            <input id="origins" value="OTP" />
+          </label>
+
+          <label class="full-row">
+            Destinations (IATA, comma-separated)
+            <input id="destinations" value="MLE,SEZ,PUJ,CUN,DPS,HKT,MRU,ZNZ" />
+          </label>
+
+          <div class="chips-wrap full-row">
+            <p class="chips-title">Quick beach presets</p>
+            <div id="destination-chips" class="chips"></div>
+          </div>
+
+          <label>
+            Search period start
+            <input id="period-start" type="date" />
+          </label>
+
+          <label>
+            Search period end
+            <input id="period-end" type="date" />
+          </label>
+
+          <label>
+            Currency
+            <select id="currency">
+              <option value="RON" selected>RON (lei)</option>
+              <option value="EUR">EUR</option>
+              <option value="USD">USD</option>
+            </select>
+          </label>
+
+          <label>
+            Main destination stay: min days
+            <input id="min-stay" type="number" min="1" max="30" value="6" />
+          </label>
+
+          <label>
+            Main destination stay: max days
+            <input id="max-stay" type="number" min="1" max="30" value="8" />
+          </label>
+
+          <label>
+            Stopover stay: min days (set 1+ to force >24h stopovers)
+            <input id="min-stopover" type="number" min="0" max="10" value="0" />
+          </label>
+
+          <label>
+            Stopover stay: max days
+            <input id="max-stopover" type="number" min="0" max="10" value="5" />
+          </label>
+
+          <label>
+            Max connection layover (hours, 0 = no cap)
+            <small class="field-help"
+              >Applies to regular connections inside each booked leg, plus split boundaries when
+              stopover days are 0.</small
+            >
+            <input id="max-connection-layover-hours" type="number" min="0" max="240" value="0" />
+          </label>
+
+          <label>
+            <span class="label-line">
+              Max transfers per direction (stops + layovers)
+              <span
+                class="info-dot"
+                tabindex="0"
+                data-tip="Single transfer cap per direction, counting both in-ticket stops and split-leg boundaries. Example OTP->AMM then AMM->MLE via AUH counts as 2 transfers."
+                >i</span
+              >
+            </span>
+            <input id="max-transfers-direction" type="number" min="0" max="6" value="2" />
+          </label>
+
+          <label>
+            Adults
+            <input id="adults" type="number" min="1" max="9" value="1" />
+          </label>
+
+          <label>
+            Cabin bags per adult
+            <input id="hand-bags" type="number" min="0" max="3" value="1" />
+          </label>
+
+          <label>
+            Hold bags per adult
+            <input id="hold-bags" type="number" min="0" max="3" value="0" />
+          </label>
+
+          <label>
+            Market compare: also fetch Kiwi base no-bag fares (comparison only)
+            <input id="market-compare-fares" type="checkbox" />
+          </label>
+
+          <label>
+            Rank by
+            <select id="objective">
+              <option value="best" selected>Best (balanced price + time)</option>
+              <option value="cheapest">Cheapest (lowest total price)</option>
+              <option value="fastest">Fastest (shortest time to destination)</option>
+              <option value="price_per_km">Advanced: best price / 1000 km</option>
+            </select>
+          </label>
+
+          <label>
+            Top results
+            <input id="top-results" type="number" min="1" max="100" value="20" />
+          </label>
+
+          <label>
+            Validate top candidates / destination
+            <input id="validate-top" type="number" min="10" max="500" value="140" />
+          </label>
+
+          <details class="full-row advanced">
+            <summary>Advanced: auto-hub and performance tuning</summary>
+            <div class="advanced-grid">
+              <label>
+                Auto hubs picked per direction
+                <input id="auto-hubs" type="number" min="1" max="96" value="10" />
+              </label>
+              <label>
+                Exhaustive hub scan (slower, checks all hub candidates)
+                <input id="exhaustive-hubs" type="checkbox" />
+              </label>
+              <label>
+                Hub candidate pool (optional IATA list)
+                <input
+                  id="hub-candidates"
+                  value=""
+                  placeholder="Loaded from server auto-hub preset (editable)"
+                />
+              </label>
+              <div class="provider-select">
+                <span class="label-line">
+                  Providers
+                  <span
+                    class="info-dot"
+                    tabindex="0"
+                    data-tip="Free providers are selectable with checkboxes. API-key providers stay optional and only become active once keys are configured."
+                    >i</span
+                  >
+                </span>
+                <small class="field-help"
+                  >Free providers are preselected by default. Paid providers stay available below once you add runtime keys.</small
+                >
+                <input id="providers" type="hidden" value="" />
+                <div id="providers-picker" class="providers-picker"></div>
+                <div id="providers-status" class="providers-status"></div>
+              </div>
+              <div class="provider-keys">
+                <p class="provider-keys-title">Provider API keys (local session only)</p>
+                <div class="provider-keys-grid">
+                  <label>
+                    Amadeus client id
+                    <input id="amadeus-client-id" type="password" autocomplete="off" />
+                  </label>
+                  <label>
+                    Amadeus client secret
+                    <input id="amadeus-client-secret" type="password" autocomplete="off" />
+                  </label>
+                  <label>
+                    SerpApi API key
+                    <input id="serpapi-api-key" type="password" autocomplete="off" />
+                  </label>
+                  <label>
+                    SerpApi return scan limit (1-5)
+                    <input id="serpapi-return-scan-limit" type="number" min="1" max="5" value="2" />
+                  </label>
+                </div>
+                <div class="provider-keys-actions">
+                  <button type="button" id="apply-provider-keys">Apply provider keys</button>
+                  <button type="button" id="apply-budget-preset">Apply budget-aware preset</button>
+                  <span id="provider-keys-status" class="field-help"></span>
+                  <span id="budget-preset-status" class="field-help"></span>
+                </div>
+              </div>
+	              <label>
+	                IO workers
+	                <small class="field-help"
+	                  >Parallel network requests (calendar + fares). Higher is faster but can hit rate
+	                  limits.</small
+	                >
+	                <input id="io-workers" type="number" min="4" max="96" value="20" />
+	              </label>
+	              <label>
+	                Candidate pool multiplier
+	                <small class="field-help"
+	                  >How many estimated routes are kept per destination before live validation. Higher improves
+	                  coverage but increases runtime.</small
+                >
+                <input id="pool-multiplier" type="number" min="2" max="50" value="8" />
+              </label>
+              <label>
+                Calendar hubs prefetch (API guardrail, 0 = all hubs)
+                <small class="field-help"
+                  >Limits how many hub airports are queried in the calendar stage before live
+                  pricing.</small
+                >
+                <input id="calendar-hubs-prefetch" type="number" min="0" max="96" value="0" />
+              </label>
+              <label>
+                Max validated one-way keys / destination (0 = no cap)
+                <small class="field-help"
+                  >Hard cap for live one-way fare lookups per destination.</small
+                >
+                <input id="max-validate-oneway-keys" type="number" min="0" max="2000" value="0" />
+              </label>
+              <label>
+                Max validated return keys / destination (0 = no cap)
+                <small class="field-help"
+                  >Hard cap for live round-trip fare lookups per destination.</small
+                >
+                <input id="max-validate-return-keys" type="number" min="0" max="800" value="0" />
+              </label>
+              <label>
+                Max provider API calls / search (0 = no cap)
+                <small class="field-help"
+                  >Global cap for paid providers (Amadeus + SerpApi). Kiwi has its own separate cap.</small
+                >
+                <input id="max-total-provider-calls" type="number" min="0" max="50000" value="145" />
+              </label>
+              <label>
+                Max Kiwi calls / search (0 = no cap)
+                <input id="max-calls-kiwi" type="number" min="0" max="50000" value="0" />
+              </label>
+              <label>
+                Max Amadeus calls / search (0 = no cap)
+                <input id="max-calls-amadeus" type="number" min="0" max="50000" value="120" />
+              </label>
+              <label>
+                Max SerpApi calls / search (0 = no cap)
+                <input id="max-calls-serpapi" type="number" min="0" max="50000" value="25" />
+              </label>
+              <label>
+                SerpApi probe one-way keys
+                <small class="field-help"
+                  >Only these top-ranked one-way keys are also checked on SerpApi.</small
+                >
+                <input id="serpapi-probe-oneway-keys" type="number" min="0" max="5000" value="80" />
+              </label>
+              <label>
+                SerpApi probe return keys
+                <small class="field-help"
+                  >Only these top-ranked return keys are also checked on SerpApi.</small
+                >
+                <input id="serpapi-probe-return-keys" type="number" min="0" max="1000" value="16" />
+              </label>
+            </div>
+          </details>
+
+          <div class="actions full-row">
+            <button id="search-button" type="submit">Search Flights</button>
+            <button id="export-button" type="button" disabled>Export Last Search (JSON)</button>
+            <button id="export-pdf-button" type="button" disabled>Export Report (PDF)</button>
+            <p class="hint">
+              Split-ticket mode: prices can be lower, but missed-connection and baggage-transfer
+              risks apply.
+            </p>
+          </div>
+        </form>
+      </section>
+
+      <section class="panel results-panel">
+        <div id="status" class="status">Ready.</div>
+        <div id="progress-panel" class="progress-panel" hidden>
+          <div class="progress-head">
+            <p id="progress-meta" class="progress-meta">0% complete.</p>
+            <p id="progress-phase" class="progress-phase">Waiting to start.</p>
+          </div>
+          <div class="progress-bar">
+            <div id="progress-bar-fill" class="progress-bar-fill"></div>
+          </div>
+          <div id="progress-log" class="progress-log"></div>
+        </div>
+        <div id="summary" class="summary"></div>
+        <div id="results" class="results"></div>
+      </section>
+    </main>
+
+    <template id="result-card-template">
+      <article class="result-card">
+        <div class="result-head">
+          <div>
+            <h3 class="result-destination"></h3>
+            <p class="result-note"></p>
+          </div>
+          <div class="result-pricing">
+            <p class="result-total"></p>
+            <p class="result-score"></p>
+          </div>
+        </div>
+
+        <div class="route-meta"></div>
+
+        <div class="legs"></div>
+
+        <ul class="risk-list"></ul>
+      </article>
+    </template>
+
+    <template id="leg-template">
+      <div class="leg">
+        <div class="leg-top">
+          <p class="leg-title"></p>
+          <p class="leg-price"></p>
+        </div>
+        <p class="leg-meta"></p>
+        <p class="leg-segments"></p>
+        <a class="leg-link" target="_blank" rel="noopener noreferrer">Open on Kiwi</a>
+      </div>
+    </template>
+
+    <script src="/app.js?v=20260315-1" defer></script>
+  </body>
+</html>
