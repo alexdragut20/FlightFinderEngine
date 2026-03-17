@@ -10,8 +10,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import requests
 
-from .airports import AirportCoordinates
-from .config import (
+from ..config import (
     ALLOW_PLAYWRIGHT_PROVIDERS,
     AUTO_HUB_CANDIDATES,
     DEFAULT_IO_WORKERS,
@@ -19,29 +18,60 @@ from .config import (
     DESTINATION_NOTES,
     SKYSCANNER_SCRAPE_PLAYWRIGHT_FALLBACK,
 )
-from .engine import SplitTripOptimizer
-from .logging_utils import log_event
-from .providers import KiwiClient
-from .resources import STATIC_DIR
+from ..data.airports import AirportCoordinates
+from ..data.resources import STATIC_DIR
+from ..engine import SplitTripOptimizer
+from ..providers import KiwiClient
+from ..utils.constants import (
+    API_PROVIDER_CONFIG_PATH,
+    API_SEARCH_JOBS_PATH,
+    API_SEARCH_PATH,
+    DEFAULT_SERVER_HOST,
+    DEFAULT_SERVER_PORT,
+    ERROR_INVALID_JSON_BODY,
+    ERROR_UNKNOWN_ENDPOINT,
+    ERROR_UNKNOWN_SEARCH_JOB,
+    HTTP_CACHE_CONTROL_NO_STORE,
+    HTTP_EXPIRES_IMMEDIATELY,
+    HTTP_PRAGMA_NO_CACHE,
+    ROOT_INDEX_PATH,
+    SERVER_READY_URL_TEMPLATE,
+)
+from ..utils.logging import log_event
 from .search_jobs import SearchJobCapacityError, SearchJobStore
 
 
 class AppHandler(SimpleHTTPRequestHandler):
+    """HTTP request handler for the local FlightFinder web server."""
+
     optimizer = SplitTripOptimizer(KiwiClient(), AirportCoordinates())
     job_store = SearchJobStore()
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """Initialize the AppHandler.
+
+        Args:
+            args: Positional arguments forwarded to the underlying implementation.
+            kwargs: Keyword arguments forwarded to the underlying implementation.
+        """
         super().__init__(*args, directory=str(STATIC_DIR), **kwargs)
 
     def end_headers(self) -> None:
         # Local app assets should always refresh so frontend changes do not
         # leave the browser running stale cached JS or CSS.
-        self.send_header("Cache-Control", "no-store, max-age=0, must-revalidate")
-        self.send_header("Pragma", "no-cache")
-        self.send_header("Expires", "0")
+        """Send the final HTTP response headers."""
+        self.send_header("Cache-Control", HTTP_CACHE_CONTROL_NO_STORE)
+        self.send_header("Pragma", HTTP_PRAGMA_NO_CACHE)
+        self.send_header("Expires", HTTP_EXPIRES_IMMEDIATELY)
         super().end_headers()
 
     def _send_json(self, status: int, payload: dict[str, Any]) -> None:
+        """Send a JSON response payload.
+
+        Args:
+            status: HTTP status code to send.
+            payload: JSON-serializable payload for the operation.
+        """
         data = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -50,16 +80,17 @@ class AppHandler(SimpleHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self) -> None:
+        """Handle HTTP GET requests."""
         split = urlsplit(self.path)
         path = split.path
         query = parse_qs(split.query)
-        if path.startswith("/api/search-jobs/"):
+        if path.startswith(f"{API_SEARCH_JOBS_PATH}/"):
             job_id = path.rsplit("/", 1)[-1].strip()
             job = self.job_store.get_job(job_id)
             if job is None:
                 self._send_json(
                     HTTPStatus.NOT_FOUND,
-                    {"error": "Unknown search job"},
+                    {"error": ERROR_UNKNOWN_SEARCH_JOB},
                 )
                 return
             raw_since_event_index = (query.get("since_event_index") or [None])[0]
@@ -97,7 +128,7 @@ class AppHandler(SimpleHTTPRequestHandler):
             )
             return
 
-        if path == "/api/provider-config":
+        if path == API_PROVIDER_CONFIG_PATH:
             self._send_json(
                 HTTPStatus.OK,
                 {
@@ -109,15 +140,16 @@ class AppHandler(SimpleHTTPRequestHandler):
             return
 
         if path == "/":
-            self.path = "/index.html"
+            self.path = ROOT_INDEX_PATH
         return super().do_GET()
 
     def do_POST(self) -> None:
+        """Handle HTTP POST requests."""
         path = self.path.split("?", 1)[0]
-        if path not in {"/api/search", "/api/provider-config", "/api/search-jobs"}:
+        if path not in {API_SEARCH_PATH, API_PROVIDER_CONFIG_PATH, API_SEARCH_JOBS_PATH}:
             self._send_json(
                 HTTPStatus.NOT_FOUND,
-                {"error": "Unknown endpoint"},
+                {"error": ERROR_UNKNOWN_ENDPOINT},
             )
             return
 
@@ -128,11 +160,11 @@ class AppHandler(SimpleHTTPRequestHandler):
         except Exception:
             self._send_json(
                 HTTPStatus.BAD_REQUEST,
-                {"error": "Invalid JSON body"},
+                {"error": ERROR_INVALID_JSON_BODY},
             )
             return
 
-        if path == "/api/provider-config":
+        if path == API_PROVIDER_CONFIG_PATH:
             try:
                 self.optimizer.update_runtime_provider_secrets(
                     payload if isinstance(payload, dict) else {}
@@ -150,7 +182,7 @@ class AppHandler(SimpleHTTPRequestHandler):
             )
             return
 
-        if path == "/api/search-jobs":
+        if path == API_SEARCH_JOBS_PATH:
             log_event(
                 logging.INFO,
                 "http_search_job_request",
@@ -209,8 +241,9 @@ class AppHandler(SimpleHTTPRequestHandler):
 
 
 def run_server() -> None:
-    host = os.getenv("HOST", "127.0.0.1")
-    port = int(os.getenv("PORT", "8000"))
+    """Start the local FlightFinder web server."""
+    host = os.getenv("HOST", DEFAULT_SERVER_HOST)
+    port = int(os.getenv("PORT", str(DEFAULT_SERVER_PORT)))
     log_event(
         logging.INFO,
         "server_starting",
@@ -222,7 +255,7 @@ def run_server() -> None:
         default_io_workers=DEFAULT_IO_WORKERS,
     )
     server = ThreadingHTTPServer((host, port), AppHandler)
-    print(f"FlightFinder Engine running at http://{host}:{port}")
+    print(SERVER_READY_URL_TEMPLATE.format(host=host, port=port))
     try:
         server.serve_forever()
     except KeyboardInterrupt:

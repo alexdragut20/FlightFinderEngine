@@ -10,17 +10,19 @@ import requests
 
 from ..config import AMADEUS_BASE_URL, AMADEUS_FLIGHT_OFFERS_MAX
 from ..exceptions import ProviderNoResultError
-from ..logging_utils import capture_provider_response as _capture_provider_response
 from ..utils import (
     date_only,
     max_segment_layover_seconds,
     parse_iso8601_duration_seconds,
     transfer_events_from_segments,
 )
+from ..utils.logging import capture_provider_response as _capture_provider_response
 from ._cache import per_instance_lru_cache
 
 
 class AmadeusClient:
+    """Provider client for the Amadeus Self-Service APIs."""
+
     provider_id = "amadeus"
     display_name = "Amadeus Self-Service"
     supports_calendar = True
@@ -47,6 +49,13 @@ class AmadeusClient:
         client_secret: str | None = None,
         base_url: str | None = None,
     ) -> None:
+        """Initialize the AmadeusClient.
+
+        Args:
+            client_id: Identifier for client.
+            client_secret: Client secret used for provider authentication.
+            base_url: URL for base.
+        """
         self._client_id = (
             client_id if client_id is not None else os.getenv("AMADEUS_CLIENT_ID") or ""
         ).strip()
@@ -60,14 +69,29 @@ class AmadeusClient:
         self._token_expires_at = 0.0
 
     def is_configured(self) -> bool:
+        """Return whether the client is configured for use.
+
+        Returns:
+            bool: True when the client is configured for use; otherwise, False.
+        """
         return bool(self._client_id and self._client_secret)
 
     def _session(self) -> requests.Session:
+        """Return the cached requests session.
+
+        Returns:
+            requests.Session: The cached requests session.
+        """
         if not hasattr(self._local, "session"):
             self._local.session = requests.Session()
         return self._local.session
 
     def _fetch_token(self) -> str:
+        """Fetch and cache an access token for the provider.
+
+        Returns:
+            str: And cache an access token for the provider.
+        """
         if not self.is_configured():
             raise RuntimeError("Amadeus credentials are missing")
 
@@ -97,6 +121,14 @@ class AmadeusClient:
 
     @staticmethod
     def _safe_json(response: requests.Response) -> dict[str, Any]:
+        """Safely decode a JSON response payload.
+
+        Args:
+            response: HTTP response object to inspect.
+
+        Returns:
+            dict[str, Any]: Safely decode a JSON response payload.
+        """
         try:
             payload = response.json()
         except ValueError:
@@ -105,6 +137,14 @@ class AmadeusClient:
 
     @classmethod
     def _error_detail(cls, payload: dict[str, Any]) -> str:
+        """Extract a human-readable error detail from the provider response.
+
+        Args:
+            payload: JSON-serializable payload for the operation.
+
+        Returns:
+            str: Extract a human-readable error detail from the provider response.
+        """
         errors = payload.get("errors")
         if not isinstance(errors, list) or not errors:
             return ""
@@ -119,6 +159,15 @@ class AmadeusClient:
 
     @classmethod
     def _is_no_result_error(cls, status_code: int, detail: str) -> bool:
+        """Return whether the provider error represents an empty-result case.
+
+        Args:
+            status_code: HTTP status code for the response.
+            detail: Human-readable detail message for the current phase.
+
+        Returns:
+            bool: True when the provider error represents an empty-result case; otherwise, False.
+        """
         if status_code not in {400, 404, 422}:
             return False
         lowered = str(detail or "").strip().lower()
@@ -127,6 +176,15 @@ class AmadeusClient:
         return any(marker in lowered for marker in cls._NO_RESULT_MARKERS)
 
     def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Send a GET request to the provider.
+
+        Args:
+            path: Filesystem or request path to inspect.
+            params: Request parameters to send to the provider.
+
+        Returns:
+            dict[str, Any]: Result of sending GET request to the provider.
+        """
         max_attempts = 3
         for attempt in range(max_attempts):
             token = self._fetch_token()
@@ -212,6 +270,14 @@ class AmadeusClient:
 
     @staticmethod
     def _amount_to_int(value: Any) -> int | None:
+        """Convert a provider amount into an integer price.
+
+        Args:
+            value: Input value to process.
+
+        Returns:
+            int | None: Converted provider amount into an integer price.
+        """
         if value in (None, ""):
             return None
         try:
@@ -221,12 +287,29 @@ class AmadeusClient:
 
     @staticmethod
     def _format_price(amount: int | None, currency: str) -> str | None:
+        """Build the normalized price payload.
+
+        Args:
+            amount: Numeric amount to convert or format.
+            currency: Currency code for pricing output.
+
+        Returns:
+            str | None: The normalized price payload.
+        """
         if amount is None:
             return None
         return f"{amount} {currency}"
 
     @staticmethod
     def _parse_segments(itinerary: dict[str, Any] | None) -> list[dict[str, Any]]:
+        """Parse provider segments into normalized segment records.
+
+        Args:
+            itinerary: Mapping of itinerary.
+
+        Returns:
+            list[dict[str, Any]]: Parsed provider segments into normalized segment records.
+        """
         parsed: list[dict[str, Any]] = []
         for segment in (itinerary or {}).get("segments") or []:
             departure = segment.get("departure") or {}
@@ -248,6 +331,14 @@ class AmadeusClient:
 
     @staticmethod
     def _duration_seconds(itinerary: dict[str, Any] | None) -> int | None:
+        """Calculate the itinerary duration in seconds.
+
+        Args:
+            itinerary: Mapping of itinerary.
+
+        Returns:
+            int | None: Calculated itinerary duration in seconds.
+        """
         return parse_iso8601_duration_seconds((itinerary or {}).get("duration"))
 
     @per_instance_lru_cache(maxsize=16384)
@@ -263,6 +354,22 @@ class AmadeusClient:
         hand_bags: int,
         hold_bags: int,
     ) -> dict[str, int]:
+        """Fetch calendar prices for the requested market.
+
+        Args:
+            source: Origin airport code for the request.
+            destination: Destination airport code for the request.
+            date_start_iso: Start date in ISO 8601 format.
+            date_end_iso: End date in ISO 8601 format.
+            currency: Currency code for pricing output.
+            max_stops_per_leg: Max stops per leg.
+            adults: Number of adult travelers.
+            hand_bags: Number of cabin bags per adult traveler.
+            hold_bags: Number of checked bags per adult traveler.
+
+        Returns:
+            dict[str, int]: Calendar prices for the requested market.
+        """
         if not self.is_configured():
             return {}
         source_code = source.upper()
@@ -305,6 +412,22 @@ class AmadeusClient:
         hold_bags: int,
         max_connection_layover_seconds: int | None = None,
     ) -> dict[str, Any] | None:
+        """Fetch the best one-way itinerary for the requested market.
+
+        Args:
+            source: Origin airport code for the request.
+            destination: Destination airport code for the request.
+            departure_iso: Departure date in ISO 8601 format.
+            currency: Currency code for pricing output.
+            max_stops_per_leg: Max stops per leg.
+            adults: Number of adult travelers.
+            hand_bags: Number of cabin bags per adult traveler.
+            hold_bags: Number of checked bags per adult traveler.
+            max_connection_layover_seconds: Duration in seconds for max connection layover.
+
+        Returns:
+            dict[str, Any] | None: The best one-way itinerary for the requested market.
+        """
         if not self.is_configured():
             return None
         source_code = source.upper()
@@ -383,6 +506,23 @@ class AmadeusClient:
         hold_bags: int,
         max_connection_layover_seconds: int | None = None,
     ) -> dict[str, Any] | None:
+        """Fetch the best round-trip itinerary for the requested market.
+
+        Args:
+            source: Origin airport code for the request.
+            destination: Destination airport code for the request.
+            outbound_iso: Outbound travel date in ISO 8601 format.
+            inbound_iso: Inbound travel date in ISO 8601 format.
+            currency: Currency code for pricing output.
+            max_stops_per_leg: Max stops per leg.
+            adults: Number of adult travelers.
+            hand_bags: Number of cabin bags per adult traveler.
+            hold_bags: Number of checked bags per adult traveler.
+            max_connection_layover_seconds: Duration in seconds for max connection layover.
+
+        Returns:
+            dict[str, Any] | None: The best round-trip itinerary for the requested market.
+        """
         if not self.is_configured():
             return None
         source_code = source.upper()

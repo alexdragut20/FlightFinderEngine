@@ -22,6 +22,8 @@ from ._cache import per_instance_lru_cache
 
 
 class KiwiClient:
+    """Provider client for Kiwi GraphQL flight lookups."""
+
     provider_id = "kiwi"
     display_name = "Kiwi"
     supports_calendar = True
@@ -30,18 +32,37 @@ class KiwiClient:
     docs_url = "https://www.kiwi.com/"
 
     def __init__(self) -> None:
+        """Initialize the KiwiClient."""
         self._local = threading.local()
 
     def is_configured(self) -> bool:
+        """Return whether the client is configured for use.
+
+        Returns:
+            bool: True when the client is configured for use; otherwise, False.
+        """
         return True
 
     def _session(self) -> requests.Session:
+        """Return the cached requests session.
+
+        Returns:
+            requests.Session: The cached requests session.
+        """
         if not hasattr(self._local, "session"):
             self._local.session = requests.Session()
         return self._local.session
 
     @staticmethod
     def _passengers_payload(passengers: PassengerConfig) -> dict[str, Any]:
+        """Build the passenger payload for the provider request.
+
+        Args:
+            passengers: Passenger configuration to serialize for the provider request.
+
+        Returns:
+            dict[str, Any]: The passenger payload for the provider request.
+        """
         adults = max(1, passengers.adults)
         return {
             "adults": adults,
@@ -50,6 +71,15 @@ class KiwiClient:
         }
 
     def _post(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+        """Send a POST request to the provider.
+
+        Args:
+            query: Provider query string to submit.
+            variables: Variables payload for the provider request.
+
+        Returns:
+            dict[str, Any]: Result of sending POST request to the provider.
+        """
         response = self._session().post(
             GRAPHQL_ENDPOINT,
             json={"query": query, "variables": variables},
@@ -63,6 +93,14 @@ class KiwiClient:
 
     @staticmethod
     def _parse_sector_segments(sector: dict[str, Any] | None) -> list[dict[str, Any]]:
+        """Parse sector data into normalized flight segments.
+
+        Args:
+            sector: Mapping of sector.
+
+        Returns:
+            list[dict[str, Any]]: Parsed sector data into normalized flight segments.
+        """
         segments_raw = (sector or {}).get("sectorSegments", [])
         segments: list[dict[str, Any]] = []
         for item in segments_raw:
@@ -97,6 +135,22 @@ class KiwiClient:
         hand_bags: int,
         hold_bags: int,
     ) -> dict[str, int]:
+        """Fetch calendar prices for the requested market.
+
+        Args:
+            source: Origin airport code for the request.
+            destination: Destination airport code for the request.
+            date_start_iso: Start date in ISO 8601 format.
+            date_end_iso: End date in ISO 8601 format.
+            currency: Currency code for pricing output.
+            max_stops_per_leg: Max stops per leg.
+            adults: Number of adult travelers.
+            hand_bags: Number of cabin bags per adult traveler.
+            hold_bags: Number of checked bags per adult traveler.
+
+        Returns:
+            dict[str, int]: Calendar prices for the requested market.
+        """
         passengers = PassengerConfig(adults=adults, hand_bags=hand_bags, hold_bags=hold_bags)
         variables = {
             "search": {
@@ -148,6 +202,22 @@ class KiwiClient:
         hold_bags: int,
         max_connection_layover_seconds: int | None = None,
     ) -> dict[str, Any] | None:
+        """Fetch the best one-way itinerary for the requested market.
+
+        Args:
+            source: Origin airport code for the request.
+            destination: Destination airport code for the request.
+            departure_iso: Departure date in ISO 8601 format.
+            currency: Currency code for pricing output.
+            max_stops_per_leg: Max stops per leg.
+            adults: Number of adult travelers.
+            hand_bags: Number of cabin bags per adult traveler.
+            hold_bags: Number of checked bags per adult traveler.
+            max_connection_layover_seconds: Duration in seconds for max connection layover.
+
+        Returns:
+            dict[str, Any] | None: The best one-way itinerary for the requested market.
+        """
         passengers = PassengerConfig(adults=adults, hand_bags=hand_bags, hold_bags=hold_bags)
         variables = {
             "search": {
@@ -238,6 +308,23 @@ class KiwiClient:
         hold_bags: int,
         max_connection_layover_seconds: int | None = None,
     ) -> dict[str, Any] | None:
+        """Fetch the best round-trip itinerary for the requested market.
+
+        Args:
+            source: Origin airport code for the request.
+            destination: Destination airport code for the request.
+            outbound_iso: Outbound travel date in ISO 8601 format.
+            inbound_iso: Inbound travel date in ISO 8601 format.
+            currency: Currency code for pricing output.
+            max_stops_per_leg: Max stops per leg.
+            adults: Number of adult travelers.
+            hand_bags: Number of cabin bags per adult traveler.
+            hold_bags: Number of checked bags per adult traveler.
+            max_connection_layover_seconds: Duration in seconds for max connection layover.
+
+        Returns:
+            dict[str, Any] | None: The best round-trip itinerary for the requested market.
+        """
         passengers = PassengerConfig(adults=adults, hand_bags=hand_bags, hold_bags=hold_bags)
         variables = {
             "search": {

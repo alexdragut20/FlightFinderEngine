@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .resources import LOG_DIR, RESPONSES_DIR
+from ..data.resources import LOG_DIR, RESPONSES_DIR
 
 _DEBUG_PROVIDER_RESPONSES = str(os.getenv("DEBUG_PROVIDER_RESPONSES", "0")).strip().lower() not in {
     "0",
@@ -48,6 +48,11 @@ _FD_COUNT_SAMPLE_INTERVAL_SECONDS = 1.0
 
 
 def _response_capture_files() -> list[Path]:
+    """Return the response capture files on disk.
+
+    Returns:
+        list[Path]: The response capture files on disk.
+    """
     try:
         return [path for path in RESPONSES_DIR.glob("*.json") if path.is_file()]
     except Exception:
@@ -55,6 +60,7 @@ def _response_capture_files() -> list[Path]:
 
 
 def _sync_response_capture_state_locked() -> None:
+    """Synchronize response capture state while the lock is held."""
     global _PROVIDER_RESPONSE_CAPTURE_TOTAL
     global _PROVIDER_RESPONSE_CAPTURE_SEQ
     global _PROVIDER_RESPONSE_CAPTURE_SYNCED
@@ -75,6 +81,7 @@ def _sync_response_capture_state_locked() -> None:
 
 
 def _prune_response_capture_files_locked() -> None:
+    """Prune response capture files while the lock is held."""
     global _PROVIDER_RESPONSE_CAPTURE_TOTAL
     if _PROVIDER_RESPONSE_CAPTURE_MAX_FILES <= 0:
         return
@@ -102,6 +109,7 @@ def _prune_response_capture_files_locked() -> None:
 
 
 def _initialize_provider_capture_retention() -> None:
+    """Initialize response capture retention metadata."""
     if not _DEBUG_PROVIDER_RESPONSES:
         return
     with _PROVIDER_RESPONSE_CAPTURE_LOCK:
@@ -110,6 +118,14 @@ def _initialize_provider_capture_retention() -> None:
 
 
 def _sanitize_debug_value(value: Any) -> Any:
+    """Sanitize a debug value before logging or persistence.
+
+    Args:
+        value: Input value to process.
+
+    Returns:
+        Any: Sanitize a debug value before logging or persistence.
+    """
     sensitive_keys = {
         "api_key",
         "apikey",
@@ -142,6 +158,11 @@ def _sanitize_debug_value(value: Any) -> Any:
 
 
 def _open_file_descriptor_count() -> int | None:
+    """Return the open file descriptor count when available.
+
+    Returns:
+        int | None: The open file descriptor count when available.
+    """
     global _FD_COUNT_CACHE_VALUE
     global _FD_COUNT_CACHE_TS
 
@@ -164,6 +185,11 @@ def _open_file_descriptor_count() -> int | None:
 
 
 def _build_engine_logger() -> logging.Logger:
+    """Build the shared engine logger.
+
+    Returns:
+        logging.Logger: The shared engine logger.
+    """
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger("flight_layover_lab")
     if logger.handlers:
@@ -187,6 +213,13 @@ ENGINE_LOGGER = _build_engine_logger()
 
 
 def log_event(level: int, event: str, **fields: Any) -> None:
+    """Log an engine event with structured context.
+
+    Args:
+        level: Logging level for the event.
+        event: Event name to record.
+        fields: Fields.
+    """
     payload: dict[str, Any] = {
         "event": str(event),
         "fd_open": _open_file_descriptor_count(),
@@ -208,6 +241,16 @@ def capture_provider_response(
     status_code: int | None = None,
     error: str | None = None,
 ) -> None:
+    """Persist a provider response for debugging when enabled.
+
+    Args:
+        provider_id: Provider identifier involved in the request.
+        operation: Operation name to record.
+        request_payload: Mapping of request payload.
+        response_payload: JSON response payload to send to the client.
+        status_code: HTTP status code for the response.
+        error: Error message to record.
+    """
     global _PROVIDER_RESPONSE_CAPTURE_TOTAL
     normalized_provider = str(provider_id or "").strip().lower()
     if not _DEBUG_PROVIDER_RESPONSES:

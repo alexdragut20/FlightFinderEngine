@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from flight_layover_lab.airports import AirportCoordinates
-from flight_layover_lab.engine import SplitTripOptimizer
-from flight_layover_lab.providers import KiwiClient
-from flight_layover_lab.route_graph import RouteConnectivityGraph, _normalize_codes
+from src.data.airports import AirportCoordinates
+from src.engine import SplitTripOptimizer
+from src.providers import KiwiClient
+from src.services.route_graph import RouteConnectivityGraph, _normalize_codes
 
 
 def test_route_graph_scores_bridge_hubs_on_outbound_and_return_paths() -> None:
@@ -86,8 +86,8 @@ def test_optimizer_expands_hubs_from_route_graph_before_fallback_pool() -> None:
 
 def test_route_graph_loading_and_availability_paths(monkeypatch, tmp_path) -> None:
     cache_path = tmp_path / "routes.dat"
-    monkeypatch.setattr("flight_layover_lab.route_graph.CACHE_DIR", tmp_path)
-    monkeypatch.setattr("flight_layover_lab.route_graph.ROUTES_CACHE_PATH", cache_path)
+    monkeypatch.setattr("src.services.route_graph.CACHE_DIR", tmp_path)
+    monkeypatch.setattr("src.services.route_graph.ROUTES_CACHE_PATH", cache_path)
 
     class _Response:
         text = "X,Y,OTP,Z,IST\nX,Y,IST,Z,BKK\nX,Y,USM,Z,DMK\nbad,row\nX,Y,OTP,Z,\\N\n"
@@ -96,7 +96,7 @@ def test_route_graph_loading_and_availability_paths(monkeypatch, tmp_path) -> No
             return None
 
     monkeypatch.setattr(
-        "flight_layover_lab.route_graph.requests.get", lambda *args, **kwargs: _Response()
+        "src.services.route_graph.requests.get", lambda *args, **kwargs: _Response()
     )
 
     graph = RouteConnectivityGraph()
@@ -107,7 +107,7 @@ def test_route_graph_loading_and_availability_paths(monkeypatch, tmp_path) -> No
 
     cache_path.unlink()
     monkeypatch.setattr(
-        "flight_layover_lab.route_graph.requests.get",
+        "src.services.route_graph.requests.get",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("download failed")),
     )
     missing_graph = RouteConnectivityGraph()
@@ -124,8 +124,8 @@ def test_route_graph_edge_loading_and_normalization_paths(monkeypatch, tmp_path)
         def open(self, *args: object, **kwargs: object) -> object:
             raise OSError("broken cache")
 
-    monkeypatch.setattr("flight_layover_lab.route_graph.CACHE_DIR", tmp_path)
-    monkeypatch.setattr("flight_layover_lab.route_graph.ROUTES_CACHE_PATH", _BrokenRoutePath())
+    monkeypatch.setattr("src.services.route_graph.CACHE_DIR", tmp_path)
+    monkeypatch.setattr("src.services.route_graph.ROUTES_CACHE_PATH", _BrokenRoutePath())
 
     broken_graph = RouteConnectivityGraph()
     assert broken_graph.available() is False

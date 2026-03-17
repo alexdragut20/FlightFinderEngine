@@ -34,7 +34,7 @@ jobs:
         run: ruff format --check .
 
       - name: Test
-        run: pytest --cov=src/flight_layover_lab --cov-report=term-missing --cov-report=xml
+        run: pytest --cov=src --cov-report=term-missing --cov-report=xml
 
       - name: Refresh coverage badge in branch
         if: github.event_name == 'push' && github.ref != 'refs/heads/main' && github.actor != 'github-actions[bot]'

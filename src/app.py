@@ -5,12 +5,9 @@ from __future__ import annotations
 
 from . import config as _config
 from . import utils as _utils
-from .airports import AirportCoordinates
+from .data.airports import AirportCoordinates
 from .engine import SplitTripOptimizer, _estimate_candidates_for_destination
 from .exceptions import ProviderNoResultError
-from .http_server import AppHandler, run_server
-from .logging_utils import capture_provider_response as _capture_provider_response
-from .logging_utils import log_event
 from .providers import (
     AmadeusClient,
     GoogleFlightsLocalClient,
@@ -21,6 +18,9 @@ from .providers import (
     SerpApiGoogleFlightsClient,
     SkyscannerScrapeClient,
 )
+from .services.http_server import AppHandler, run_server
+from .utils.logging import capture_provider_response as _capture_provider_response
+from .utils.logging import log_event
 
 # Re-export config + utils symbols for backward compatibility with the legacy
 # monolithic `server.py` import surface.

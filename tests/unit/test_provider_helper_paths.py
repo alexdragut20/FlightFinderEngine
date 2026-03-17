@@ -10,14 +10,14 @@ from types import SimpleNamespace
 import pytest
 import requests
 
-from flight_layover_lab import logging_utils
-from flight_layover_lab.exceptions import ProviderNoResultError
-from flight_layover_lab.progress import SearchProgressTracker
-from flight_layover_lab.providers.amadeus import AmadeusClient
-from flight_layover_lab.providers.google_flights import GoogleFlightsLocalClient
-from flight_layover_lab.providers.kayak import KayakScrapeClient
-from flight_layover_lab.providers.serpapi import SerpApiGoogleFlightsClient
-from flight_layover_lab.providers.skyscanner import SkyscannerScrapeClient
+from src.exceptions import ProviderNoResultError
+from src.providers.amadeus import AmadeusClient
+from src.providers.google_flights import GoogleFlightsLocalClient
+from src.providers.kayak import KayakScrapeClient
+from src.providers.serpapi import SerpApiGoogleFlightsClient
+from src.providers.skyscanner import SkyscannerScrapeClient
+from src.services.progress import SearchProgressTracker
+from src.utils import logging as logging_utils
 
 
 class _FakeResponse:
@@ -239,7 +239,7 @@ def test_amadeus_helper_paths_cover_static_methods_and_payload_errors(monkeypatc
     monkeypatch.setattr(client, "_session", lambda: session)
     monkeypatch.setattr(client, "_fetch_token", lambda: "token")
     monkeypatch.setattr(
-        "flight_layover_lab.providers.amadeus._capture_provider_response",
+        "src.providers.amadeus._capture_provider_response",
         lambda *args, **kwargs: None,
     )
 
@@ -253,7 +253,7 @@ def test_serpapi_helper_paths_cover_payload_parsing_and_errors(monkeypatch) -> N
     session = _FakeSession(get_responses=[_FakeResponse({"error": "quota"}, status_code=200)])
     monkeypatch.setattr(client, "_session", lambda: session)
     monkeypatch.setattr(
-        "flight_layover_lab.providers.serpapi._capture_provider_response",
+        "src.providers.serpapi._capture_provider_response",
         lambda *args, **kwargs: None,
     )
     with pytest.raises(RuntimeError, match="quota"):
@@ -398,7 +398,7 @@ def test_kayak_helper_paths_cover_bootstrap_polling_and_static_helpers(monkeypat
     assert client._leg_duration_seconds({}, {}, [segment_entry]) == 7200
     assert client._normalize_price(100, "USD", "USD") == (100, "USD")
     monkeypatch.setattr(
-        "flight_layover_lab.providers.kayak.convert_currency_amount",
+        "src.providers.kayak.convert_currency_amount",
         lambda amount, source, target: None,
     )
     assert client._normalize_price(100, "USD", "RON") == (100, "USD")
@@ -411,7 +411,7 @@ def test_kayak_helper_paths_cover_bootstrap_polling_and_static_helpers(monkeypat
         client, "_post_poll", KayakScrapeClient._post_poll.__get__(client, KayakScrapeClient)
     )
     monkeypatch.setattr(
-        "flight_layover_lab.providers.kayak._capture_provider_response",
+        "src.providers.kayak._capture_provider_response",
         lambda *args, **kwargs: None,
     )
     with pytest.raises(ProviderNoResultError):
@@ -583,7 +583,7 @@ def test_kayak_helper_paths_cover_session_poll_errors_and_result_selection(monke
     assert (best_amount, best_currency, best_assumption) == (120, "USD", "displayed")
 
     monkeypatch.setattr(
-        "flight_layover_lab.providers.kayak._capture_provider_response",
+        "src.providers.kayak._capture_provider_response",
         lambda *args, **kwargs: None,
     )
     generic_error_session = _FakeSession(
@@ -616,7 +616,7 @@ def test_kayak_helper_paths_cover_session_poll_errors_and_result_selection(monke
     assert client._segment_entry("SEG-X", {"SEG-X": "bad"}, {}, {}) is None
     assert client._normalize_price(None, "", "RON") == (None, "RON")
     monkeypatch.setattr(
-        "flight_layover_lab.providers.kayak.convert_currency_amount",
+        "src.providers.kayak.convert_currency_amount",
         lambda amount, source, target: (
             250 if (amount, source, target) == (100, "USD", "RON") else None
         ),
@@ -803,7 +803,7 @@ def test_skyscanner_helper_paths_cover_cooldowns_runtime_fallbacks_and_fare_sele
     assert (html, final_url, status_code) == ("<html>ok</html>", "https://final.example", 202)
     assert http_session.headers["User-Agent"] == client._USER_AGENTS[1]
 
-    monkeypatch.setattr("flight_layover_lab.providers.skyscanner.time.time", lambda: 100.0)
+    monkeypatch.setattr("src.providers.skyscanner.time.time", lambda: 100.0)
     monkeypatch.setattr(SkyscannerScrapeClient, "_PROVIDER_COOLDOWN_UNTIL", 0.0)
     monkeypatch.setattr(SkyscannerScrapeClient, "_PLAYWRIGHT_COOLDOWN_UNTIL", 0.0)
     SkyscannerScrapeClient._set_provider_cooldown(5)
@@ -1042,7 +1042,7 @@ def test_kayak_client_remaining_edge_paths_cover_search_payload_and_filtering(mo
             return None
 
     monkeypatch.setattr(
-        "flight_layover_lab.providers.kayak._capture_provider_response",
+        "src.providers.kayak._capture_provider_response",
         lambda *args, **kwargs: None,
     )
 
@@ -1643,7 +1643,7 @@ def test_google_and_amadeus_helper_paths_cover_runtime_caching_and_tiebreaks(
         post_responses=[_FakeResponse({"access_token": "token", "expires_in": 120})]
     )
     monkeypatch.setattr(amadeus_client, "_session", lambda: token_session)
-    monkeypatch.setattr("flight_layover_lab.providers.amadeus.time.time", lambda: 100.0)
+    monkeypatch.setattr("src.providers.amadeus.time.time", lambda: 100.0)
     assert amadeus_client._session() is token_session
     assert amadeus_client._fetch_token() == "token"
     assert amadeus_client._fetch_token() == "token"
@@ -1940,9 +1940,7 @@ def test_google_flights_client_remaining_edge_paths_cover_runtime_and_return_log
             raise ImportError("playwright missing")
         return real_import(name, globals, locals, fromlist, level)
 
-    monkeypatch.setattr(
-        "flight_layover_lab.providers.google_flights.ALLOW_PLAYWRIGHT_PROVIDERS", True
-    )
+    monkeypatch.setattr("src.providers.google_flights.ALLOW_PLAYWRIGHT_PROVIDERS", True)
     local_client = GoogleFlightsLocalClient(fetch_mode="local")
     monkeypatch.setattr(builtins, "__import__", local_missing_playwright_import)
     assert local_client._ensure_fast_flights() is False
@@ -2056,7 +2054,7 @@ def test_serpapi_client_remaining_edge_paths_cover_search_and_selection_logic(
     )
     monkeypatch.setattr(client, "_session", lambda: session)
     monkeypatch.setattr(
-        "flight_layover_lab.providers.serpapi._capture_provider_response",
+        "src.providers.serpapi._capture_provider_response",
         lambda *args, **kwargs: None,
     )
     with pytest.raises(RuntimeError, match="HTTP 400"):
@@ -2869,11 +2867,11 @@ def test_amadeus_client_remaining_edge_paths_cover_session_errors_and_tiebreaks(
     )
     monkeypatch.setattr(retry_client, "_session", lambda: retry_session)
     monkeypatch.setattr(
-        "flight_layover_lab.providers.amadeus._capture_provider_response",
+        "src.providers.amadeus._capture_provider_response",
         lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(
-        "flight_layover_lab.providers.amadeus.time.sleep",
+        "src.providers.amadeus.time.sleep",
         lambda *_args, **_kwargs: None,
     )
     assert retry_client._get("/v2/shopping/flight-offers", {"originLocationCode": "OTP"}) == {
@@ -2895,7 +2893,7 @@ def test_amadeus_client_remaining_edge_paths_cover_session_errors_and_tiebreaks(
     )
     monkeypatch.setattr(http_error_client, "_session", lambda: http_error_session)
     monkeypatch.setattr(
-        "flight_layover_lab.providers.amadeus._capture_provider_response",
+        "src.providers.amadeus._capture_provider_response",
         lambda *args, **kwargs: None,
     )
     with pytest.raises(requests.HTTPError):
@@ -2912,7 +2910,7 @@ def test_amadeus_client_remaining_edge_paths_cover_session_errors_and_tiebreaks(
     )
     monkeypatch.setattr(payload_error_client, "_session", lambda: payload_error_session)
     monkeypatch.setattr(
-        "flight_layover_lab.providers.amadeus._capture_provider_response",
+        "src.providers.amadeus._capture_provider_response",
         lambda *args, **kwargs: None,
     )
     with pytest.raises(RuntimeError, match="payload broke"):
@@ -2934,7 +2932,7 @@ def test_amadeus_client_remaining_edge_paths_cover_session_errors_and_tiebreaks(
     )
     monkeypatch.setattr(no_result_payload_client, "_session", lambda: no_result_payload_session)
     monkeypatch.setattr(
-        "flight_layover_lab.providers.amadeus._capture_provider_response",
+        "src.providers.amadeus._capture_provider_response",
         lambda *args, **kwargs: None,
     )
     with pytest.raises(ProviderNoResultError):

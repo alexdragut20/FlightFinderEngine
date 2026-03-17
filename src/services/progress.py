@@ -5,6 +5,16 @@ import threading
 import time
 from typing import Any
 
+from ..utils.constants import (
+    SEARCH_EVENT_COMPLETE,
+    SEARCH_EVENT_FAILURE_PREFIX,
+    SEARCH_EVENT_QUEUED,
+    SEARCH_STATUS_COMPLETED,
+    SEARCH_STATUS_FAILED,
+    SEARCH_STATUS_QUEUED,
+    SEARCH_STATUS_RUNNING,
+)
+
 _PHASE_ORDER = (
     ("setup", "Preparing search", 0.04),
     ("calendar", "Fetching route calendars", 0.20),
@@ -18,16 +28,28 @@ _PHASE_META = {name: {"label": label, "weight": weight} for name, label, weight 
 
 
 def _utc_now_iso() -> str:
+    """Return the current UTC time in ISO 8601 format.
+
+    Returns:
+        str: The current UTC time in ISO 8601 format.
+    """
     return dt.datetime.now(dt.UTC).isoformat().replace("+00:00", "Z")
 
 
 class SearchProgressTracker:
+    """Progress tracker for long-running search jobs."""
+
     def __init__(self, search_id: str) -> None:
+        """Initialize the SearchProgressTracker.
+
+        Args:
+            search_id: Identifier of the current search.
+        """
         self.search_id = search_id
         self.started_at = time.time()
         self.updated_at = self.started_at
         self._lock = threading.Lock()
-        self._status = "queued"
+        self._status = SEARCH_STATUS_QUEUED
         self._error: str | None = None
         self._current_phase = "setup"
         self._phase_state: dict[str, dict[str, Any]] = {
@@ -46,11 +68,16 @@ class SearchProgressTracker:
         }
         self._phase_log_buckets = {name: -1 for name in _PHASE_META}
         self._events: list[dict[str, Any]] = []
-        self._append_event_locked("Search queued.")
+        self._append_event_locked(SEARCH_EVENT_QUEUED)
 
     def mark_running(self, detail: str | None = None) -> None:
+        """Mark the search as running.
+
+        Args:
+            detail: Human-readable detail message for the current phase.
+        """
         with self._lock:
-            self._status = "running"
+            self._status = SEARCH_STATUS_RUNNING
             self.updated_at = time.time()
             if detail:
                 self._append_event_locked(detail)
@@ -62,9 +89,16 @@ class SearchProgressTracker:
         total: int | None = None,
         detail: str | None = None,
     ) -> None:
+        """Start tracking a progress phase.
+
+        Args:
+            phase: Progress phase name to update.
+            total: Total number of work units for the phase.
+            detail: Human-readable detail message for the current phase.
+        """
         with self._lock:
             state = self._phase(phase)
-            self._status = "running"
+            self._status = SEARCH_STATUS_RUNNING
             self._current_phase = phase
             state["active"] = True
             if state["started_at"] is None:
@@ -86,6 +120,14 @@ class SearchProgressTracker:
         total: int | None = None,
         detail: str | None = None,
     ) -> None:
+        """Add work units to a progress phase.
+
+        Args:
+            phase: Progress phase name to update.
+            total_increment: Additional work units to add to the phase total.
+            total: Total number of work units for the phase.
+            detail: Human-readable detail message for the current phase.
+        """
         with self._lock:
             state = self._phase(phase)
             if total is not None:
@@ -105,9 +147,18 @@ class SearchProgressTracker:
         total: int | None = None,
         detail: str | None = None,
     ) -> None:
+        """Advance the completed count for a progress phase.
+
+        Args:
+            phase: Progress phase name to update.
+            step: Number of work units to advance.
+            completed: Number of completed work units for the phase.
+            total: Total number of work units for the phase.
+            detail: Human-readable detail message for the current phase.
+        """
         with self._lock:
             state = self._phase(phase)
-            self._status = "running"
+            self._status = SEARCH_STATUS_RUNNING
             self._current_phase = phase
             state["active"] = True
             if state["started_at"] is None:
@@ -130,6 +181,12 @@ class SearchProgressTracker:
             self._maybe_log_bucket_locked(phase)
 
     def complete_phase(self, phase: str, *, detail: str | None = None) -> None:
+        """Mark a progress phase as completed.
+
+        Args:
+            phase: Progress phase name to update.
+            detail: Human-readable detail message for the current phase.
+        """
         with self._lock:
             state = self._phase(phase)
             self._current_phase = phase
@@ -149,6 +206,12 @@ class SearchProgressTracker:
             self._append_event_locked(detail or f"{state['label']} complete.", phase=phase)
 
     def log_message(self, message: str, *, phase: str | None = None) -> None:
+        """Append a human-readable log message to the progress stream.
+
+        Args:
+            message: Human-readable message to log or display.
+            phase: Progress phase name to update.
+        """
         with self._lock:
             if phase:
                 self._phase(phase)
@@ -157,27 +220,48 @@ class SearchProgressTracker:
             self._append_event_locked(message, phase=phase)
 
     def mark_completed(self, *, result_count: int | None = None) -> None:
+        """Mark the search as completed.
+
+        Args:
+            result_count: Number of result.
+        """
         with self._lock:
-            self._status = "completed"
+            self._status = SEARCH_STATUS_COMPLETED
             self._error = None
             self._current_phase = "finalize"
             self.updated_at = time.time()
-            summary = "Search complete."
+            summary = SEARCH_EVENT_COMPLETE
             if result_count is not None:
-                summary = f"Search complete: {result_count} result(s)."
+                summary = f"{SEARCH_EVENT_COMPLETE[:-1]}: {result_count} result(s)."
             self._append_event_locked(summary, phase="finalize")
 
     def mark_failed(self, error: str) -> None:
+        """Mark the search as failed.
+
+        Args:
+            error: Error message to record.
+        """
         with self._lock:
-            self._status = "failed"
+            self._status = SEARCH_STATUS_FAILED
             self._error = str(error)
             self.updated_at = time.time()
-            self._append_event_locked(f"Search failed: {error}", phase=self._current_phase)
+            self._append_event_locked(
+                f"{SEARCH_EVENT_FAILURE_PREFIX}{error}",
+                phase=self._current_phase,
+            )
 
     def snapshot(self, *, since_event_index: int | None = None) -> dict[str, Any]:
+        """Return a snapshot of the current progress state.
+
+        Args:
+            since_event_index: Last event index already received by the client.
+
+        Returns:
+            dict[str, Any]: A snapshot of the current progress state.
+        """
         with self._lock:
             now = time.time()
-            if self._status == "completed":
+            if self._status == SEARCH_STATUS_COMPLETED:
                 overall = 1.0
             else:
                 overall = sum(
@@ -221,7 +305,17 @@ class SearchProgressTracker:
         overall: float,
         elapsed_seconds: float,
     ) -> int | None:
-        if self._status != "running" or overall <= 0.0 or overall >= 1.0:
+        """Estimate the remaining time for the search.
+
+        Args:
+            now: Current timestamp for the operation.
+            overall: Overall.
+            elapsed_seconds: Duration in seconds for elapsed.
+
+        Returns:
+            int | None: Estimated remaining time for the search.
+        """
+        if self._status != SEARCH_STATUS_RUNNING or overall <= 0.0 or overall >= 1.0:
             return None
 
         current_state = self._phase_state.get(self._current_phase, {})
@@ -281,12 +375,26 @@ class SearchProgressTracker:
         return int(round(eta_seconds))
 
     def _phase(self, phase: str) -> dict[str, Any]:
+        """Return the mutable state for a progress phase.
+
+        Args:
+            phase: Progress phase name to update.
+
+        Returns:
+            dict[str, Any]: The mutable state for a progress phase.
+        """
         normalized = str(phase or "").strip().lower()
         if normalized not in self._phase_state:
             raise ValueError(f"Unknown progress phase: {phase}")
         return self._phase_state[normalized]
 
     def _append_event_locked(self, message: str, *, phase: str | None = None) -> None:
+        """Append an event while the tracker lock is held.
+
+        Args:
+            message: Human-readable message to log or display.
+            phase: Progress phase name to update.
+        """
         normalized = str(message or "").strip()
         if not normalized:
             return
@@ -299,6 +407,11 @@ class SearchProgressTracker:
         )
 
     def _maybe_log_bucket_locked(self, phase: str) -> None:
+        """Emit a progress bucket log when the threshold changes.
+
+        Args:
+            phase: Progress phase name to update.
+        """
         state = self._phase_state[phase]
         total = int(state["total"] or 0)
         if total <= 0:

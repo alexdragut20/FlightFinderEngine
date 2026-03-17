@@ -11,16 +11,28 @@ _KW_MARKER = object()
 
 
 def _build_cache_key(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[Any, ...]:
+    """Build a cache key for the given call arguments.
+
+    Args:
+        args: Positional arguments forwarded to the underlying implementation.
+        kwargs: Keyword arguments forwarded to the underlying implementation.
+
+    Returns:
+        tuple[Any, ...]: A cache key for the given call arguments.
+    """
     if not kwargs:
         return args
     return args + (_KW_MARKER,) + tuple(sorted(kwargs.items()))
 
 
 def per_instance_lru_cache(maxsize: int | None = 128) -> Callable[[F], F]:
-    """Cache method results on each instance instead of on the function object.
+    """Handle per instance lru cache.
 
-    This preserves the behavior we want from `functools.lru_cache` while avoiding
-    cross-instance retention of `self`, which is what flake8-bugbear warns about.
+    Args:
+        maxsize: Maximum number of cached entries.
+
+    Returns:
+        Callable[[F], F]: Handle per instance lru cache.
     """
 
     def decorator(func: F) -> F:

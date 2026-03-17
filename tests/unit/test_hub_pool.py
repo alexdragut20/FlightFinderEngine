@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from flight_layover_lab.hub_pool import AUTO_HUB_CANDIDATES, HUB_CONNECTIVITY_SEEDS
+from src.data.hub_pool import AUTO_HUB_CANDIDATES, HUB_CONNECTIVITY_SEEDS
 
 
 def test_hub_pool_expansion_invariants() -> None:

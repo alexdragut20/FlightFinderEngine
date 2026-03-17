@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import threading
 
-from . import hub_pool
+from .data import hub_pool
 
 AUTO_HUB_CANDIDATES = hub_pool.AUTO_HUB_CANDIDATES
 

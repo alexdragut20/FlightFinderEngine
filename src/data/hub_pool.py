@@ -2,6 +2,14 @@ from __future__ import annotations
 
 
 def _parse_codes(multiline_csv: str) -> list[str]:
+    """Parse airport codes from a comma-separated value.
+
+    Args:
+        multiline_csv: Comma-separated or newline-separated airport codes.
+
+    Returns:
+        list[str]: Parsed airport codes from a comma-separated value.
+    """
     normalized = multiline_csv.replace("\n", ",")
     return [code.strip().upper() for code in normalized.split(",") if code.strip()]
 

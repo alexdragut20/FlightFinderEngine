@@ -14,7 +14,6 @@ from dataclasses import replace
 from functools import partial
 from typing import Any
 
-from ..airports import AirportCoordinates
 from ..config import (
     AUTO_HUB_CANDIDATES,
     DEFAULT_CALENDAR_HUBS_PREFETCH,
@@ -35,9 +34,8 @@ from ..config import (
     MIN_SPLIT_CONNECTION_SAME_AIRPORT_SECONDS,
     SUPPORTED_PROVIDER_IDS,
 )
-from ..logging_utils import log_event
+from ..data.airports import AirportCoordinates
 from ..models import PassengerConfig, SearchConfig
-from ..progress import SearchProgressTracker
 from ..providers import (
     AmadeusClient,
     GoogleFlightsLocalClient,
@@ -48,7 +46,8 @@ from ..providers import (
     SerpApiGoogleFlightsClient,
     SkyscannerScrapeClient,
 )
-from ..route_graph import RouteConnectivityGraph
+from ..services.progress import SearchProgressTracker
+from ..services.route_graph import RouteConnectivityGraph
 from ..utils import (
     boundary_transfer_events,
     bounded_io_concurrency,
@@ -68,9 +67,32 @@ from ..utils import (
     to_bool,
     to_date,
 )
+from ..utils.constants import (
+    BEST_OBJECTIVE_PRICE_PER_HOUR_WEIGHT,
+    FASTEST_OBJECTIVE_PRICE_MULTIPLIER,
+    INNER_RETURN_BUNDLE_DISCOUNT_FACTOR,
+    OUTBOUND_TIME_PROXY_BASE_SECONDS,
+    OUTBOUND_TIME_PROXY_TRANSFER_PENALTY_SECONDS,
+    PRICE_SENTINEL,
+    PRICE_TIME_SCORE_PRICE_WEIGHT,
+    PRICE_TIME_SCORE_TIME_WEIGHT,
+    SEARCH_EVENT_REQUEST_ACCEPTED,
+    SEARCH_EVENT_STARTED,
+    SECONDS_PER_DAY,
+    SECONDS_PER_HOUR,
+)
+from ..utils.logging import log_event
 
 
 def _min_calendar_price(prices: dict[str, int] | None) -> int | None:
+    """Return the minimum price from a calendar mapping.
+
+    Args:
+        prices: Mapping of prices.
+
+    Returns:
+        int | None: The minimum price from a calendar mapping.
+    """
     if not prices:
         return None
     try:
@@ -83,6 +105,15 @@ def _estimate_inner_return_bundle_price(
     outbound_price: int | None,
     inbound_price: int | None,
 ) -> int | None:
+    """Estimate a bundled inner round-trip price.
+
+    Args:
+        outbound_price: Price for the outbound segment.
+        inbound_price: Price for the inbound segment.
+
+    Returns:
+        int | None: Estimated bundled inner round-trip price.
+    """
     known_prices: list[int] = []
     for value in (outbound_price, inbound_price):
         try:
@@ -105,7 +136,10 @@ def _estimate_inner_return_bundle_price(
     # the full sum of two separate one-ways, and symmetric markets usually
     # land near a discounted share of the total two-way spend.
     directional_proxy = cheaper * 2
-    discounted_sum_proxy = max(cheaper, int(round(float(summed) * 0.67)))
+    discounted_sum_proxy = max(
+        cheaper,
+        int(round(float(summed) * INNER_RETURN_BUNDLE_DISCOUNT_FACTOR)),
+    )
     return max(cheaper, min(summed, directional_proxy, discounted_sum_proxy))
 
 
@@ -115,6 +149,16 @@ def _apply_inner_return_bundle_estimate(
     outbound_market_price: int | None,
     inbound_market_price: int | None,
 ) -> tuple[int, int | None]:
+    """Apply an inner round-trip estimate to the current total.
+
+    Args:
+        base_total: Running trip total before additional pricing adjustments.
+        outbound_market_price: Price for outbound market.
+        inbound_market_price: Price for inbound market.
+
+    Returns:
+        tuple[int, int | None]: An inner round-trip estimate to the current total.
+    """
     bundle_price = _estimate_inner_return_bundle_price(
         outbound_market_price,
         inbound_market_price,
@@ -137,6 +181,14 @@ def _apply_price_time_score(
     time_key: str,
     score_key: str,
 ) -> None:
+    """Apply the weighted price-time score.
+
+    Args:
+        items: Items for the current operation.
+        price_key: Dictionary key used for price.
+        time_key: Dictionary key used for time.
+        score_key: Dictionary key used for score.
+    """
     if not items:
         return
 
@@ -160,7 +212,11 @@ def _apply_price_time_score(
             time_norm = 1.0
         else:
             time_norm = normalize(int(outbound_time), min_time, max_time)
-        item[score_key] = round((0.72 * price_norm) + (0.28 * time_norm), 6)
+        item[score_key] = round(
+            (PRICE_TIME_SCORE_PRICE_WEIGHT * price_norm)
+            + (PRICE_TIME_SCORE_TIME_WEIGHT * time_norm),
+            6,
+        )
 
 
 def _estimated_outbound_time_proxy_seconds(
@@ -169,10 +225,23 @@ def _estimated_outbound_time_proxy_seconds(
     depart_destination_date: dt.date,
     outbound_transfer_count: int,
 ) -> int:
+    """Estimate outbound travel time for scoring.
+
+    Args:
+        depart_origin_date: Date for depart origin.
+        depart_destination_date: Date for depart destination.
+        outbound_transfer_count: Number of outbound transfer.
+
+    Returns:
+        int: Estimated outbound travel time for scoring.
+    """
     day_delta = max(0, (depart_destination_date - depart_origin_date).days)
-    base_flight_seconds = 6 * 3600
-    transfer_penalty_seconds = max(0, int(outbound_transfer_count)) * 4 * 3600
-    return base_flight_seconds + (day_delta * 86400) + transfer_penalty_seconds
+    transfer_penalty_seconds = (
+        max(0, int(outbound_transfer_count)) * OUTBOUND_TIME_PROXY_TRANSFER_PENALTY_SECONDS
+    )
+    return (
+        OUTBOUND_TIME_PROXY_BASE_SECONDS + (day_delta * SECONDS_PER_DAY) + transfer_penalty_seconds
+    )
 
 
 def _estimate_objective_score(
@@ -182,15 +251,28 @@ def _estimate_objective_score(
     distance_basis_km: float | None,
     outbound_time_proxy_seconds: int | None,
 ) -> float:
+    """Estimate the objective score for a candidate route.
+
+    Args:
+        objective: Ranking objective for the search.
+        estimated_total: Estimated total fare value for the candidate.
+        distance_basis_km: Distance basis in kilometers used for scoring.
+        outbound_time_proxy_seconds: Duration in seconds for outbound time proxy.
+
+    Returns:
+        float: Estimated objective score for a candidate route.
+    """
     if objective == "fastest":
         if outbound_time_proxy_seconds is None:
-            return float(estimated_total) * 0.01
-        return float(outbound_time_proxy_seconds) + (float(estimated_total) * 0.01)
+            return float(estimated_total) * FASTEST_OBJECTIVE_PRICE_MULTIPLIER
+        return float(outbound_time_proxy_seconds) + (
+            float(estimated_total) * FASTEST_OBJECTIVE_PRICE_MULTIPLIER
+        )
     if objective == "best":
         if outbound_time_proxy_seconds is None:
             return float(estimated_total)
-        outbound_hours = float(outbound_time_proxy_seconds) / 3600.0
-        return float(estimated_total) + (outbound_hours * 12.0)
+        outbound_hours = float(outbound_time_proxy_seconds) / float(SECONDS_PER_HOUR)
+        return float(estimated_total) + (outbound_hours * BEST_OBJECTIVE_PRICE_PER_HOUR_WEIGHT)
     if not distance_basis_km:
         return float(estimated_total)
     return (estimated_total / distance_basis_km) * 1000.0
@@ -207,6 +289,21 @@ def _rank_chain_pairs(
     reverse_leg_c_map: dict[str, dict[str, int]] | None = None,
     pair_limit: int,
 ) -> list[tuple[str, str, str]]:
+    """Rank outbound chain pairs before validation.
+
+    Args:
+        origins: Origins for the operation.
+        first_hubs: Collection of first hubs.
+        second_hubs: Collection of second hubs.
+        leg_a_map: Mapping of leg a.
+        leg_b_map: Mapping of leg b.
+        leg_c_map: Mapping of leg c.
+        reverse_leg_c_map: Mapping of reverse leg c.
+        pair_limit: Maximum number of hub pairs to evaluate.
+
+    Returns:
+        list[tuple[str, str, str]]: Ranked outbound chain pairs before validation.
+    """
     scored: list[tuple[int, str, str, str]] = []
     for origin in origins:
         for first_hub in first_hubs:
@@ -259,6 +356,21 @@ def _rank_inbound_chain_pairs(
     hub_to_origin: dict[str, dict[str, int]],
     pair_limit: int,
 ) -> list[tuple[str, str, str]]:
+    """Rank inbound chain pairs before validation.
+
+    Args:
+        origins: Origins for the operation.
+        first_hubs: Collection of first hubs.
+        second_hubs: Collection of second hubs.
+        destination_to_hub: Mapping of destination to hub.
+        hub_to_destination: Mapping of hub to destination.
+        hub_to_hub: Mapping of hub to hub.
+        hub_to_origin: Mapping of hub to origin.
+        pair_limit: Maximum number of hub pairs to evaluate.
+
+    Returns:
+        list[tuple[str, str, str]]: Ranked inbound chain pairs before validation.
+    """
     scored: list[tuple[int, str, str, str]] = []
     for arrival_origin in origins:
         for first_hub in first_hubs:
@@ -301,6 +413,14 @@ def _rank_inbound_chain_pairs(
 
 
 def _estimate_candidates_for_destination(task: dict[str, Any]) -> list[dict[str, Any]]:
+    """Estimate candidate routes for a destination.
+
+    Args:
+        task: Mapping of task.
+
+    Returns:
+        list[dict[str, Any]]: Estimated candidate routes for a destination.
+    """
     destination = task["destination"]
     origins: list[str] = task["origins"]
     outbound_hubs: list[str] = task["outbound_hubs"]
@@ -769,7 +889,7 @@ def _estimate_candidates_for_destination(task: dict[str, Any]) -> list[dict[str,
                 else candidate["estimated_score"]
             ),
             int(candidate["estimated_total"]),
-            int(outbound_time) if outbound_time is not None else 10**12,
+            int(outbound_time) if outbound_time is not None else PRICE_SENTINEL,
         )
 
     split_candidates.sort(key=candidate_sort_key)
@@ -787,9 +907,17 @@ def _estimate_candidates_for_destination(task: dict[str, Any]) -> list[dict[str,
 
 
 class SplitTripOptimizer:
+    """Layover-first optimizer for direct, stopover, and split-ticket searches."""
+
     def __init__(
         self, client: KiwiClient | dict[str, Any], coordinates: AirportCoordinates
     ) -> None:
+        """Initialize the SplitTripOptimizer.
+
+        Args:
+            client: Provider client used for the request.
+            coordinates: Airport coordinates to evaluate.
+        """
         self.runtime_provider_secrets: dict[str, str] = {}
         self.providers: dict[str, Any] = {}
         self._set_provider_instances(client)
@@ -797,6 +925,11 @@ class SplitTripOptimizer:
         self.route_graph = RouteConnectivityGraph()
 
     def _set_provider_instances(self, client: KiwiClient | dict[str, Any]) -> None:
+        """Configure the active provider instances for the optimizer.
+
+        Args:
+            client: Provider client used for the request.
+        """
         if isinstance(client, dict):
             providers = {str(k).lower(): v for k, v in client.items()}
         else:
@@ -837,6 +970,11 @@ class SplitTripOptimizer:
         self.providers = providers
 
     def update_runtime_provider_secrets(self, payload: dict[str, Any]) -> None:
+        """Update runtime provider credentials and related settings.
+
+        Args:
+            payload: JSON-serializable payload for the operation.
+        """
         mapping = {
             "amadeus_client_id": "amadeus_client_id",
             "amadeus_client_secret": "amadeus_client_secret",
@@ -857,6 +995,11 @@ class SplitTripOptimizer:
         self._set_provider_instances(self.providers.get("kiwi", KiwiClient()))
 
     def runtime_provider_config_status(self) -> dict[str, bool]:
+        """Return runtime provider configuration status.
+
+        Returns:
+            dict[str, bool]: Runtime provider configuration status.
+        """
         return {
             "amadeus_client_id_set": bool(self.runtime_provider_secrets.get("amadeus_client_id")),
             "amadeus_client_secret_set": bool(
@@ -870,9 +1013,19 @@ class SplitTripOptimizer:
 
     @staticmethod
     def _available_cpu_workers() -> int:
+        """Return the number of CPU workers available to the process.
+
+        Returns:
+            int: The number of CPU workers available to the process.
+        """
         return max(1, os.cpu_count() or 1)
 
     def runtime_capabilities(self) -> dict[str, int]:
+        """Return runtime capability information for the optimizer.
+
+        Returns:
+            dict[str, int]: Runtime capability information for the optimizer.
+        """
         return {
             "cpu_workers_default": DEFAULT_CPU_WORKERS,
             "cpu_workers_max": self._available_cpu_workers(),
@@ -881,6 +1034,15 @@ class SplitTripOptimizer:
         }
 
     def _distance_km(self, from_code: str, to_code: str) -> float | None:
+        """Calculate the direct distance in kilometers between two airports.
+
+        Args:
+            from_code: Origin airport code for the segment.
+            to_code: Destination airport code for the segment.
+
+        Returns:
+            float | None: Calculated direct distance in kilometers between two airports.
+        """
         a = self.coords.get(from_code)
         b = self.coords.get(to_code)
         if not a or not b:
@@ -888,6 +1050,14 @@ class SplitTripOptimizer:
         return haversine_km(a, b)
 
     def _distance_for_route(self, airports: list[str]) -> float | None:
+        """Calculate the direct distance for a route.
+
+        Args:
+            airports: Collection of airports.
+
+        Returns:
+            float | None: Calculated direct distance for a route.
+        """
         total = 0.0
         for idx in range(len(airports) - 1):
             d = self._distance_km(airports[idx], airports[idx + 1])
@@ -897,6 +1067,14 @@ class SplitTripOptimizer:
         return total
 
     def _destination_display_name(self, code: str) -> str:
+        """Return the human-readable destination label.
+
+        Args:
+            code: Airport or provider code to process.
+
+        Returns:
+            str: The human-readable destination label.
+        """
         normalized = str(code or "").strip().upper()
         if not normalized:
             return str(code or "")
@@ -912,6 +1090,14 @@ class SplitTripOptimizer:
         self,
         config: SearchConfig,
     ) -> tuple[SearchConfig, dict[str, Any], list[str]]:
+        """Expand the hub pool with route-graph candidates.
+
+        Args:
+            config: Search configuration for the operation.
+
+        Returns:
+            tuple[SearchConfig, dict[str, Any], list[str]]: Expand the hub pool with route-graph candidates.
+        """
         base_hubs = tuple(dict.fromkeys(config.hub_candidates))
         meta: dict[str, Any] = {
             "hub_candidates_input_count": len(base_hubs),
@@ -965,6 +1151,14 @@ class SplitTripOptimizer:
     def provider_catalog(
         self, requested_provider_ids: tuple[str, ...] | None = None
     ) -> list[dict[str, Any]]:
+        """Handle provider catalog.
+
+        Args:
+            requested_provider_ids: Identifiers for requested provider.
+
+        Returns:
+            list[dict[str, Any]]: Handle provider catalog.
+        """
         requested = set(requested_provider_ids or SUPPORTED_PROVIDER_IDS)
         catalog: list[dict[str, Any]] = []
         for provider_id in SUPPORTED_PROVIDER_IDS:
@@ -1011,6 +1205,14 @@ class SplitTripOptimizer:
         self,
         config: SearchConfig,
     ) -> tuple[MultiProviderClient, list[dict[str, Any]], list[str]]:
+        """Build search client.
+
+        Args:
+            config: Search configuration for the operation.
+
+        Returns:
+            tuple[MultiProviderClient, list[dict[str, Any]], list[str]]: Search client.
+        """
         provider_status = self.provider_catalog(config.provider_ids)
         active_providers = [
             self.providers[item["id"]] for item in provider_status if item.get("active")
@@ -1055,6 +1257,14 @@ class SplitTripOptimizer:
         )
 
     def parse_search_config(self, payload: dict[str, Any]) -> SearchConfig:
+        """Parse search config.
+
+        Args:
+            payload: JSON-serializable payload for the operation.
+
+        Returns:
+            SearchConfig: Parsed search config.
+        """
         today = dt.date.today()
         default_period_start = today + dt.timedelta(days=45)
         default_period_end = default_period_start + dt.timedelta(days=60)
@@ -1335,6 +1545,16 @@ class SplitTripOptimizer:
         distance_basis_km: float | None,
         objective: str,
     ) -> float:
+        """Score candidate.
+
+        Args:
+            total_price: Price for total.
+            distance_basis_km: Distance basis in kilometers used for scoring.
+            objective: Ranking objective for the search.
+
+        Returns:
+            float: Scored candidate.
+        """
         if objective in {"best", "cheapest", "fastest"}:
             return float(total_price)
         if distance_basis_km and distance_basis_km > 0:
@@ -1343,6 +1563,14 @@ class SplitTripOptimizer:
 
     @staticmethod
     def _transfer_airports(segments: list[dict[str, Any]]) -> list[str]:
+        """Handle transfer airports.
+
+        Args:
+            segments: Mapping of segments.
+
+        Returns:
+            list[str]: Handle transfer airports.
+        """
         out: list[str] = []
         for segment in segments[:-1]:
             code = str(segment.get("to") or "").upper().strip()
@@ -1352,6 +1580,11 @@ class SplitTripOptimizer:
 
     @staticmethod
     def _compute_best_value_scores(results: list[dict[str, Any]]) -> None:
+        """Handle compute best value scores.
+
+        Args:
+            results: Result records for the current operation.
+        """
         _apply_price_time_score(
             results,
             price_key="total_price",
@@ -1361,6 +1594,14 @@ class SplitTripOptimizer:
 
     @staticmethod
     def _as_int(value: Any) -> int | None:
+        """Handle as int.
+
+        Args:
+            value: Input value to process.
+
+        Returns:
+            int | None: Handle as int.
+        """
         try:
             return int(value)
         except (TypeError, ValueError):
@@ -1371,6 +1612,15 @@ class SplitTripOptimizer:
         segments: list[dict[str, Any]],
         max_allowed_seconds: int | None,
     ) -> bool:
+        """Handle exceeds connection layover limit.
+
+        Args:
+            segments: Mapping of segments.
+            max_allowed_seconds: Duration in seconds for max allowed.
+
+        Returns:
+            bool: Handle exceeds connection layover limit.
+        """
         if max_allowed_seconds is None:
             return False
         gap_seconds = max_segment_layover_seconds(segments)
@@ -1380,6 +1630,14 @@ class SplitTripOptimizer:
 
     @staticmethod
     def _candidate_split_plans(candidate: dict[str, Any]) -> dict[str, Any] | None:
+        """Handle candidate split plans.
+
+        Args:
+            candidate: Mapping of candidate.
+
+        Returns:
+            dict[str, Any] | None: Handle candidate split plans.
+        """
         candidate_type = str(candidate.get("candidate_type") or "split_stopover")
         if candidate_type == "direct_roundtrip":
             return None
@@ -1458,6 +1716,14 @@ class SplitTripOptimizer:
         }
 
     def _candidate_inner_return_plan(self, candidate: dict[str, Any]) -> dict[str, Any] | None:
+        """Handle candidate inner return plan.
+
+        Args:
+            candidate: Mapping of candidate.
+
+        Returns:
+            dict[str, Any] | None: Handle candidate inner return plan.
+        """
         plans = self._candidate_split_plans(candidate)
         if not plans:
             return None
@@ -1506,6 +1772,16 @@ class SplitTripOptimizer:
         oneway_map: dict[tuple[str, str, str], dict[str, Any] | None],
         entry_cache: dict[tuple[str, str, str], dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]] | None:
+        """Handle materialize oneway plan entries.
+
+        Args:
+            plan: Collection of plan.
+            oneway_map: Mapping of oneway.
+            entry_cache: Cache of entry.
+
+        Returns:
+            list[dict[str, Any]] | None: Handle materialize oneway plan entries.
+        """
         entries: list[dict[str, Any]] = []
         for source, destination, date_iso in plan:
             cached_entry = (entry_cache or {}).get((source, destination, date_iso))
@@ -1555,6 +1831,16 @@ class SplitTripOptimizer:
         boundary_days: list[int],
         max_connection_layover_seconds: int | None,
     ) -> tuple[bool, int]:
+        """Handle validate entry boundaries.
+
+        Args:
+            entries: Mapping of entries.
+            boundary_days: Duration in days for boundary.
+            max_connection_layover_seconds: Duration in seconds for max connection layover.
+
+        Returns:
+            tuple[bool, int]: Handle validate entry boundaries.
+        """
         boundary_events = 0
         for idx in range(len(entries) - 1):
             current_entry = entries[idx]
@@ -1593,6 +1879,17 @@ class SplitTripOptimizer:
         expected_source: str,
         expected_destination: str,
     ) -> bool:
+        """Handle leg matches expected route.
+
+        Args:
+            actual_source: Observed source airport code from provider data.
+            actual_destination: Observed destination airport code from provider data.
+            expected_source: Expected source airport code for validation.
+            expected_destination: Expected destination airport code for validation.
+
+        Returns:
+            bool: Handle leg matches expected route.
+        """
         return (
             str(actual_source or "").strip().upper() == str(expected_source or "").strip().upper()
             and str(actual_destination or "").strip().upper()
@@ -1608,6 +1905,18 @@ class SplitTripOptimizer:
         fallback_date: str,
         max_stops_per_leg: int,
     ) -> dict[str, Any]:
+        """Handle oneway entry to leg.
+
+        Args:
+            entry: Mapping of entry.
+            fallback_source: Fallback source airport code to use when segments are missing.
+            fallback_destination: Fallback destination airport code to use when segments are missing.
+            fallback_date: Date for fallback.
+            max_stops_per_leg: Max stops per leg.
+
+        Returns:
+            dict[str, Any]: Handle oneway entry to leg.
+        """
         fare = entry.get("fare") or {}
         segments = entry.get("segments") or []
         return {
@@ -1643,6 +1952,19 @@ class SplitTripOptimizer:
         inbound_iso: str,
         max_stops_per_leg: int,
     ) -> dict[str, Any]:
+        """Handle return fare to ticket leg.
+
+        Args:
+            fare: Mapping of fare.
+            source: Origin airport code for the request.
+            destination: Destination airport code for the request.
+            outbound_iso: Outbound travel date in ISO 8601 format.
+            inbound_iso: Inbound travel date in ISO 8601 format.
+            max_stops_per_leg: Max stops per leg.
+
+        Returns:
+            dict[str, Any]: Handle return fare to ticket leg.
+        """
         outbound_segments = fare.get("outbound_segments") or []
         inbound_segments = fare.get("inbound_segments") or []
         return {
@@ -1683,6 +2005,14 @@ class SplitTripOptimizer:
         self,
         oneway_map: dict[tuple[str, str, str], dict[str, Any] | None],
     ) -> dict[tuple[str, str, str], dict[str, Any]]:
+        """Handle prepare oneway entry cache.
+
+        Args:
+            oneway_map: Mapping of oneway.
+
+        Returns:
+            dict[tuple[str, str, str], dict[str, Any]]: Handle prepare oneway entry cache.
+        """
         cache: dict[tuple[str, str, str], dict[str, Any]] = {}
         for (source, destination, date_iso), fare in oneway_map.items():
             if not fare:
@@ -1708,6 +2038,14 @@ class SplitTripOptimizer:
         self,
         return_map: dict[tuple[str, str, str, str], dict[str, Any] | None],
     ) -> dict[tuple[str, str, str, str], dict[str, Any]]:
+        """Handle prepare return trip cache.
+
+        Args:
+            return_map: Mapping of return.
+
+        Returns:
+            dict[tuple[str, str, str, str], dict[str, Any]]: Handle prepare return trip cache.
+        """
         cache: dict[tuple[str, str, str, str], dict[str, Any]] = {}
         for (source, destination, outbound_iso, inbound_iso), fare in return_map.items():
             if not fare:
@@ -1756,6 +2094,24 @@ class SplitTripOptimizer:
         oneway_entry_cache: dict[tuple[str, str, str], dict[str, Any]] | None = None,
         comparison_links: dict[str, str] | None = None,
     ) -> dict[str, Any] | None:
+        """Build split candidate with inner return bundle.
+
+        Args:
+            candidate: Mapping of candidate.
+            inner_return_plan: Mapping of inner return plan.
+            oneway_map: Mapping of oneway.
+            return_map: Mapping of return.
+            config: Search configuration for the operation.
+            distance_basis_km: Distance basis in kilometers used for scoring.
+            max_connection_layover_seconds: Duration in seconds for max connection layover.
+            destination_name: Destination name.
+            notes: Mapping of notes.
+            oneway_entry_cache: Cache of oneway entry.
+            comparison_links: Mapping of comparison links.
+
+        Returns:
+            dict[str, Any] | None: Split candidate with inner return bundle.
+        """
         inner_return = return_map.get(inner_return_plan["return_key"])
         if not inner_return:
             return None
@@ -1961,7 +2317,7 @@ class SplitTripOptimizer:
                         for value in inner_return_plan["outer_outbound_boundary_days"]
                     )
                 )
-                * 86400
+                * SECONDS_PER_DAY
             )
         if (
             all(value is not None for value in outer_inbound_durations)
@@ -1977,7 +2333,7 @@ class SplitTripOptimizer:
                         for value in inner_return_plan["outer_inbound_boundary_days"]
                     )
                 )
-                * 86400
+                * SECONDS_PER_DAY
             )
 
         price_modes = sorted(
@@ -2119,6 +2475,14 @@ class SplitTripOptimizer:
 
     @staticmethod
     def _strategy_anchor_key(item: dict[str, Any]) -> str | None:
+        """Handle strategy anchor key.
+
+        Args:
+            item: Item for the current operation.
+
+        Returns:
+            str | None: Handle strategy anchor key.
+        """
         outbound = item.get("outbound") or {}
         inbound = item.get("inbound") or {}
         if item.get("itinerary_type") == "split_stopover":
@@ -2140,6 +2504,15 @@ class SplitTripOptimizer:
         ranked: list[dict[str, Any]],
         top_results: int,
     ) -> list[dict[str, Any]]:
+        """Handle merge strategy anchors.
+
+        Args:
+            ranked: Mapping of ranked.
+            top_results: Ranked results to keep for the current operation.
+
+        Returns:
+            list[dict[str, Any]]: Handle merge strategy anchors.
+        """
         if top_results <= 0 or not ranked:
             return []
 
@@ -2273,6 +2646,17 @@ class SplitTripOptimizer:
         destination_order: list[str] | tuple[str, ...] | None = None,
         required_by_destination: dict[str, list[dict[str, Any]]] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, int]]:
+        """Handle cap results per destination.
+
+        Args:
+            ranked: Mapping of ranked.
+            top_results_per_destination: Maximum number of ranked results to keep per destination.
+            destination_order: Collection of destination order.
+            required_by_destination: Mapping of required by destination.
+
+        Returns:
+            tuple[list[dict[str, Any]], dict[str, int]]: Handle cap results per destination.
+        """
         if top_results_per_destination <= 0 or not ranked:
             return [], {}
 
@@ -2328,6 +2712,14 @@ class SplitTripOptimizer:
 
     @staticmethod
     def _split_candidate_key(candidate: dict[str, Any]) -> tuple[Any, ...]:
+        """Handle split candidate key.
+
+        Args:
+            candidate: Mapping of candidate.
+
+        Returns:
+            tuple[Any, ...]: Handle split candidate key.
+        """
         candidate_type = str(candidate.get("candidate_type") or "split_stopover")
         base = (
             candidate_type,
@@ -2378,6 +2770,16 @@ class SplitTripOptimizer:
         base_quota: int,
         extra_quota: int,
     ) -> list[dict[str, Any]]:
+        """Select split candidates with diversity.
+
+        Args:
+            split_candidates: Mapping of split candidates.
+            base_quota: Base validation quota per destination.
+            extra_quota: Additional validation quota to distribute.
+
+        Returns:
+            list[dict[str, Any]]: Selected split candidates with diversity.
+        """
         if not split_candidates or base_quota <= 0:
             return []
 
@@ -2465,6 +2867,20 @@ class SplitTripOptimizer:
         core_provider_ids: tuple[str, ...],
         serpapi_active: bool,
     ) -> tuple[dict[str, Any], list[str]]:
+        """Handle prepare destination validation context.
+
+        Args:
+            destination: Destination airport code for the request.
+            estimated_candidates: Mapping of estimated candidates.
+            config: Search configuration for the operation.
+            validation_target_per_destination: Validation budget allocated to each destination.
+            origin_rank: Mapping of origin rank.
+            core_provider_ids: Identifiers for core provider.
+            serpapi_active: Flag that controls whether serpapi active is used.
+
+        Returns:
+            tuple[dict[str, Any], list[str]]: Handle prepare destination validation context.
+        """
         warnings: list[str] = []
         destination_name = self._destination_display_name(destination)
         notes = DESTINATION_NOTES.get(destination, {})
@@ -2498,7 +2914,9 @@ class SplitTripOptimizer:
                     else item["estimated_score"]
                 ),
                 int(item["estimated_total"]),
-                int(estimated_outbound_time) if estimated_outbound_time is not None else 10**12,
+                int(estimated_outbound_time)
+                if estimated_outbound_time is not None
+                else PRICE_SENTINEL,
             )
 
         split_candidates = sorted(
@@ -2616,7 +3034,7 @@ class SplitTripOptimizer:
         for candidate in limited_candidates:
             candidate_type = str(candidate.get("candidate_type") or "split_stopover")
             candidate["_candidate_type"] = candidate_type
-            estimated_total = int(candidate.get("estimated_total") or 10**12)
+            estimated_total = int(candidate.get("estimated_total") or PRICE_SENTINEL)
             if candidate_type == "direct_roundtrip":
                 direct_return_key = (
                     candidate["origin"],
@@ -2662,7 +3080,7 @@ class SplitTripOptimizer:
 
         def leg_sort_key(key: tuple[str, str, str]) -> tuple[int, int, tuple[str, str, str]]:
             return (
-                leg_rank_score.get(key, 10**12),
+                leg_rank_score.get(key, PRICE_SENTINEL),
                 origin_rank.get(key[0], len(origin_rank)),
                 key,
             )
@@ -2671,7 +3089,7 @@ class SplitTripOptimizer:
             key: tuple[str, str, str, str],
         ) -> tuple[int, int, tuple[str, str, str, str]]:
             return (
-                return_rank_score.get(key, 10**12),
+                return_rank_score.get(key, PRICE_SENTINEL),
                 origin_rank.get(key[0], len(origin_rank)),
                 key,
             )
@@ -2760,6 +3178,14 @@ class SplitTripOptimizer:
     def _prune_dominated_split_results(
         results: list[dict[str, Any]],
     ) -> tuple[list[dict[str, Any]], int]:
+        """Handle prune dominated split results.
+
+        Args:
+            results: Result records for the current operation.
+
+        Returns:
+            tuple[list[dict[str, Any]], int]: Handle prune dominated split results.
+        """
         if not results:
             return results, 0
 
@@ -2844,6 +3270,17 @@ class SplitTripOptimizer:
         config: SearchConfig,
         calendars: dict[tuple[str, str], dict[str, int]],
     ) -> tuple[list[str], list[str]]:
+        """Handle pick auto hubs.
+
+        Args:
+            destination: Destination airport code for the request.
+            config: Search configuration for the operation.
+            calendars: Mapping of calendars.
+
+        Returns:
+            tuple[list[str], list[str]]: Handle pick auto hubs.
+        """
+
         def robust_low(values: list[int]) -> float | None:
             if not values:
                 return None
@@ -3059,6 +3496,19 @@ class SplitTripOptimizer:
         calendar_provider_ids: tuple[str, ...] | None = None,
         progress: SearchProgressTracker | None = None,
     ) -> tuple[dict[tuple[str, str], dict[str, int]], list[str]]:
+        """Fetch calendars parallel.
+
+        Args:
+            search_client: Client used to execute search requests.
+            routes: Collection of routes.
+            config: Search configuration for the operation.
+            io_pool: Thread pool used for I/O-bound provider validation.
+            calendar_provider_ids: Identifiers for calendar provider.
+            progress: Progress ratio for the current phase.
+
+        Returns:
+            tuple[dict[tuple[str, str], dict[str, int]], list[str]]: Calendars parallel.
+        """
         loop = asyncio.get_running_loop()
         warnings: list[str] = []
         sem = asyncio.Semaphore(bounded_io_concurrency(config.io_workers))
@@ -3121,6 +3571,22 @@ class SplitTripOptimizer:
         progress_completed_offset: int = 0,
         progress_total: int | None = None,
     ) -> tuple[dict[tuple[str, str, str], dict[str, Any] | None], list[str], int]:
+        """Fetch oneways parallel.
+
+        Args:
+            search_client: Client used to execute search requests.
+            leg_keys: Collection of leg keys.
+            config: Search configuration for the operation.
+            io_pool: Thread pool used for I/O-bound provider validation.
+            provider_map: Mapping of provider.
+            base_provider_ids: Identifiers for base provider.
+            progress: Progress ratio for the current phase.
+            progress_completed_offset: Completed-work offset applied to progress reporting.
+            progress_total: Total work units represented by the progress sample.
+
+        Returns:
+            tuple[dict[tuple[str, str, str], dict[str, Any] | None], list[str], int]: Oneways parallel.
+        """
         loop = asyncio.get_running_loop()
         warnings: list[str] = []
         sem = asyncio.Semaphore(bounded_io_concurrency(config.io_workers))
@@ -3129,7 +3595,7 @@ class SplitTripOptimizer:
             config.passengers.hand_bags > 0 or config.passengers.hold_bags > 0
         )
         max_connection_layover_seconds = (
-            int(config.max_connection_layover_hours * 3600)
+            int(config.max_connection_layover_hours * SECONDS_PER_HOUR)
             if config.max_connection_layover_hours
             else None
         )
@@ -3240,6 +3706,22 @@ class SplitTripOptimizer:
         progress_completed_offset: int = 0,
         progress_total: int | None = None,
     ) -> tuple[dict[tuple[str, str, str, str], dict[str, Any] | None], list[str], int]:
+        """Fetch returns parallel.
+
+        Args:
+            search_client: Client used to execute search requests.
+            trip_keys: Collection of trip keys.
+            config: Search configuration for the operation.
+            io_pool: Thread pool used for I/O-bound provider validation.
+            provider_map: Mapping of provider.
+            base_provider_ids: Identifiers for base provider.
+            progress: Progress ratio for the current phase.
+            progress_completed_offset: Completed-work offset applied to progress reporting.
+            progress_total: Total work units represented by the progress sample.
+
+        Returns:
+            tuple[dict[tuple[str, str, str, str], dict[str, Any] | None], list[str], int]: Returns parallel.
+        """
         loop = asyncio.get_running_loop()
         warnings: list[str] = []
         sem = asyncio.Semaphore(bounded_io_concurrency(config.io_workers))
@@ -3248,7 +3730,7 @@ class SplitTripOptimizer:
             config.passengers.hand_bags > 0 or config.passengers.hold_bags > 0
         )
         max_connection_layover_seconds = (
-            int(config.max_connection_layover_hours * 3600)
+            int(config.max_connection_layover_hours * SECONDS_PER_HOUR)
             if config.max_connection_layover_hours
             else None
         )
@@ -3357,6 +3839,16 @@ class SplitTripOptimizer:
         config: SearchConfig,
         progress: SearchProgressTracker | None = None,
     ) -> dict[str, list[dict[str, Any]]]:
+        """Estimate candidates parallel.
+
+        Args:
+            tasks: Mapping of tasks.
+            config: Search configuration for the operation.
+            progress: Progress ratio for the current phase.
+
+        Returns:
+            dict[str, list[dict[str, Any]]]: Estimated candidates parallel.
+        """
         if not tasks:
             return {}
 
@@ -3432,6 +3924,17 @@ class SplitTripOptimizer:
         search_id: str | None = None,
         progress: SearchProgressTracker | None = None,
     ) -> dict[str, Any]:
+        """Handle search async.
+
+        Args:
+            config: Search configuration for the operation.
+            io_pool: Thread pool used for I/O-bound provider validation.
+            search_id: Identifier of the current search.
+            progress: Progress ratio for the current phase.
+
+        Returns:
+            dict[str, Any]: Handle search async.
+        """
         start_ts = time.time()
         warnings: list[str] = []
         config, hub_resolution_meta, hub_resolution_warnings = (
@@ -3439,7 +3942,7 @@ class SplitTripOptimizer:
         )
         warnings.extend(hub_resolution_warnings)
         if progress is not None:
-            progress.mark_running("Search started.")
+            progress.mark_running(SEARCH_EVENT_STARTED)
             progress.start_phase(
                 "setup",
                 total=1,
@@ -3722,7 +4225,7 @@ class SplitTripOptimizer:
         base_fare_selected_oneways = 0
         base_fare_selected_returns = 0
         max_connection_layover_seconds = (
-            int(config.max_connection_layover_hours * 3600)
+            int(config.max_connection_layover_hours * SECONDS_PER_HOUR)
             if config.max_connection_layover_hours
             else None
         )
@@ -4372,14 +4875,14 @@ class SplitTripOptimizer:
                             sum(int(v or 0) for v in outbound_durations)
                         )
                         outbound_time_to_destination_seconds += (
-                            int(sum(int(v or 0) for v in outbound_boundary_days)) * 86400
+                            int(sum(int(v or 0) for v in outbound_boundary_days)) * SECONDS_PER_DAY
                         )
                     if all(value is not None for value in inbound_durations):
                         inbound_time_to_origin_seconds = int(
                             sum(int(v or 0) for v in inbound_durations)
                         )
                         inbound_time_to_origin_seconds += (
-                            int(sum(int(v or 0) for v in inbound_boundary_days)) * 86400
+                            int(sum(int(v or 0) for v in inbound_boundary_days)) * SECONDS_PER_DAY
                         )
 
                     legs: list[dict[str, Any]] = []
@@ -4640,13 +5143,13 @@ class SplitTripOptimizer:
                     outbound_time_to_destination_seconds = (
                         leg1_duration
                         + leg2_duration
-                        + (int(candidate["outbound_stopover_days"]) * 86400)
+                        + (int(candidate["outbound_stopover_days"]) * SECONDS_PER_DAY)
                     )
                 if leg3_duration is not None and leg4_duration is not None:
                     inbound_time_to_origin_seconds = (
                         leg3_duration
                         + leg4_duration
-                        + (int(candidate["inbound_stopover_days"]) * 86400)
+                        + (int(candidate["inbound_stopover_days"]) * SECONDS_PER_DAY)
                     )
 
                 legs = [
@@ -4916,8 +5419,14 @@ class SplitTripOptimizer:
                 f"of {config.max_connection_layover_hours}h."
             )
         if filtered_invalid_split_boundaries > 0:
-            min_same_h = round(MIN_SPLIT_CONNECTION_SAME_AIRPORT_SECONDS / 3600, 1)
-            min_cross_h = round(MIN_SPLIT_CONNECTION_CROSS_AIRPORT_SECONDS / 3600, 1)
+            min_same_h = round(
+                MIN_SPLIT_CONNECTION_SAME_AIRPORT_SECONDS / SECONDS_PER_HOUR,
+                1,
+            )
+            min_cross_h = round(
+                MIN_SPLIT_CONNECTION_CROSS_AIRPORT_SECONDS / SECONDS_PER_HOUR,
+                1,
+            )
             warnings.append(
                 "Filtered "
                 f"{filtered_invalid_split_boundaries} split itineraries with invalid or too-short self-transfer boundaries "
@@ -5021,8 +5530,8 @@ class SplitTripOptimizer:
                 cheapest_overall = min(
                     items,
                     key=lambda entry: (
-                        int(entry.get("total_price") or 10**12),
-                        int(entry.get("outbound_time_to_destination_seconds") or 10**12),
+                        int(entry.get("total_price") or PRICE_SENTINEL),
+                        int(entry.get("outbound_time_to_destination_seconds") or PRICE_SENTINEL),
                     ),
                 )
                 required: list[dict[str, Any]] = [cheapest_overall]
@@ -5031,8 +5540,10 @@ class SplitTripOptimizer:
                     cheapest_kiwi = min(
                         kiwi_items,
                         key=lambda entry: (
-                            int(entry.get("total_price") or 10**12),
-                            int(entry.get("outbound_time_to_destination_seconds") or 10**12),
+                            int(entry.get("total_price") or PRICE_SENTINEL),
+                            int(
+                                entry.get("outbound_time_to_destination_seconds") or PRICE_SENTINEL
+                            ),
                         ),
                     )
                     if str(cheapest_kiwi.get("result_id") or "") != str(
@@ -5205,11 +5716,11 @@ class SplitTripOptimizer:
                     "filtered_by_connection_layover": filtered_by_connection_layover,
                     "filtered_invalid_split_boundaries": filtered_invalid_split_boundaries,
                     "min_split_connection_same_airport_hours": round(
-                        MIN_SPLIT_CONNECTION_SAME_AIRPORT_SECONDS / 3600,
+                        MIN_SPLIT_CONNECTION_SAME_AIRPORT_SECONDS / SECONDS_PER_HOUR,
                         2,
                     ),
                     "min_split_connection_cross_airport_hours": round(
-                        MIN_SPLIT_CONNECTION_CROSS_AIRPORT_SECONDS / 3600,
+                        MIN_SPLIT_CONNECTION_CROSS_AIRPORT_SECONDS / SECONDS_PER_HOUR,
                         2,
                     ),
                 },
@@ -5225,11 +5736,21 @@ class SplitTripOptimizer:
         search_id: str | None = None,
         progress: SearchProgressTracker | None = None,
     ) -> dict[str, Any]:
+        """Handle search.
+
+        Args:
+            config: Search configuration for the operation.
+            search_id: Identifier of the current search.
+            progress: Progress ratio for the current phase.
+
+        Returns:
+            dict[str, Any]: Handle search.
+        """
         if not search_id:
             search_id = uuid.uuid4().hex[:12]
         wall_start = time.time()
         if progress is not None:
-            progress.mark_running("Search request accepted.")
+            progress.mark_running(SEARCH_EVENT_REQUEST_ACCEPTED)
         log_event(
             logging.INFO,
             "search_started",

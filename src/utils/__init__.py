@@ -9,7 +9,7 @@ from urllib.parse import urlencode, urljoin
 
 import requests
 
-from .config import (
+from ..config import (
     _FX_CACHE_LOCK,
     _FX_CACHE_TTL_SECONDS,
     _FX_RATE_CACHE,
@@ -19,9 +19,19 @@ from .config import (
     MIN_SPLIT_CONNECTION_SAME_AIRPORT_SECONDS,
     SUPPORTED_PROVIDER_IDS,
 )
+from .constants import SECONDS_PER_DAY, SECONDS_PER_HOUR, SECONDS_PER_MINUTE
 
 
 def normalize_codes(value: Any, fallback: list[str]) -> tuple[str, ...]:
+    """Normalize airport codes from the provided input.
+
+    Args:
+        value: Input value to process.
+        fallback: Fallback value to use when parsing fails.
+
+    Returns:
+        tuple[str, ...]: Normalized airport codes from the provided input.
+    """
     if isinstance(value, str):
         raw = value.replace(";", ",").split(",")
     elif isinstance(value, list):
@@ -42,6 +52,14 @@ def normalize_codes(value: Any, fallback: list[str]) -> tuple[str, ...]:
 
 
 def normalize_provider_ids(value: Any) -> tuple[str, ...]:
+    """Normalize provider identifiers from the provided input.
+
+    Args:
+        value: Input value to process.
+
+    Returns:
+        tuple[str, ...]: Normalized provider identifiers from the provided input.
+    """
     if isinstance(value, str):
         raw = value.replace(";", ",").split(",")
     elif isinstance(value, list):
@@ -67,12 +85,32 @@ def normalize_provider_ids(value: Any) -> tuple[str, ...]:
 
 
 def to_date(value: Any, fallback: dt.date) -> dt.date:
+    """Convert the input value to a date.
+
+    Args:
+        value: Input value to process.
+        fallback: Fallback value to use when parsing fails.
+
+    Returns:
+        dt.date: Converted input value to a date.
+    """
     if not value:
         return fallback
     return dt.date.fromisoformat(str(value))
 
 
 def clamp_int(value: Any, fallback: int, low: int, high: int) -> int:
+    """Clamp an integer value to the allowed range.
+
+    Args:
+        value: Input value to process.
+        fallback: Fallback value to use when parsing fails.
+        low: Lower bound for the accepted range.
+        high: Upper bound for the accepted range.
+
+    Returns:
+        int: Clamped integer value to the allowed range.
+    """
     try:
         parsed = int(value)
     except (TypeError, ValueError):
@@ -81,6 +119,17 @@ def clamp_int(value: Any, fallback: int, low: int, high: int) -> int:
 
 
 def clamp_optional_int(value: Any, fallback: int | None, low: int, high: int) -> int | None:
+    """Clamp an optional integer value to the allowed range.
+
+    Args:
+        value: Input value to process.
+        fallback: Fallback value to use when parsing fails.
+        low: Lower bound for the accepted range.
+        high: Upper bound for the accepted range.
+
+    Returns:
+        int | None: Clamped optional integer value to the allowed range.
+    """
     if value in (None, ""):
         return fallback
     try:
@@ -93,6 +142,14 @@ def clamp_optional_int(value: Any, fallback: int | None, low: int, high: int) ->
 
 
 def bounded_io_concurrency(io_workers: int) -> int:
+    """Return the bounded I/O concurrency level.
+
+    Args:
+        io_workers: Maximum number of I/O workers to use.
+
+    Returns:
+        int: The bounded I/O concurrency level.
+    """
     try:
         parsed = int(io_workers)
     except (TypeError, ValueError):
@@ -101,6 +158,15 @@ def bounded_io_concurrency(io_workers: int) -> int:
 
 
 def to_bool(value: Any, fallback: bool = False) -> bool:
+    """Convert the input value to a boolean.
+
+    Args:
+        value: Input value to process.
+        fallback: Fallback value to use when parsing fails.
+
+    Returns:
+        bool: Converted input value to a boolean.
+    """
     if isinstance(value, bool):
         return value
     if value is None:
@@ -114,6 +180,15 @@ def to_bool(value: Any, fallback: bool = False) -> bool:
 
 
 def date_range(start: dt.date, end: dt.date) -> list[dt.date]:
+    """Build an inclusive range of dates.
+
+    Args:
+        start: Start value for the requested range.
+        end: End value for the requested range.
+
+    Returns:
+        list[dt.date]: An inclusive range of dates.
+    """
     days = (end - start).days
     if days < 0:
         return []
@@ -121,6 +196,15 @@ def date_range(start: dt.date, end: dt.date) -> list[dt.date]:
 
 
 def haversine_km(a: tuple[float, float], b: tuple[float, float]) -> float:
+    """Calculate the great-circle distance in kilometers.
+
+    Args:
+        a: First latitude and longitude pair.
+        b: Second latitude and longitude pair.
+
+    Returns:
+        float: Calculated great-circle distance in kilometers.
+    """
     radius = 6371.0
     lat1, lon1 = map(math.radians, a)
     lat2, lon2 = map(math.radians, b)
@@ -136,6 +220,17 @@ def kiwi_oneway_url(
     date_iso: str,
     max_stops_per_leg: int | None = None,
 ) -> str:
+    """Build the Kiwi one-way booking URL.
+
+    Args:
+        source: Origin airport code for the request.
+        destination: Destination airport code for the request.
+        date_iso: Travel date in ISO 8601 format.
+        max_stops_per_leg: Max stops per leg.
+
+    Returns:
+        str: The Kiwi one-way booking URL.
+    """
     src = str(source or "").strip().lower()
     dst = str(destination or "").strip().lower()
     if not src or not dst:
@@ -158,6 +253,18 @@ def kiwi_return_url(
     inbound_iso: str,
     max_stops_per_leg: int | None = None,
 ) -> str:
+    """Build the Kiwi round-trip booking URL.
+
+    Args:
+        source: Origin airport code for the request.
+        destination: Destination airport code for the request.
+        outbound_iso: Outbound travel date in ISO 8601 format.
+        inbound_iso: Inbound travel date in ISO 8601 format.
+        max_stops_per_leg: Max stops per leg.
+
+    Returns:
+        str: The Kiwi round-trip booking URL.
+    """
     src = str(source or "").strip().lower()
     dst = str(destination or "").strip().lower()
     if not src or not dst:
@@ -175,6 +282,14 @@ def kiwi_return_url(
 
 
 def absolute_kiwi_url(path_or_url: str | None) -> str | None:
+    """Return an absolute Kiwi URL.
+
+    Args:
+        path_or_url: URL for path or.
+
+    Returns:
+        str | None: An absolute Kiwi URL.
+    """
     raw = str(path_or_url or "").strip()
     if not raw:
         return None
@@ -186,6 +301,15 @@ def absolute_kiwi_url(path_or_url: str | None) -> str | None:
 
 
 def absolute_kayak_url(path_or_url: str | None, host: str = KAYAK_SCRAPE_HOST) -> str | None:
+    """Return an absolute Kayak URL.
+
+    Args:
+        path_or_url: URL for path or.
+        host: Host name for the request.
+
+    Returns:
+        str | None: An absolute Kayak URL.
+    """
     raw = str(path_or_url or "").strip()
     if not raw:
         return None
@@ -196,6 +320,14 @@ def absolute_kayak_url(path_or_url: str | None, host: str = KAYAK_SCRAPE_HOST) -
 
 
 def itinerary_booking_url(itinerary: dict[str, Any] | None) -> str | None:
+    """Resolve the preferred booking URL for an itinerary.
+
+    Args:
+        itinerary: Mapping of itinerary.
+
+    Returns:
+        str | None: Resolved preferred booking URL for an itinerary.
+    """
     booking_options = (itinerary or {}).get("bookingOptions") or {}
     edges = booking_options.get("edges") or []
     if not isinstance(edges, list):
@@ -210,6 +342,14 @@ def itinerary_booking_url(itinerary: dict[str, Any] | None) -> str | None:
 
 
 def parse_local_datetime(value: Any) -> dt.datetime | None:
+    """Parse a local date-time string.
+
+    Args:
+        value: Input value to process.
+
+    Returns:
+        dt.datetime | None: Parsed local date-time string.
+    """
     raw = str(value or "").strip()
     if not raw:
         return None
@@ -226,6 +366,15 @@ def parse_local_datetime(value: Any) -> dt.datetime | None:
 
 
 def connection_gap_seconds(arrive_local: Any, depart_local: Any) -> int | None:
+    """Calculate the connection gap in seconds.
+
+    Args:
+        arrive_local: Localized arrival timestamp for the segment.
+        depart_local: Depart local.
+
+    Returns:
+        int | None: Calculated connection gap in seconds.
+    """
     arrive = parse_local_datetime(arrive_local)
     depart = parse_local_datetime(depart_local)
     if not arrive or not depart:
@@ -238,6 +387,14 @@ def connection_gap_seconds(arrive_local: Any, depart_local: Any) -> int | None:
 
 
 def max_segment_layover_seconds(segments: list[dict[str, Any]] | None) -> int | None:
+    """Return the maximum layover across itinerary segments.
+
+    Args:
+        segments: Mapping of segments.
+
+    Returns:
+        int | None: The maximum layover across itinerary segments.
+    """
     if not segments:
         return 0
     if len(segments) < 2:
@@ -260,6 +417,15 @@ def minimum_split_boundary_connection_seconds(
     arrival_airport: str,
     next_departure_airport: str,
 ) -> int:
+    """Return the minimum allowed split-boundary connection time.
+
+    Args:
+        arrival_airport: Arrival airport code for the current leg.
+        next_departure_airport: Departure airport code for the following leg.
+
+    Returns:
+        int: The minimum allowed split-boundary connection time.
+    """
     arrived = str(arrival_airport or "").strip().upper()
     departed = str(next_departure_airport or "").strip().upper()
     if arrived and departed and arrived == departed:
@@ -268,10 +434,26 @@ def minimum_split_boundary_connection_seconds(
 
 
 def date_only(value: Any) -> str:
+    """Return the date portion of a date-time string.
+
+    Args:
+        value: Input value to process.
+
+    Returns:
+        str: The date portion of a date-time string.
+    """
     return str(value or "").strip()[:10]
 
 
 def parse_iso8601_duration_seconds(value: Any) -> int | None:
+    """Parse an ISO 8601 duration into seconds.
+
+    Args:
+        value: Input value to process.
+
+    Returns:
+        int | None: Parsed ISO 8601 duration into seconds.
+    """
     raw = str(value or "").strip().upper()
     if not raw:
         return None
@@ -285,10 +467,23 @@ def parse_iso8601_duration_seconds(value: Any) -> int | None:
     hours = int(match.group("hours") or 0)
     minutes = int(match.group("minutes") or 0)
     seconds = int(match.group("seconds") or 0)
-    return (days * 86400) + (hours * 3600) + (minutes * 60) + seconds
+    return (
+        (days * SECONDS_PER_DAY)
+        + (hours * SECONDS_PER_HOUR)
+        + (minutes * SECONDS_PER_MINUTE)
+        + seconds
+    )
 
 
 def parse_duration_text_seconds(value: Any) -> int | None:
+    """Parse a duration string into seconds.
+
+    Args:
+        value: Input value to process.
+
+    Returns:
+        int | None: Parsed duration string into seconds.
+    """
     raw = str(value or "").strip().lower()
     if not raw:
         return None
@@ -304,10 +499,18 @@ def parse_duration_text_seconds(value: Any) -> int | None:
         minutes = int(minute_match.group(1))
     if hours == 0 and minutes == 0:
         return None
-    return (hours * 3600) + (minutes * 60)
+    return (hours * SECONDS_PER_HOUR) + (minutes * SECONDS_PER_MINUTE)
 
 
 def parse_money_amount_int(value: Any) -> int | None:
+    """Parse a money amount into an integer value.
+
+    Args:
+        value: Input value to process.
+
+    Returns:
+        int | None: Parsed money amount into an integer value.
+    """
     if value in (None, ""):
         return None
     if isinstance(value, int | float):
@@ -338,6 +541,14 @@ def parse_money_amount_int(value: Any) -> int | None:
 
 
 def _get_fx_rates(base_currency: str) -> dict[str, float] | None:
+    """Get fx rates.
+
+    Args:
+        base_currency: Base currency.
+
+    Returns:
+        dict[str, float] | None: Get fx rates.
+    """
     normalized_base = str(base_currency or "").strip().upper()
     if not normalized_base:
         return None
@@ -387,6 +598,16 @@ def convert_currency_amount(
     from_currency: str,
     to_currency: str,
 ) -> int | None:
+    """Convert an amount between currencies.
+
+    Args:
+        amount: Numeric amount to convert or format.
+        from_currency: From currency.
+        to_currency: To currency.
+
+    Returns:
+        int | None: Converted amount between currencies.
+    """
     if amount is None:
         return None
     try:
@@ -412,6 +633,14 @@ def convert_currency_amount(
 
 
 def parse_datetime_guess(value: Any) -> str | None:
+    """Parse a date-time value using the supported heuristics.
+
+    Args:
+        value: Input value to process.
+
+    Returns:
+        str | None: Parsed date-time value using the supported heuristics.
+    """
     raw = str(value or "").strip()
     if not raw:
         return None
@@ -435,6 +664,15 @@ def parse_datetime_guess(value: Any) -> str | None:
 
 
 def parse_google_flights_text_datetime(value: Any, date_hint_iso: str) -> str | None:
+    """Parse a Google Flights text date-time value.
+
+    Args:
+        value: Input value to process.
+        date_hint_iso: Date hint iso.
+
+    Returns:
+        str | None: Parsed Google Flights text date-time value.
+    """
     raw = str(value or "").strip()
     if not raw:
         return None
@@ -470,6 +708,20 @@ def build_comparison_links(
     max_stops_per_leg: int | None = None,
     currency: str = "RON",
 ) -> dict[str, str]:
+    """Build comparison links for external flight sites.
+
+    Args:
+        origin: Origin code for the operation.
+        destination: Destination airport code for the request.
+        depart_date: Date for depart.
+        return_date: Date for return.
+        adults: Number of adult travelers.
+        max_stops_per_leg: Max stops per leg.
+        currency: Currency code for pricing output.
+
+    Returns:
+        dict[str, str]: Comparison links for external flight sites.
+    """
     orig = str(origin or "").strip().upper()
     dest = str(destination or "").strip().upper()
     dep = date_only(depart_date)
@@ -545,6 +797,16 @@ def leg_endpoints_from_segments(
     fallback_source: str,
     fallback_destination: str,
 ) -> tuple[str, str]:
+    """Return the origin and destination for a segment list.
+
+    Args:
+        segments: Mapping of segments.
+        fallback_source: Fallback source airport code to use when segments are missing.
+        fallback_destination: Fallback destination airport code to use when segments are missing.
+
+    Returns:
+        tuple[str, str]: The origin and destination for a segment list.
+    """
     if not segments:
         return fallback_source, fallback_destination
     source = str(segments[0].get("from") or fallback_source).strip().upper()
@@ -553,7 +815,14 @@ def leg_endpoints_from_segments(
 
 
 def transfer_events_from_segments(segments: list[dict[str, Any]] | None) -> int:
-    """Count transfer events, including airport changes between consecutive segments."""
+    """Build transfer events from normalized segments.
+
+    Args:
+        segments: Mapping of segments.
+
+    Returns:
+        int: Transfer events from normalized segments.
+    """
     if not segments:
         return 0
 
@@ -568,7 +837,15 @@ def transfer_events_from_segments(segments: list[dict[str, Any]] | None) -> int:
 
 
 def boundary_transfer_events(arrival_airport: str, next_departure_airport: str) -> int:
-    """Count transfer events between two separately ticketed legs."""
+    """Build transfer events for itinerary boundaries.
+
+    Args:
+        arrival_airport: Arrival airport code for the current leg.
+        next_departure_airport: Departure airport code for the following leg.
+
+    Returns:
+        int: Transfer events for itinerary boundaries.
+    """
     events = 1
     arrived = str(arrival_airport or "").strip().upper()
     next_departure = str(next_departure_airport or "").strip().upper()

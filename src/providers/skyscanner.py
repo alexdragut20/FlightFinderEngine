@@ -29,6 +29,8 @@ from ._cache import per_instance_lru_cache
 
 
 class SkyscannerScrapeClient:
+    """Provider client for Skyscanner scrape-based flight lookups."""
+
     provider_id = "skyscanner"
     display_name = "Skyscanner Scrape (experimental)"
     supports_calendar = False
@@ -80,6 +82,14 @@ class SkyscannerScrapeClient:
         http_retries: int | None = None,
         playwright_fallback: bool | None = None,
     ) -> None:
+        """Initialize the SkyscannerScrapeClient.
+
+        Args:
+            host: Host name for the request.
+            host_candidates: Collection of host candidates.
+            http_retries: Number of HTTP retries to allow.
+            playwright_fallback: Flag that controls whether Playwright fallback is enabled.
+        """
         normalized_host = str(host or SKYSCANNER_SCRAPE_HOST).strip().lower()
         self._host = normalized_host or SKYSCANNER_SCRAPE_HOST
         configured_candidates = list(host_candidates or SKYSCANNER_SCRAPE_HOSTS)
@@ -104,30 +114,55 @@ class SkyscannerScrapeClient:
 
     @classmethod
     def _set_provider_cooldown(cls, seconds: int) -> None:
+        """Set the provider cooldown window.
+
+        Args:
+            seconds: Duration in seconds for the operation.
+        """
         until = time.time() + max(0, int(seconds))
         with cls._COOLDOWN_LOCK:
             cls._PROVIDER_COOLDOWN_UNTIL = max(cls._PROVIDER_COOLDOWN_UNTIL, until)
 
     @classmethod
     def _set_playwright_cooldown(cls, seconds: int) -> None:
+        """Set the Playwright cooldown window.
+
+        Args:
+            seconds: Duration in seconds for the operation.
+        """
         until = time.time() + max(0, int(seconds))
         with cls._COOLDOWN_LOCK:
             cls._PLAYWRIGHT_COOLDOWN_UNTIL = max(cls._PLAYWRIGHT_COOLDOWN_UNTIL, until)
 
     @classmethod
     def _provider_cooldown_remaining_seconds(cls) -> int:
+        """Return the remaining provider cooldown in seconds.
+
+        Returns:
+            int: The remaining provider cooldown in seconds.
+        """
         with cls._COOLDOWN_LOCK:
             remaining = int(math.ceil(cls._PROVIDER_COOLDOWN_UNTIL - time.time()))
         return max(0, remaining)
 
     @classmethod
     def _playwright_cooldown_remaining_seconds(cls) -> int:
+        """Return the remaining Playwright cooldown in seconds.
+
+        Returns:
+            int: The remaining Playwright cooldown in seconds.
+        """
         with cls._COOLDOWN_LOCK:
             remaining = int(math.ceil(cls._PLAYWRIGHT_COOLDOWN_UNTIL - time.time()))
         return max(0, remaining)
 
     @classmethod
     def _get_or_start_playwright_runtime(cls) -> tuple[Any, Any]:
+        """Get or start the shared Playwright runtime.
+
+        Returns:
+            tuple[Any, Any]: Get or start the shared Playwright runtime.
+        """
         with cls._PLAYWRIGHT_RUNTIME_LOCK:
             if cls._PLAYWRIGHT_RUNTIME is not None:
                 return cls._PLAYWRIGHT_RUNTIME
@@ -146,6 +181,7 @@ class SkyscannerScrapeClient:
 
     @classmethod
     def _close_playwright_runtime(cls) -> None:
+        """Close the shared Playwright runtime."""
         with cls._PLAYWRIGHT_RUNTIME_LOCK:
             runtime = cls._PLAYWRIGHT_RUNTIME
             cls._PLAYWRIGHT_RUNTIME = None
@@ -158,9 +194,19 @@ class SkyscannerScrapeClient:
             playwright.stop()
 
     def is_configured(self) -> bool:
+        """Return whether the client is configured for use.
+
+        Returns:
+            bool: True when the client is configured for use; otherwise, False.
+        """
         return True
 
     def _session(self) -> requests.Session:
+        """Return the cached requests session.
+
+        Returns:
+            requests.Session: The cached requests session.
+        """
         if not hasattr(self._local, "session"):
             session = requests.Session()
             session.headers.update(
@@ -175,6 +221,11 @@ class SkyscannerScrapeClient:
         return self._local.session
 
     def _hosts_to_try(self) -> list[str]:
+        """Return the ordered list of provider hosts to try.
+
+        Returns:
+            list[str]: The ordered list of provider hosts to try.
+        """
         out: list[str] = []
         for candidate in [self._host, *self._host_candidates_config, "www.skyscanner.com"]:
             host = str(candidate or "").strip().lower()
@@ -185,6 +236,15 @@ class SkyscannerScrapeClient:
 
     @staticmethod
     def _replace_url_host(url: str, host: str) -> str:
+        """Replace the host portion of a URL.
+
+        Args:
+            url: URL to request or parse.
+            host: Host name for the request.
+
+        Returns:
+            str: Replace the host portion of a URL.
+        """
         parsed = urlsplit(url)
         if not parsed.scheme:
             return f"https://{host}{url}"
@@ -199,6 +259,19 @@ class SkyscannerScrapeClient:
         currency: str,
         adults: int,
     ) -> str:
+        """Build the provider search page URL.
+
+        Args:
+            source: Origin airport code for the request.
+            destination: Destination airport code for the request.
+            outbound_iso: Outbound travel date in ISO 8601 format.
+            inbound_iso: Inbound travel date in ISO 8601 format.
+            currency: Currency code for pricing output.
+            adults: Number of adult travelers.
+
+        Returns:
+            str: The provider search page URL.
+        """
         outbound_part = date_only(outbound_iso).replace("-", "")
         inbound_part = date_only(inbound_iso).replace("-", "") if inbound_iso else ""
         path = f"/transport/flights/{source.lower()}/{destination.lower()}/{outbound_part}/"
@@ -214,6 +287,15 @@ class SkyscannerScrapeClient:
         return f"https://{self._host}{path}?{urlencode(params)}"
 
     def _http_fetch_search_html(self, url: str, attempt_idx: int = 0) -> tuple[str, str, int]:
+        """Fetch the search page over HTTP.
+
+        Args:
+            url: URL to request or parse.
+            attempt_idx: Zero-based attempt index for the retry loop.
+
+        Returns:
+            tuple[str, str, int]: The search page over HTTP.
+        """
         session = self._session()
         session.headers["User-Agent"] = self._USER_AGENTS[attempt_idx % len(self._USER_AGENTS)]
         response = session.get(url, timeout=45, allow_redirects=True)
@@ -228,6 +310,16 @@ class SkyscannerScrapeClient:
         final_url: str,
         status_code: int,
     ) -> bool:
+        """Return whether the response indicates bot blocking.
+
+        Args:
+            html: HTML document to parse.
+            final_url: URL for final.
+            status_code: HTTP status code for the response.
+
+        Returns:
+            bool: True when the response indicates bot blocking; otherwise, False.
+        """
         if status_code in {403, 429, 451, 503}:
             return True
         lowered_url = final_url.lower()
@@ -239,6 +331,14 @@ class SkyscannerScrapeClient:
         return any(marker in lowered_text for marker in cls._BLOCK_MARKERS)
 
     def _fetch_search_html_playwright(self, url: str) -> tuple[str, str]:
+        """Fetch the search page through Playwright.
+
+        Args:
+            url: URL to request or parse.
+
+        Returns:
+            tuple[str, str]: The search page through Playwright.
+        """
         cooldown_remaining = self._playwright_cooldown_remaining_seconds()
         if cooldown_remaining > 0:
             raise ProviderNoResultError(
@@ -318,6 +418,14 @@ class SkyscannerScrapeClient:
             self._PLAYWRIGHT_GATE.release()
 
     def _fetch_search_html(self, url: str) -> tuple[str, str]:
+        """Fetch the search page using the best available strategy.
+
+        Args:
+            url: URL to request or parse.
+
+        Returns:
+            tuple[str, str]: The search page using the best available strategy.
+        """
         provider_cooldown = self._provider_cooldown_remaining_seconds()
         if provider_cooldown > 0:
             raise ProviderNoResultError(
@@ -389,6 +497,14 @@ class SkyscannerScrapeClient:
 
     @staticmethod
     def _extract_best_price(html: str) -> int | None:
+        """Extract the best visible price from the search page.
+
+        Args:
+            html: HTML document to parse.
+
+        Returns:
+            int | None: Extract the best visible price from the search page.
+        """
         offers = SkyscannerScrapeClient._extract_offer_options(html)
         if offers:
             return int(offers[0].get("price") or 0) or None
@@ -412,6 +528,14 @@ class SkyscannerScrapeClient:
 
     @staticmethod
     def _extract_offer_options(html: str) -> list[dict[str, Any]]:
+        """Extract offer options from the provider payload.
+
+        Args:
+            html: HTML document to parse.
+
+        Returns:
+            list[dict[str, Any]]: Extract offer options from the provider payload.
+        """
         offers: list[dict[str, Any]] = []
         for payload in SkyscannerScrapeClient._extract_json_script_payloads(html):
             SkyscannerScrapeClient._collect_offer_nodes(payload, offers)
@@ -453,6 +577,14 @@ class SkyscannerScrapeClient:
 
     @staticmethod
     def _extract_json_script_payloads(html: str) -> list[Any]:
+        """Extract JSON payloads embedded in script tags.
+
+        Args:
+            html: HTML document to parse.
+
+        Returns:
+            list[Any]: Extract JSON payloads embedded in script tags.
+        """
         payloads: list[Any] = []
         for match in re.finditer(r"<script[^>]*>(.*?)</script>", html, re.IGNORECASE | re.DOTALL):
             raw = str(match.group(1) or "").strip()
@@ -477,6 +609,14 @@ class SkyscannerScrapeClient:
 
     @staticmethod
     def _extract_offer_options_regex(html: str) -> list[dict[str, Any]]:
+        """Extract offer options regex.
+
+        Args:
+            html: HTML document to parse.
+
+        Returns:
+            list[dict[str, Any]]: Extract offer options regex.
+        """
         offers: list[dict[str, Any]] = []
         name_keys = "bookingProviderName|providerName|agentName|merchantName|vendorName|name"
         price_keys = "rawPrice|totalPrice|minPrice|lowestPrice|price|amount"
@@ -510,6 +650,12 @@ class SkyscannerScrapeClient:
 
     @staticmethod
     def _collect_offer_nodes(payload: Any, offers: list[dict[str, Any]]) -> None:
+        """Handle collect offer nodes.
+
+        Args:
+            payload: JSON-serializable payload for the operation.
+            offers: Mapping of offers.
+        """
         stack: list[Any] = [payload]
         max_nodes = 20000
         nodes_seen = 0
@@ -530,6 +676,14 @@ class SkyscannerScrapeClient:
 
     @staticmethod
     def _offer_from_node(node: dict[str, Any]) -> dict[str, Any] | None:
+        """Handle offer from node.
+
+        Args:
+            node: Mapping of node.
+
+        Returns:
+            dict[str, Any] | None: Handle offer from node.
+        """
         provider = SkyscannerScrapeClient._extract_provider_name(node)
         if not provider:
             return None
@@ -549,6 +703,14 @@ class SkyscannerScrapeClient:
 
     @staticmethod
     def _extract_provider_name(node: dict[str, Any]) -> str | None:
+        """Extract provider name.
+
+        Args:
+            node: Mapping of node.
+
+        Returns:
+            str | None: Extract provider name.
+        """
         preferred_keys = {
             "bookingprovidername",
             "bookingprovider",
@@ -580,6 +742,14 @@ class SkyscannerScrapeClient:
 
     @staticmethod
     def _extract_price_from_node(node: dict[str, Any]) -> int | None:
+        """Extract price from node.
+
+        Args:
+            node: Mapping of node.
+
+        Returns:
+            int | None: Extract price from node.
+        """
         candidate_values: list[Any] = []
         for key, value in node.items():
             key_l = str(key or "").strip().lower()
@@ -606,6 +776,15 @@ class SkyscannerScrapeClient:
 
     @staticmethod
     def _parse_price_value(value: Any, depth: int = 0) -> int | None:
+        """Parse price value.
+
+        Args:
+            value: Input value to process.
+            depth: Traversal depth for the graph search.
+
+        Returns:
+            int | None: Parsed price value.
+        """
         if isinstance(value, dict):
             for key in (
                 "rawPrice",
@@ -633,6 +812,14 @@ class SkyscannerScrapeClient:
 
     @staticmethod
     def _extract_currency_from_node(node: dict[str, Any]) -> str | None:
+        """Extract currency from node.
+
+        Args:
+            node: Mapping of node.
+
+        Returns:
+            str | None: Extract currency from node.
+        """
         for key, value in node.items():
             key_l = str(key or "").strip().lower()
             if key_l in {"currency", "currencycode", "curr"}:
@@ -649,6 +836,14 @@ class SkyscannerScrapeClient:
 
     @staticmethod
     def _extract_booking_url_from_node(node: dict[str, Any]) -> str | None:
+        """Extract booking url from node.
+
+        Args:
+            node: Mapping of node.
+
+        Returns:
+            str | None: Extract booking url from node.
+        """
         for key, value in node.items():
             key_l = str(key or "").strip().lower()
             if key_l in {
@@ -672,6 +867,15 @@ class SkyscannerScrapeClient:
 
     @staticmethod
     def _extract_stops_hint(html: str, max_stops_per_leg: int) -> int:
+        """Extract stops hint.
+
+        Args:
+            html: HTML document to parse.
+            max_stops_per_leg: Max stops per leg.
+
+        Returns:
+            int: Extract stops hint.
+        """
         for match in re.finditer(r'"stops"\s*:\s*([0-9])', html):
             try:
                 parsed = int(match.group(1))
@@ -683,6 +887,15 @@ class SkyscannerScrapeClient:
 
     @staticmethod
     def _synthetic_segments(source: str, destination: str) -> list[dict[str, Any]]:
+        """Handle synthetic segments.
+
+        Args:
+            source: Origin airport code for the request.
+            destination: Destination airport code for the request.
+
+        Returns:
+            list[dict[str, Any]]: Handle synthetic segments.
+        """
         return [
             {
                 "from": source,
@@ -709,6 +922,22 @@ class SkyscannerScrapeClient:
         hand_bags: int,
         hold_bags: int,
     ) -> dict[str, int]:
+        """Fetch calendar prices for the requested market.
+
+        Args:
+            source: Origin airport code for the request.
+            destination: Destination airport code for the request.
+            date_start_iso: Start date in ISO 8601 format.
+            date_end_iso: End date in ISO 8601 format.
+            currency: Currency code for pricing output.
+            max_stops_per_leg: Max stops per leg.
+            adults: Number of adult travelers.
+            hand_bags: Number of cabin bags per adult traveler.
+            hold_bags: Number of checked bags per adult traveler.
+
+        Returns:
+            dict[str, int]: Calendar prices for the requested market.
+        """
         return {}
 
     @per_instance_lru_cache(maxsize=32768)
@@ -724,6 +953,22 @@ class SkyscannerScrapeClient:
         hold_bags: int,
         max_connection_layover_seconds: int | None = None,
     ) -> dict[str, Any] | None:
+        """Fetch the best one-way itinerary for the requested market.
+
+        Args:
+            source: Origin airport code for the request.
+            destination: Destination airport code for the request.
+            departure_iso: Departure date in ISO 8601 format.
+            currency: Currency code for pricing output.
+            max_stops_per_leg: Max stops per leg.
+            adults: Number of adult travelers.
+            hand_bags: Number of cabin bags per adult traveler.
+            hold_bags: Number of checked bags per adult traveler.
+            max_connection_layover_seconds: Duration in seconds for max connection layover.
+
+        Returns:
+            dict[str, Any] | None: The best one-way itinerary for the requested market.
+        """
         source_code = source.upper()
         destination_code = destination.upper()
         url = self._search_page_url(
@@ -777,6 +1022,23 @@ class SkyscannerScrapeClient:
         hold_bags: int,
         max_connection_layover_seconds: int | None = None,
     ) -> dict[str, Any] | None:
+        """Fetch the best round-trip itinerary for the requested market.
+
+        Args:
+            source: Origin airport code for the request.
+            destination: Destination airport code for the request.
+            outbound_iso: Outbound travel date in ISO 8601 format.
+            inbound_iso: Inbound travel date in ISO 8601 format.
+            currency: Currency code for pricing output.
+            max_stops_per_leg: Max stops per leg.
+            adults: Number of adult travelers.
+            hand_bags: Number of cabin bags per adult traveler.
+            hold_bags: Number of checked bags per adult traveler.
+            max_connection_layover_seconds: Duration in seconds for max connection layover.
+
+        Returns:
+            dict[str, Any] | None: The best round-trip itinerary for the requested market.
+        """
         source_code = source.upper()
         destination_code = destination.upper()
         url = self._search_page_url(

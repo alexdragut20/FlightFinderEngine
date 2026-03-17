@@ -4,15 +4,15 @@ from collections import Counter
 
 import pytest
 
-from flight_layover_lab.airports import AirportCoordinates
-from flight_layover_lab.config import (
+from src.config import (
     MIN_SPLIT_CONNECTION_CROSS_AIRPORT_SECONDS,
     MIN_SPLIT_CONNECTION_SAME_AIRPORT_SECONDS,
 )
-from flight_layover_lab.engine import SplitTripOptimizer, _estimate_candidates_for_destination
-from flight_layover_lab.exceptions import ProviderNoResultError
-from flight_layover_lab.providers import KiwiClient, MultiProviderClient, SerpApiGoogleFlightsClient
-from flight_layover_lab.utils import (
+from src.data.airports import AirportCoordinates
+from src.engine import SplitTripOptimizer, _estimate_candidates_for_destination
+from src.exceptions import ProviderNoResultError
+from src.providers import KiwiClient, MultiProviderClient, SerpApiGoogleFlightsClient
+from src.utils import (
     boundary_transfer_events,
     build_comparison_links,
     connection_gap_seconds,

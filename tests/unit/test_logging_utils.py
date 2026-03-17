@@ -5,8 +5,8 @@ import itertools
 import logging
 from pathlib import Path
 
-from flight_layover_lab import logging_utils
-from flight_layover_lab import resources as resources_module
+from src.data import resources as resources_module
+from src.utils import logging as logging_utils
 
 
 def _captured_files(path: Path) -> list[Path]:

@@ -162,7 +162,7 @@ Run the main quality checks manually:
 ```bash
 ruff check .
 ruff format --check .
-pytest --cov=src/flight_layover_lab --cov-report=term-missing
+pytest --cov=src --cov-report=term-missing
 ```
 
 The repository includes:
@@ -187,7 +187,13 @@ Output is written under `cache/`.
 
 ```text
 .
-|- src/flight_layover_lab/    Core engine, providers, HTTP server, progress tracking
+|- src/                       Main package root
+|  |- data/                   Airport metadata, hub seeds, resource paths
+|  |- engine/                 Search optimizer and ranking logic
+|  |- models/                 Search and passenger models
+|  |- providers/              Fare-source adapters
+|  |- services/               HTTP server, progress, async job orchestration
+|  |- utils/                  Shared helpers and logging utilities
 |- static/                    Browser UI assets
 |- tests/                     Unit and integration coverage
 |- docs/                      Supporting research notes

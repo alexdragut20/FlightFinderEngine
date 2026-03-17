@@ -4,12 +4,15 @@ import csv
 
 import requests
 
-from .config import AIRPORTS_DATA_URL, DESTINATION_NOTES, FALLBACK_COORDS
+from ..config import AIRPORTS_DATA_URL, DESTINATION_NOTES, FALLBACK_COORDS
 from .resources import AIRPORTS_CACHE_PATH, CACHE_DIR
 
 
 class AirportCoordinates:
+    """Airport coordinate lookup and caching service."""
+
     def __init__(self) -> None:
+        """Initialize the AirportCoordinates."""
         self._coords: dict[str, tuple[float, float]] = dict(FALLBACK_COORDS)
         self._labels: dict[str, str] = {
             code: str(meta.get("name") or code) for code, meta in DESTINATION_NOTES.items()
@@ -17,6 +20,14 @@ class AirportCoordinates:
         self._loaded_from_file = False
 
     def get(self, code: str) -> tuple[float, float] | None:
+        """Handle get.
+
+        Args:
+            code: Airport or provider code to process.
+
+        Returns:
+            tuple[float, float] | None: Handle get.
+        """
         code = code.upper().strip()
         if not code:
             return None
@@ -26,6 +37,14 @@ class AirportCoordinates:
         return self._coords.get(code)
 
     def display_name(self, code: str) -> str | None:
+        """Handle display name.
+
+        Args:
+            code: Airport or provider code to process.
+
+        Returns:
+            str | None: Handle display name.
+        """
         normalized = str(code or "").strip().upper()
         if not normalized:
             return None
@@ -36,6 +55,7 @@ class AirportCoordinates:
         return label
 
     def _ensure_loaded(self) -> None:
+        """Load the backing dataset on first use."""
         if self._loaded_from_file:
             return
         self._loaded_from_file = True
