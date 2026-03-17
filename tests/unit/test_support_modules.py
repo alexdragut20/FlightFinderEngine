@@ -6,17 +6,17 @@ import warnings
 from datetime import date
 from pathlib import Path
 
-from flight_layover_lab import airports as airports_module
-from flight_layover_lab import app as app_module
-from flight_layover_lab import config as config_module
-from flight_layover_lab import progress as progress_module
-from flight_layover_lab import resources as resources_module
-from flight_layover_lab import route_graph as route_graph_module
-from flight_layover_lab import utils as utils_module
-from flight_layover_lab.airports import AirportCoordinates
-from flight_layover_lab.progress import SearchProgressTracker
-from flight_layover_lab.providers._cache import _build_cache_key, per_instance_lru_cache
-from flight_layover_lab.search_jobs import SearchJob, SearchJobStore
+from src import app as app_module
+from src import config as config_module
+from src import utils as utils_module
+from src.data import airports as airports_module
+from src.data import resources as resources_module
+from src.data.airports import AirportCoordinates
+from src.providers._cache import _build_cache_key, per_instance_lru_cache
+from src.services import progress as progress_module
+from src.services import route_graph as route_graph_module
+from src.services.progress import SearchProgressTracker
+from src.services.search_jobs import SearchJob, SearchJobStore
 
 
 class _FakeResponse:
@@ -45,14 +45,14 @@ def test_app_module_reexports_core_symbols() -> None:
 def test_package_entrypoints_delegate_to_run_server(monkeypatch) -> None:
     calls: list[str] = []
     monkeypatch.setattr(
-        "flight_layover_lab.http_server.run_server",
+        "src.services.http_server.run_server",
         lambda: calls.append("run"),
     )
 
-    runpy.run_module("flight_layover_lab.__main__", run_name="__main__")
+    runpy.run_module("src.__main__", run_name="__main__")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
-        runpy.run_module("flight_layover_lab.app", run_name="__main__")
+        runpy.run_module("src.app", run_name="__main__")
 
     assert calls == ["run", "run"]
 

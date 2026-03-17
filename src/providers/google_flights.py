@@ -12,10 +12,13 @@ from ..utils import (
     parse_google_flights_text_datetime,
     parse_money_amount_int,
 )
+from ..utils.constants import PRICE_SENTINEL
 from ._cache import per_instance_lru_cache
 
 
 class GoogleFlightsLocalClient:
+    """Provider client for Google Flights local-browser queries."""
+
     provider_id = "googleflights"
     display_name = "Google Flights (local browser)"
     supports_calendar = False
@@ -28,6 +31,11 @@ class GoogleFlightsLocalClient:
         self,
         fetch_mode: str | None = None,
     ) -> None:
+        """Initialize the GoogleFlightsLocalClient.
+
+        Args:
+            fetch_mode: Fetch strategy to use for the provider request.
+        """
         normalized_fetch_mode = (
             str(fetch_mode or os.getenv("GOOGLE_FLIGHTS_FETCH_MODE") or "common").strip().lower()
         )
@@ -44,6 +52,11 @@ class GoogleFlightsLocalClient:
         self._get_flights_fn: Any = None
 
     def _ensure_fast_flights(self) -> bool:
+        """Handle ensure fast flights.
+
+        Returns:
+            bool: Handle ensure fast flights.
+        """
         if self._fast_flights_loaded:
             return self._fast_flights_available
         self._fast_flights_loaded = True
@@ -73,15 +86,33 @@ class GoogleFlightsLocalClient:
         return self._fast_flights_available
 
     def is_configured(self) -> bool:
+        """Return whether the client is configured for use.
+
+        Returns:
+            bool: True when the client is configured for use; otherwise, False.
+        """
         return self._ensure_fast_flights()
 
     def configuration_hint(self) -> str | None:
+        """Return setup guidance for the client.
+
+        Returns:
+            str | None: Setup guidance for the client.
+        """
         if self._ensure_fast_flights():
             return None
         return "Install fast-flights to enable Google Flights."
 
     @staticmethod
     def _carrier_from_name(name: Any) -> tuple[str, str]:
+        """Extract a carrier code from the carrier name.
+
+        Args:
+            name: Human-readable name for the object.
+
+        Returns:
+            tuple[str, str]: Extract a carrier code from the carrier name.
+        """
         raw = str(name or "").strip()
         if not raw:
             return "GF", "Google Flights"
@@ -93,6 +124,14 @@ class GoogleFlightsLocalClient:
 
     @staticmethod
     def _flight_stops(value: Any) -> int:
+        """Count the stops in a flight option.
+
+        Args:
+            value: Input value to process.
+
+        Returns:
+            int: Count the stops in a flight option.
+        """
         try:
             stops = int(value)
         except (TypeError, ValueError):
@@ -110,6 +149,20 @@ class GoogleFlightsLocalClient:
         booking_url: str | None,
         max_stops_per_leg: int,
     ) -> dict[str, Any] | None:
+        """Convert a provider result into the normalized one-way schema.
+
+        Args:
+            source: Origin airport code for the request.
+            destination: Destination airport code for the request.
+            departure_iso: Departure date in ISO 8601 format.
+            currency: Currency code for pricing output.
+            flight: Flight payload to inspect.
+            booking_url: URL for booking.
+            max_stops_per_leg: Max stops per leg.
+
+        Returns:
+            dict[str, Any] | None: Converted provider result into the normalized one-way schema.
+        """
         price = parse_money_amount_int(getattr(flight, "price", None))
         if price is None:
             return None
@@ -153,10 +206,18 @@ class GoogleFlightsLocalClient:
 
     @staticmethod
     def _candidate_sort_key(candidate: dict[str, Any]) -> tuple[int, int, int]:
+        """Build the sort key for candidate ranking.
+
+        Args:
+            candidate: Mapping of candidate.
+
+        Returns:
+            tuple[int, int, int]: The sort key for candidate ranking.
+        """
         return (
-            int(candidate.get("price") or 10**12),
+            int(candidate.get("price") or PRICE_SENTINEL),
             int(candidate.get("stops") or 0),
-            int(candidate.get("duration_seconds") or 10**12),
+            int(candidate.get("duration_seconds") or PRICE_SENTINEL),
         )
 
     def _fetch_flights(
@@ -169,6 +230,19 @@ class GoogleFlightsLocalClient:
         adults: int,
         max_stops_per_leg: int,
     ) -> list[Any]:
+        """Fetch flight options from the provider backend.
+
+        Args:
+            source: Origin airport code for the request.
+            destination: Destination airport code for the request.
+            date_iso: Travel date in ISO 8601 format.
+            currency: Currency code for pricing output.
+            adults: Number of adult travelers.
+            max_stops_per_leg: Max stops per leg.
+
+        Returns:
+            list[Any]: Flight options from the provider backend.
+        """
         if not self._ensure_fast_flights():
             raise RuntimeError(
                 "Google Flights provider is not ready. "
@@ -220,6 +294,22 @@ class GoogleFlightsLocalClient:
         hand_bags: int,
         hold_bags: int,
     ) -> dict[str, int]:
+        """Fetch calendar prices for the requested market.
+
+        Args:
+            source: Origin airport code for the request.
+            destination: Destination airport code for the request.
+            date_start_iso: Start date in ISO 8601 format.
+            date_end_iso: End date in ISO 8601 format.
+            currency: Currency code for pricing output.
+            max_stops_per_leg: Max stops per leg.
+            adults: Number of adult travelers.
+            hand_bags: Number of cabin bags per adult traveler.
+            hold_bags: Number of checked bags per adult traveler.
+
+        Returns:
+            dict[str, int]: Calendar prices for the requested market.
+        """
         return {}
 
     @per_instance_lru_cache(maxsize=32768)
@@ -235,6 +325,22 @@ class GoogleFlightsLocalClient:
         hold_bags: int,
         max_connection_layover_seconds: int | None = None,
     ) -> dict[str, Any] | None:
+        """Fetch the best one-way itinerary for the requested market.
+
+        Args:
+            source: Origin airport code for the request.
+            destination: Destination airport code for the request.
+            departure_iso: Departure date in ISO 8601 format.
+            currency: Currency code for pricing output.
+            max_stops_per_leg: Max stops per leg.
+            adults: Number of adult travelers.
+            hand_bags: Number of cabin bags per adult traveler.
+            hold_bags: Number of checked bags per adult traveler.
+            max_connection_layover_seconds: Duration in seconds for max connection layover.
+
+        Returns:
+            dict[str, Any] | None: The best one-way itinerary for the requested market.
+        """
         if not self.is_configured():
             return None
         source_code = source.upper()
@@ -288,6 +394,23 @@ class GoogleFlightsLocalClient:
         hold_bags: int,
         max_connection_layover_seconds: int | None = None,
     ) -> dict[str, Any] | None:
+        """Fetch the best round-trip itinerary for the requested market.
+
+        Args:
+            source: Origin airport code for the request.
+            destination: Destination airport code for the request.
+            outbound_iso: Outbound travel date in ISO 8601 format.
+            inbound_iso: Inbound travel date in ISO 8601 format.
+            currency: Currency code for pricing output.
+            max_stops_per_leg: Max stops per leg.
+            adults: Number of adult travelers.
+            hand_bags: Number of cabin bags per adult traveler.
+            hold_bags: Number of checked bags per adult traveler.
+            max_connection_layover_seconds: Duration in seconds for max connection layover.
+
+        Returns:
+            dict[str, Any] | None: The best round-trip itinerary for the requested market.
+        """
         if not self.is_configured():
             return None
         outbound = self.get_best_oneway(

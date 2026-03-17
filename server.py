@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Backward-compatible entrypoint for FlightFinder Engine.
 
-The core app code lives in `src/flight_layover_lab/`.
+The core app code lives in the `src/` package.
 
 This thin wrapper keeps existing commands working:
   - `python3 server.py`
@@ -14,13 +14,12 @@ import importlib
 import sys
 from pathlib import Path
 
-# Ensure `src/` is importable when running from the repo root.
+# Ensure the repo root is importable when running from the checkout.
 _PROJECT_ROOT = Path(__file__).resolve().parent
-SRC_DIR = _PROJECT_ROOT / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
-_app = importlib.import_module("flight_layover_lab.app")
+_app = importlib.import_module("src.app")
 
 # Re-export all names (including underscore-prefixed helpers used by tests).
 for _name, _value in _app.__dict__.items():

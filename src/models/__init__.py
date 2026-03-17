@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class PassengerConfig:
+    """Passenger baggage and traveler-count configuration."""
+
     adults: int = 1
     hand_bags: int = 0
     hold_bags: int = 0
@@ -13,6 +15,8 @@ class PassengerConfig:
 
 @dataclass(frozen=True)
 class SearchConfig:
+    """Search settings used by the optimizer and service layer."""
+
     origins: tuple[str, ...]
     destinations: tuple[str, ...]
     hub_candidates: tuple[str, ...]

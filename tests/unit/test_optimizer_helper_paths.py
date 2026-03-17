@@ -7,9 +7,9 @@ from datetime import date
 
 import pytest
 
-from flight_layover_lab.airports import AirportCoordinates
-from flight_layover_lab.engine import optimizer as optimizer_module
-from flight_layover_lab.engine.optimizer import (
+from src.data.airports import AirportCoordinates
+from src.engine import optimizer as optimizer_module
+from src.engine.optimizer import (
     SplitTripOptimizer,
     _apply_inner_return_bundle_estimate,
     _apply_price_time_score,
@@ -20,8 +20,8 @@ from flight_layover_lab.engine.optimizer import (
     _rank_chain_pairs,
     _rank_inbound_chain_pairs,
 )
-from flight_layover_lab.progress import SearchProgressTracker
-from flight_layover_lab.providers import KiwiClient
+from src.providers import KiwiClient
+from src.services.progress import SearchProgressTracker
 
 
 def test_optimizer_top_level_helper_functions_cover_price_and_ranking_paths() -> None:

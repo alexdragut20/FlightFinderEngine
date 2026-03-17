@@ -39,7 +39,7 @@ Repository = "https://github.com/alexdragut20/FlightFinderEngine"
 Issues = "https://github.com/alexdragut20/FlightFinderEngine/issues"
 
 [project.scripts]
-flightfinder-engine = "flight_layover_lab.app:run_server"
+flightfinder-engine = "src.app:run_server"
 
 [project.optional-dependencies]
 dev = [
@@ -52,9 +52,14 @@ scrape = [
   "playwright>=1.45.0",
 ]
 
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+exclude = ["tests*", "docs*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["."]
 addopts = "-ra"
 
 [tool.ruff]
@@ -71,7 +76,7 @@ indent-style = "space"
 line-ending = "auto"
 
 [tool.coverage.run]
-source = ["src/flight_layover_lab"]
+source = ["src"]
 branch = true
 
 [tool.coverage.report]

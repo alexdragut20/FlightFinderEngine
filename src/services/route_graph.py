@@ -4,11 +4,19 @@ import csv
 
 import requests
 
-from .config import ROUTES_DATA_URL
-from .resources import CACHE_DIR, ROUTES_CACHE_PATH
+from ..config import ROUTES_DATA_URL
+from ..data.resources import CACHE_DIR, ROUTES_CACHE_PATH
 
 
 def _normalize_codes(codes: list[str] | tuple[str, ...] | set[str]) -> set[str]:
+    """Normalize a collection of airport codes.
+
+    Args:
+        codes: Airport or provider codes to process.
+
+    Returns:
+        set[str]: Normalized collection of airport codes.
+    """
     normalized: set[str] = set()
     for code in codes:
         value = str(code or "").strip().upper()
@@ -18,21 +26,45 @@ def _normalize_codes(codes: list[str] | tuple[str, ...] | set[str]) -> set[str]:
 
 
 class RouteConnectivityGraph:
+    """Route graph used to score likely split-ticket hub airports."""
+
     def __init__(self) -> None:
+        """Initialize the RouteConnectivityGraph."""
         self._loaded = False
         self._outgoing: dict[str, set[str]] = {}
         self._incoming: dict[str, set[str]] = {}
 
     def available(self) -> bool:
+        """Return whether the route graph is available for use.
+
+        Returns:
+            bool: True when the route graph is available for use; otherwise, False.
+        """
         self._ensure_loaded()
         return bool(self._outgoing)
 
     def outgoing(self, code: str) -> set[str]:
+        """Return outgoing connections for an airport code.
+
+        Args:
+            code: Airport or provider code to process.
+
+        Returns:
+            set[str]: Outgoing connections for an airport code.
+        """
         self._ensure_loaded()
         normalized = str(code or "").strip().upper()
         return set(self._outgoing.get(normalized, set()))
 
     def incoming(self, code: str) -> set[str]:
+        """Return incoming connections for an airport code.
+
+        Args:
+            code: Airport or provider code to process.
+
+        Returns:
+            set[str]: Incoming connections for an airport code.
+        """
         self._ensure_loaded()
         normalized = str(code or "").strip().upper()
         return set(self._incoming.get(normalized, set()))
@@ -44,6 +76,16 @@ class RouteConnectivityGraph:
         destinations: list[str] | tuple[str, ...],
         max_split_hubs: int,
     ) -> dict[str, int]:
+        """Score likely hub airports for the requested markets.
+
+        Args:
+            origins: Origins for the operation.
+            destinations: Destinations for the operation.
+            max_split_hubs: Max split hubs.
+
+        Returns:
+            dict[str, int]: Scored likely hub airports for the requested markets.
+        """
         self._ensure_loaded()
         if max_split_hubs <= 0 or not self._outgoing:
             return {}
@@ -97,6 +139,7 @@ class RouteConnectivityGraph:
         return scores
 
     def _ensure_loaded(self) -> None:
+        """Load the backing dataset on first use."""
         if self._loaded:
             return
         self._loaded = True

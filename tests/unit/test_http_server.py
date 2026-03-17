@@ -7,9 +7,9 @@ from types import SimpleNamespace
 
 import requests
 
-from flight_layover_lab.http_server import AppHandler
-from flight_layover_lab.resources import STATIC_DIR
-from flight_layover_lab.search_jobs import SearchJobCapacityError
+from src.data.resources import STATIC_DIR
+from src.services.http_server import AppHandler
+from src.services.search_jobs import SearchJobCapacityError
 
 
 def test_app_handler_end_headers_disables_caching(monkeypatch) -> None:
@@ -62,7 +62,7 @@ def test_search_job_endpoint_returns_429_when_job_store_is_full(monkeypatch) -> 
         sent["status"] = status
         sent["payload"] = payload
 
-    monkeypatch.setattr("flight_layover_lab.http_server.log_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr("src.services.http_server.log_event", lambda *args, **kwargs: None)
     handler.optimizer = OptimizerStub()
     handler.job_store = JobStoreStub()
     handler._send_json = fake_send_json  # type: ignore[method-assign]
@@ -279,7 +279,7 @@ def test_post_provider_config_handles_success_and_failure(monkeypatch) -> None:
 
 
 def test_post_search_handles_success_and_error_paths(monkeypatch) -> None:
-    monkeypatch.setattr("flight_layover_lab.http_server.log_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr("src.services.http_server.log_event", lambda *args, **kwargs: None)
 
     class OptimizerStub:
         def __init__(self, result: object) -> None:
@@ -363,7 +363,7 @@ def test_http_server_bootstrap_and_job_error_paths(monkeypatch) -> None:
     assert sent_get["payload"] == {"job_id": "job-123", "status": "running"}
     assert job.called_with is None
 
-    monkeypatch.setattr("flight_layover_lab.http_server.log_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr("src.services.http_server.log_event", lambda *args, **kwargs: None)
 
     def _run_job_case(mode: str) -> tuple[int, dict[str, object]]:
         job_handler = AppHandler.__new__(AppHandler)
@@ -427,16 +427,16 @@ def test_http_server_bootstrap_and_job_error_paths(monkeypatch) -> None:
         created_servers.append(server)
         return server
 
-    monkeypatch.setattr("flight_layover_lab.http_server.ThreadingHTTPServer", fake_server)
+    monkeypatch.setattr("src.services.http_server.ThreadingHTTPServer", fake_server)
     monkeypatch.setattr(
-        "flight_layover_lab.http_server.log_event",
+        "src.services.http_server.log_event",
         lambda level, event, **fields: logged_events.append({"event": event, **fields}),
     )
     monkeypatch.setattr("builtins.print", lambda message: printed.append(str(message)))
 
     monkeypatch.setenv("HOST", "0.0.0.0")
     monkeypatch.setenv("PORT", "8123")
-    from flight_layover_lab.http_server import run_server
+    from src.services.http_server import run_server
 
     run_server()
     run_server()

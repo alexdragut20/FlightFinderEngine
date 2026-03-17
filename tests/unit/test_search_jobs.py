@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import time
 
-from flight_layover_lab.progress import SearchProgressTracker
-from flight_layover_lab.search_jobs import (
+from src.services.progress import SearchProgressTracker
+from src.services.search_jobs import (
     SearchJob,
     SearchJobCapacityError,
     SearchJobStore,
@@ -54,7 +54,7 @@ def test_start_job_rejects_when_store_is_full_of_active_jobs(monkeypatch) -> Non
         def start(self) -> None:
             raise AssertionError("thread should not start when capacity is exhausted")
 
-    monkeypatch.setattr("flight_layover_lab.search_jobs.threading.Thread", FakeThread)
+    monkeypatch.setattr("src.services.search_jobs.threading.Thread", FakeThread)
 
     try:
         store.start_job(object(), object())
@@ -84,7 +84,7 @@ def test_start_job_reclaims_finished_job_before_inserting(monkeypatch) -> None:
         def start(self) -> None:
             started["value"] = True
 
-    monkeypatch.setattr("flight_layover_lab.search_jobs.threading.Thread", FakeThread)
+    monkeypatch.setattr("src.services.search_jobs.threading.Thread", FakeThread)
 
     job = store.start_job(object(), object())
 

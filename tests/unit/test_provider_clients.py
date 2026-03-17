@@ -3,11 +3,11 @@ from __future__ import annotations
 import pytest
 import requests
 
-from flight_layover_lab.exceptions import ProviderNoResultError
-from flight_layover_lab.providers.amadeus import AmadeusClient
-from flight_layover_lab.providers.kiwi import KiwiClient
-from flight_layover_lab.providers.multi import MultiProviderClient
-from flight_layover_lab.providers.serpapi import SerpApiGoogleFlightsClient
+from src.exceptions import ProviderNoResultError
+from src.providers.amadeus import AmadeusClient
+from src.providers.kiwi import KiwiClient
+from src.providers.multi import MultiProviderClient
+from src.providers.serpapi import SerpApiGoogleFlightsClient
 
 
 class _FakeResponse:
@@ -281,12 +281,10 @@ def test_amadeus_token_and_get_paths(monkeypatch) -> None:
     )
     monkeypatch.setattr(client, "_session", lambda: session)
     monkeypatch.setattr(
-        "flight_layover_lab.providers.amadeus._capture_provider_response",
+        "src.providers.amadeus._capture_provider_response",
         lambda *args, **kwargs: None,
     )
-    monkeypatch.setattr(
-        "flight_layover_lab.providers.amadeus.time.sleep", lambda *_args, **_kwargs: None
-    )
+    monkeypatch.setattr("src.providers.amadeus.time.sleep", lambda *_args, **_kwargs: None)
 
     assert client._fetch_token() == "token-1"
     assert client._fetch_token() == "token-1"
@@ -412,7 +410,7 @@ def test_serpapi_search_and_best_flights(monkeypatch) -> None:
     )
     monkeypatch.setattr(client, "_session", lambda: session)
     monkeypatch.setattr(
-        "flight_layover_lab.providers.serpapi._capture_provider_response",
+        "src.providers.serpapi._capture_provider_response",
         lambda *args, **kwargs: None,
     )
 
@@ -609,9 +607,7 @@ def test_multi_provider_client_merges_prices_and_tracks_budgets(monkeypatch) -> 
         max_total_calls=2,
         max_calls_by_provider={"amadeus": 1},
     )
-    monkeypatch.setattr(
-        "flight_layover_lab.providers.multi.log_event", lambda *args, **kwargs: None
-    )
+    monkeypatch.setattr("src.providers.multi.log_event", lambda *args, **kwargs: None)
 
     prices = client.get_calendar_prices(
         "OTP",
@@ -689,9 +685,9 @@ def test_multi_provider_client_internal_selection_pause_and_tiebreak_paths(monke
 
     now = {"value": 1000.0}
     logged: list[str] = []
-    monkeypatch.setattr("flight_layover_lab.providers.multi.time.time", lambda: now["value"])
+    monkeypatch.setattr("src.providers.multi.time.time", lambda: now["value"])
     monkeypatch.setattr(
-        "flight_layover_lab.providers.multi.log_event",
+        "src.providers.multi.log_event",
         lambda *_args, **kwargs: logged.append(str(kwargs.get("provider_id") or "")),
     )
 
@@ -788,7 +784,7 @@ def test_multi_provider_client_remaining_calendar_budget_and_helper_paths(
 
     logged: list[dict[str, object]] = []
     monkeypatch.setattr(
-        "flight_layover_lab.providers.multi.log_event",
+        "src.providers.multi.log_event",
         lambda level, event, **fields: logged.append({"event": event, **fields}),
     )
 
@@ -866,7 +862,7 @@ def test_kiwi_client_internal_paths_cover_session_post_and_selection(monkeypatch
             _FakeResponse({}, status_code=502),
         ]
     )
-    monkeypatch.setattr("flight_layover_lab.providers.kiwi.requests.Session", lambda: session)
+    monkeypatch.setattr("src.providers.kiwi.requests.Session", lambda: session)
 
     client = KiwiClient()
     assert client._session() is session
@@ -1199,7 +1195,7 @@ def test_serpapi_client_internal_paths_cover_search_and_selection(monkeypatch) -
     )
     monkeypatch.setattr(client, "_session", lambda: session)
     monkeypatch.setattr(
-        "flight_layover_lab.providers.serpapi._capture_provider_response",
+        "src.providers.serpapi._capture_provider_response",
         lambda *args, **kwargs: None,
     )
 
@@ -1413,12 +1409,10 @@ def test_amadeus_client_internal_paths_cover_auth_retries_and_selection(monkeypa
     )
     monkeypatch.setattr(retry_client, "_session", lambda: retry_session)
     monkeypatch.setattr(
-        "flight_layover_lab.providers.amadeus._capture_provider_response",
+        "src.providers.amadeus._capture_provider_response",
         lambda *args, **kwargs: None,
     )
-    monkeypatch.setattr(
-        "flight_layover_lab.providers.amadeus.time.sleep", lambda *_args, **_kwargs: None
-    )
+    monkeypatch.setattr("src.providers.amadeus.time.sleep", lambda *_args, **_kwargs: None)
     assert retry_client._get("/v2/shopping/flight-offers", {"originLocationCode": "OTP"}) == {
         "data": []
     }
@@ -1435,7 +1429,7 @@ def test_amadeus_client_internal_paths_cover_auth_retries_and_selection(monkeypa
     )
     monkeypatch.setattr(no_result_client, "_session", lambda: no_result_session)
     monkeypatch.setattr(
-        "flight_layover_lab.providers.amadeus._capture_provider_response",
+        "src.providers.amadeus._capture_provider_response",
         lambda *args, **kwargs: None,
     )
     with pytest.raises(ProviderNoResultError):
@@ -1937,9 +1931,7 @@ def test_multi_provider_client_remaining_edge_paths_cover_calendar_filters_and_t
         "_provider_pause_remaining_seconds",
         lambda provider_id: 5 if provider_id == "serpapi" else 0,
     )
-    monkeypatch.setattr(
-        "flight_layover_lab.providers.multi.log_event", lambda *args, **kwargs: None
-    )
+    monkeypatch.setattr("src.providers.multi.log_event", lambda *args, **kwargs: None)
 
     prices = client.get_calendar_prices(
         "OTP",

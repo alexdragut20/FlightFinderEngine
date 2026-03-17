@@ -5,18 +5,18 @@ from pathlib import Path
 
 
 def resolve_project_root() -> Path:
-    """Resolve the repo root used for local assets (static/cache/logs/responses).
+    """Resolve the project root used for local assets.
 
-    This project primarily runs from a checked-out repo. When installed as a package
-    elsewhere, users can point `FLIGHT_LAYOVER_LAB_ROOT` at the repo checkout.
+    Returns:
+        Path: Resolved project root used for local assets.
     """
 
     env_root = str(os.getenv("FLIGHT_LAYOVER_LAB_ROOT", "") or "").strip()
     if env_root:
         return Path(env_root).expanduser().resolve()
 
-    # When running from the repo with a `src/` layout:
-    #   repo-root/src/flight_layover_lab/resources.py
+    # When running from the repo with the current `src/` package layout:
+    #   repo-root/src/data/resources.py
     return Path(__file__).resolve().parents[2]
 
 

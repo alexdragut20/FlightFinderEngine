@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import pytest
 
-from flight_layover_lab.airports import AirportCoordinates
-from flight_layover_lab.engine import SplitTripOptimizer
-from flight_layover_lab.progress import SearchProgressTracker
-from flight_layover_lab.providers import KiwiClient
+from src.data.airports import AirportCoordinates
+from src.engine import SplitTripOptimizer
+from src.providers import KiwiClient
+from src.services.progress import SearchProgressTracker
 
 
 def test_parse_config_cpu_workers_zero_uses_detected_max(monkeypatch) -> None:
@@ -113,7 +113,7 @@ def test_progress_tracker_edge_paths_cover_default_messages_eta_and_empty_logs(
     monkeypatch,
 ) -> None:
     clock = {"now": 1000.0}
-    monkeypatch.setattr("flight_layover_lab.progress.time.time", lambda: clock["now"])
+    monkeypatch.setattr("src.services.progress.time.time", lambda: clock["now"])
 
     tracker = SearchProgressTracker("job-edge")
     initial = tracker.snapshot(since_event_index=999)

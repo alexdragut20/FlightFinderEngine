@@ -7,7 +7,6 @@ from typing import Any
 import requests
 
 from ..config import SERPAPI_RETURN_OPTION_SCAN_LIMIT, SERPAPI_SEARCH_URL
-from ..logging_utils import capture_provider_response as _capture_provider_response
 from ..utils import (
     max_segment_layover_seconds,
     parse_datetime_guess,
@@ -15,10 +14,14 @@ from ..utils import (
     parse_money_amount_int,
     transfer_events_from_segments,
 )
+from ..utils.constants import PRICE_SENTINEL
+from ..utils.logging import capture_provider_response as _capture_provider_response
 from ._cache import per_instance_lru_cache
 
 
 class SerpApiGoogleFlightsClient:
+    """Provider client for SerpApi-backed Google Flights queries."""
+
     provider_id = "serpapi"
     display_name = "SerpApi Google Flights"
     supports_calendar = False
@@ -33,6 +36,13 @@ class SerpApiGoogleFlightsClient:
         search_url: str | None = None,
         return_option_scan_limit: int | None = None,
     ) -> None:
+        """Initialize the SerpApiGoogleFlightsClient.
+
+        Args:
+            api_key: Dictionary key used for api.
+            search_url: URL for search.
+            return_option_scan_limit: Maximum number of return options to scan.
+        """
         self._api_key = (
             api_key if api_key is not None else os.getenv("SERPAPI_API_KEY") or ""
         ).strip()
@@ -51,14 +61,32 @@ class SerpApiGoogleFlightsClient:
         self._local = threading.local()
 
     def is_configured(self) -> bool:
+        """Return whether the client is configured for use.
+
+        Returns:
+            bool: True when the client is configured for use; otherwise, False.
+        """
         return bool(self._api_key)
 
     def _session(self) -> requests.Session:
+        """Return the cached requests session.
+
+        Returns:
+            requests.Session: The cached requests session.
+        """
         if not hasattr(self._local, "session"):
             self._local.session = requests.Session()
         return self._local.session
 
     def _search(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Execute the provider search request.
+
+        Args:
+            params: Request parameters to send to the provider.
+
+        Returns:
+            dict[str, Any]: Execute the provider search request.
+        """
         if not self.is_configured():
             raise RuntimeError("SerpApi API key is missing")
         query = dict(params)
@@ -116,6 +144,14 @@ class SerpApiGoogleFlightsClient:
 
     @staticmethod
     def _iter_options(payload: dict[str, Any]) -> list[dict[str, Any]]:
+        """Iterate through normalized provider options.
+
+        Args:
+            payload: JSON-serializable payload for the operation.
+
+        Returns:
+            list[dict[str, Any]]: Iterate through normalized provider options.
+        """
         out: list[dict[str, Any]] = []
         for key in ("best_flights", "other_flights"):
             for item in payload.get(key) or []:
@@ -125,6 +161,14 @@ class SerpApiGoogleFlightsClient:
 
     @staticmethod
     def _option_segments(option: dict[str, Any]) -> list[dict[str, Any]]:
+        """Extract normalized segments for a provider option.
+
+        Args:
+            option: Mapping of option.
+
+        Returns:
+            list[dict[str, Any]]: Extract normalized segments for a provider option.
+        """
         segments: list[dict[str, Any]] = []
         for flight in option.get("flights") or []:
             if not isinstance(flight, dict):
@@ -149,6 +193,14 @@ class SerpApiGoogleFlightsClient:
 
     @staticmethod
     def _option_duration_seconds(option: dict[str, Any]) -> int | None:
+        """Calculate the duration for a provider option.
+
+        Args:
+            option: Mapping of option.
+
+        Returns:
+            int | None: Calculated duration for a provider option.
+        """
         total_duration = option.get("total_duration")
         if isinstance(total_duration, int | float):
             return int(total_duration) * 60
@@ -159,6 +211,14 @@ class SerpApiGoogleFlightsClient:
 
     @staticmethod
     def _option_price(option: dict[str, Any]) -> int | None:
+        """Extract the price for a provider option.
+
+        Args:
+            option: Mapping of option.
+
+        Returns:
+            int | None: Extract the price for a provider option.
+        """
         for key in ("price", "total_price", "price_rounded"):
             amount = parse_money_amount_int(option.get(key))
             if amount is not None:
@@ -169,6 +229,14 @@ class SerpApiGoogleFlightsClient:
     def _stops_param(max_stops_per_leg: int) -> int:
         # SerpApi Google Flights semantics:
         # 0 any stops, 1 non-stop, 2 <=1 stop, 3 <=2 stops.
+        """Build the provider stops parameter.
+
+        Args:
+            max_stops_per_leg: Max stops per leg.
+
+        Returns:
+            int: The provider stops parameter.
+        """
         if max_stops_per_leg <= 0:
             return 1
         if max_stops_per_leg == 1:
@@ -177,6 +245,14 @@ class SerpApiGoogleFlightsClient:
 
     @staticmethod
     def _booking_url(payload: dict[str, Any]) -> str | None:
+        """Build the booking URL for the selected option.
+
+        Args:
+            payload: JSON-serializable payload for the operation.
+
+        Returns:
+            str | None: The booking URL for the selected option.
+        """
         metadata = payload.get("search_metadata") or {}
         for key in ("google_flights_url", "raw_html_file"):
             value = str(metadata.get(key) or "").strip()
@@ -199,6 +275,22 @@ class SerpApiGoogleFlightsClient:
     ) -> dict[str, int]:
         # SerpApi does not provide a cheap dense calendar endpoint like Kiwi's.
         # Keep it empty and let the engine rely on other providers for seeding.
+        """Fetch calendar prices for the requested market.
+
+        Args:
+            source: Origin airport code for the request.
+            destination: Destination airport code for the request.
+            date_start_iso: Start date in ISO 8601 format.
+            date_end_iso: End date in ISO 8601 format.
+            currency: Currency code for pricing output.
+            max_stops_per_leg: Max stops per leg.
+            adults: Number of adult travelers.
+            hand_bags: Number of cabin bags per adult traveler.
+            hold_bags: Number of checked bags per adult traveler.
+
+        Returns:
+            dict[str, int]: Calendar prices for the requested market.
+        """
         return {}
 
     @per_instance_lru_cache(maxsize=32768)
@@ -214,6 +306,22 @@ class SerpApiGoogleFlightsClient:
         hold_bags: int,
         max_connection_layover_seconds: int | None = None,
     ) -> dict[str, Any] | None:
+        """Fetch the best one-way itinerary for the requested market.
+
+        Args:
+            source: Origin airport code for the request.
+            destination: Destination airport code for the request.
+            departure_iso: Departure date in ISO 8601 format.
+            currency: Currency code for pricing output.
+            max_stops_per_leg: Max stops per leg.
+            adults: Number of adult travelers.
+            hand_bags: Number of cabin bags per adult traveler.
+            hold_bags: Number of checked bags per adult traveler.
+            max_connection_layover_seconds: Duration in seconds for max connection layover.
+
+        Returns:
+            dict[str, Any] | None: The best one-way itinerary for the requested market.
+        """
         if not self.is_configured():
             return None
         source_code = source.upper()
@@ -285,6 +393,23 @@ class SerpApiGoogleFlightsClient:
         hold_bags: int,
         max_connection_layover_seconds: int | None = None,
     ) -> dict[str, Any] | None:
+        """Fetch the best round-trip itinerary for the requested market.
+
+        Args:
+            source: Origin airport code for the request.
+            destination: Destination airport code for the request.
+            outbound_iso: Outbound travel date in ISO 8601 format.
+            inbound_iso: Inbound travel date in ISO 8601 format.
+            currency: Currency code for pricing output.
+            max_stops_per_leg: Max stops per leg.
+            adults: Number of adult travelers.
+            hand_bags: Number of cabin bags per adult traveler.
+            hold_bags: Number of checked bags per adult traveler.
+            max_connection_layover_seconds: Duration in seconds for max connection layover.
+
+        Returns:
+            dict[str, Any] | None: The best round-trip itinerary for the requested market.
+        """
         if not self.is_configured():
             return None
         source_code = source.upper()
@@ -306,7 +431,9 @@ class SerpApiGoogleFlightsClient:
         departure_options = self._iter_options(base_payload)
         departure_options.sort(
             key=lambda option: (
-                self._option_price(option) if self._option_price(option) is not None else 10**12
+                self._option_price(option)
+                if self._option_price(option) is not None
+                else PRICE_SENTINEL
             )
         )
 

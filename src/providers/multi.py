@@ -4,21 +4,36 @@ import logging
 import math
 import threading
 import time
+from collections.abc import Callable
 from typing import Any
 
 from ..config import _FREE_PROVIDER_IDS, PROVIDER_ERROR_COOLDOWN_SECONDS
 from ..exceptions import ProviderNoResultError
-from ..logging_utils import log_event
+from ..utils.constants import PRICE_SENTINEL
+from ..utils.logging import log_event
 from ._cache import per_instance_lru_cache
+
+CandidateResult = dict[str, Any]
+CandidateFetcher = Callable[[Any, str], CandidateResult | None]
+CandidateComparator = Callable[[CandidateResult, CandidateResult | None], bool]
 
 
 class MultiProviderClient:
+    """Coordinator that evaluates multiple provider clients under shared budgets."""
+
     def __init__(
         self,
         providers: list[Any],
         max_total_calls: int | None = None,
         max_calls_by_provider: dict[str, int | None] | None = None,
     ) -> None:
+        """Initialize the MultiProviderClient.
+
+        Args:
+            providers: Provider instances for the operation.
+            max_total_calls: Maximum number of provider calls allowed across the search.
+            max_calls_by_provider: Mapping of max calls by provider.
+        """
         self.providers = tuple(providers)
         self._provider_by_id = {
             str(getattr(provider, "provider_id", "") or "").lower(): provider
@@ -65,16 +80,33 @@ class MultiProviderClient:
 
     @property
     def active_provider_ids(self) -> list[str]:
+        """Return the normalized provider identifiers currently in play.
+
+        Returns:
+            list[str]: Normalized provider identifiers currently in play.
+        """
         return [
             str(getattr(provider, "provider_id", "") or "").lower() for provider in self.providers
         ]
 
     def _bump(self, bucket: str, provider_id: str, amount: int = 1) -> None:
+        """Handle bump.
+
+        Args:
+            bucket: Log bucket used for throttled progress updates.
+            provider_id: Provider identifier involved in the request.
+            amount: Numeric amount to convert or format.
+        """
         with self._stats_lock:
             target = self._stats.setdefault(bucket, {})
             target[provider_id] = target.get(provider_id, 0) + amount
 
     def stats_snapshot(self) -> dict[str, Any]:
+        """Return a snapshot of provider selection and budget counters.
+
+        Returns:
+            dict[str, Any]: Provider selection and budget counters.
+        """
         with self._stats_lock:
             snapshot = {key: dict(value) for key, value in self._stats.items()}
             snapshot["budget"] = {
@@ -86,6 +118,14 @@ class MultiProviderClient:
             return snapshot
 
     def _consume_budget(self, provider_id: str) -> bool:
+        """Consume a provider budget slot if one is available.
+
+        Args:
+            provider_id: Provider identifier involved in the request.
+
+        Returns:
+            bool: True when a budget slot was consumed; otherwise, False.
+        """
         normalized_provider_id = str(provider_id or "").strip().lower()
         with self._stats_lock:
             cap = self._max_calls_by_provider.get(normalized_provider_id)
@@ -105,6 +145,14 @@ class MultiProviderClient:
             return True
 
     def _provider_pause_remaining_seconds(self, provider_id: str) -> int:
+        """Return the remaining provider cooldown in seconds.
+
+        Args:
+            provider_id: Provider identifier involved in the request.
+
+        Returns:
+            int: Remaining provider cooldown in seconds.
+        """
         normalized_provider_id = str(provider_id or "").strip().lower()
         if not normalized_provider_id:
             return 0
@@ -114,6 +162,12 @@ class MultiProviderClient:
         return max(0, remaining)
 
     def _pause_provider(self, provider_id: str, seconds: int) -> None:
+        """Pause a provider for the requested cooldown window.
+
+        Args:
+            provider_id: Provider identifier involved in the request.
+            seconds: Duration in seconds for the operation.
+        """
         normalized_provider_id = str(provider_id or "").strip().lower()
         if not normalized_provider_id:
             return
@@ -125,6 +179,12 @@ class MultiProviderClient:
             )
 
     def _register_provider_exception(self, provider_id: str, exc: Exception) -> None:
+        """Record provider exceptions that should trigger temporary cooldowns.
+
+        Args:
+            provider_id: Provider identifier involved in the request.
+            exc: Exception instance for the failure path.
+        """
         text = str(exc or "").lower()
         if "too many open files" in text or int(getattr(exc, "errno", 0) or 0) == 24:
             self._pause_provider(provider_id, PROVIDER_ERROR_COOLDOWN_SECONDS)
@@ -138,6 +198,14 @@ class MultiProviderClient:
 
     @per_instance_lru_cache(maxsize=128)
     def _providers_for_selection(self, provider_ids: tuple[str, ...] | None) -> tuple[Any, ...]:
+        """Return the providers eligible for the current selection scope.
+
+        Args:
+            provider_ids: Provider identifiers involved in the request.
+
+        Returns:
+            tuple[Any, ...]: Providers eligible for the current selection scope.
+        """
         if not provider_ids:
             return self.providers
         requested = {
@@ -165,6 +233,23 @@ class MultiProviderClient:
         hold_bags: int,
         provider_ids: tuple[str, ...] | None = None,
     ) -> dict[str, int]:
+        """Fetch calendar prices for the requested market.
+
+        Args:
+            source: Origin airport code for the request.
+            destination: Destination airport code for the request.
+            date_start_iso: Start date in ISO 8601 format.
+            date_end_iso: End date in ISO 8601 format.
+            currency: Currency code for pricing output.
+            max_stops_per_leg: Max stops per leg.
+            adults: Number of adult travelers.
+            hand_bags: Number of cabin bags per adult traveler.
+            hold_bags: Number of checked bags per adult traveler.
+            provider_ids: Provider identifiers involved in the request.
+
+        Returns:
+            dict[str, int]: Calendar prices for the requested market.
+        """
         merged: dict[str, int] = {}
         source_by_date: dict[str, str] = {}
         for provider in self._providers_for_selection(provider_ids):
@@ -214,10 +299,19 @@ class MultiProviderClient:
 
     @staticmethod
     def _is_better_oneway(candidate: dict[str, Any], current: dict[str, Any] | None) -> bool:
+        """Return whether better oneway.
+
+        Args:
+            candidate: Mapping of candidate.
+            current: Mapping of current.
+
+        Returns:
+            bool: True when better oneway; otherwise, False.
+        """
         if current is None:
             return True
-        candidate_price = int(candidate.get("price") or 10**12)
-        current_price = int(current.get("price") or 10**12)
+        candidate_price = int(candidate.get("price") or PRICE_SENTINEL)
+        current_price = int(current.get("price") or PRICE_SENTINEL)
         if candidate_price != current_price:
             return candidate_price < current_price
         candidate_stops = int(candidate.get("stops") or 0)
@@ -234,10 +328,19 @@ class MultiProviderClient:
 
     @staticmethod
     def _is_better_return(candidate: dict[str, Any], current: dict[str, Any] | None) -> bool:
+        """Return whether better return.
+
+        Args:
+            candidate: Mapping of candidate.
+            current: Mapping of current.
+
+        Returns:
+            bool: True when better return; otherwise, False.
+        """
         if current is None:
             return True
-        candidate_price = int(candidate.get("price") or 10**12)
-        current_price = int(current.get("price") or 10**12)
+        candidate_price = int(candidate.get("price") or PRICE_SENTINEL)
+        current_price = int(current.get("price") or PRICE_SENTINEL)
         if candidate_price != current_price:
             return candidate_price < current_price
         candidate_stops = int(candidate.get("outbound_stops") or 0) + int(
@@ -266,9 +369,25 @@ class MultiProviderClient:
         no_result_bucket: str,
         errors_bucket: str,
         selected_bucket: str,
-        fetch_candidate,
-        better_than,
+        fetch_candidate: CandidateFetcher,
+        better_than: CandidateComparator,
     ) -> dict[str, Any] | None:
+        """Return the best candidate returned by the selected providers.
+
+        Args:
+            provider_ids: Provider identifiers involved in the request.
+            skipped_cooldown_bucket: Stats bucket used for provider cooldown skips.
+            skipped_budget_bucket: Stats bucket used for budget skip accounting.
+            calls_bucket: Stats bucket used for provider call counting.
+            no_result_bucket: Stats bucket used when providers return no result.
+            errors_bucket: Stats bucket used when providers raise an error.
+            selected_bucket: Stats bucket used for the winning provider.
+            fetch_candidate: Callback that fetches a candidate from a provider.
+            better_than: Callback that compares a candidate against the current best result.
+
+        Returns:
+            dict[str, Any] | None: The best candidate returned by the selected providers.
+        """
         best: dict[str, Any] | None = None
         best_provider = ""
         for provider in self._providers_for_selection(provider_ids):
@@ -314,6 +433,24 @@ class MultiProviderClient:
         max_connection_layover_seconds: int | None = None,
         provider_ids: tuple[str, ...] | None = None,
     ) -> dict[str, Any] | None:
+        """Fetch the best one-way itinerary for the requested market.
+
+        Args:
+            source: Origin airport code for the request.
+            destination: Destination airport code for the request.
+            departure_iso: Departure date in ISO 8601 format.
+            currency: Currency code for pricing output.
+            max_stops_per_leg: Max stops per leg.
+            adults: Number of adult travelers.
+            hand_bags: Number of cabin bags per adult traveler.
+            hold_bags: Number of checked bags per adult traveler.
+            max_connection_layover_seconds: Duration in seconds for max connection layover.
+            provider_ids: Provider identifiers involved in the request.
+
+        Returns:
+            dict[str, Any] | None: The best one-way itinerary for the requested market.
+        """
+
         def _fetch(provider: Any, _: str) -> dict[str, Any] | None:
             return provider.get_best_oneway(
                 source=source,
@@ -354,6 +491,25 @@ class MultiProviderClient:
         max_connection_layover_seconds: int | None = None,
         provider_ids: tuple[str, ...] | None = None,
     ) -> dict[str, Any] | None:
+        """Fetch the best round-trip itinerary for the requested market.
+
+        Args:
+            source: Origin airport code for the request.
+            destination: Destination airport code for the request.
+            outbound_iso: Outbound travel date in ISO 8601 format.
+            inbound_iso: Inbound travel date in ISO 8601 format.
+            currency: Currency code for pricing output.
+            max_stops_per_leg: Max stops per leg.
+            adults: Number of adult travelers.
+            hand_bags: Number of cabin bags per adult traveler.
+            hold_bags: Number of checked bags per adult traveler.
+            max_connection_layover_seconds: Duration in seconds for max connection layover.
+            provider_ids: Provider identifiers involved in the request.
+
+        Returns:
+            dict[str, Any] | None: The best round-trip itinerary for the requested market.
+        """
+
         def _fetch(provider: Any, _: str) -> dict[str, Any] | None:
             return provider.get_best_return(
                 source=source,
