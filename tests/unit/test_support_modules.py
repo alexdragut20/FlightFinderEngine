@@ -9,9 +9,14 @@ from pathlib import Path
 from flight_layover_lab import airports as airports_module
 from flight_layover_lab import app as app_module
 from flight_layover_lab import config as config_module
+from flight_layover_lab import progress as progress_module
 from flight_layover_lab import resources as resources_module
+from flight_layover_lab import route_graph as route_graph_module
 from flight_layover_lab import utils as utils_module
 from flight_layover_lab.airports import AirportCoordinates
+from flight_layover_lab.progress import SearchProgressTracker
+from flight_layover_lab.providers._cache import _build_cache_key, per_instance_lru_cache
+from flight_layover_lab.search_jobs import SearchJob, SearchJobStore
 
 
 class _FakeResponse:
@@ -146,6 +151,64 @@ def test_airport_coordinates_gracefully_handles_invalid_cache(monkeypatch, tmp_p
     assert airports.display_name("BAD") is None
 
 
+def test_airport_coordinates_cover_empty_codes_download_failure_and_label_fallbacks(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    cache_path = tmp_path / "airports.dat"
+    monkeypatch.setattr(airports_module, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(airports_module, "AIRPORTS_CACHE_PATH", cache_path)
+
+    monkeypatch.setattr(
+        airports_module.requests,
+        "get",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("download failed")),
+    )
+    failed = AirportCoordinates()
+    assert failed.get("") is None
+    assert failed.display_name("") is None
+    assert failed.get("OTP") == config_module.FALLBACK_COORDS["OTP"]
+
+    cache_path.write_text(
+        "1,Airport Name,\\N,Country,TST,ICAO,10.0,20.0\n"
+        "2,Short Row\n"
+        "3,Airport Name,City,Country,TWO,ICAO,bad,20.0\n",
+        encoding="utf-8",
+    )
+    loaded = AirportCoordinates()
+    assert loaded.get("TST") == (10.0, 20.0)
+    assert loaded.display_name("TST") == "Airport Name"
+    assert loaded.get("TWO") is None
+
+
+def test_airport_coordinates_loading_failures_cover_download_and_open_errors(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    missing_cache_path = tmp_path / "missing-airports.dat"
+    monkeypatch.setattr(airports_module, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(airports_module, "AIRPORTS_CACHE_PATH", missing_cache_path)
+    monkeypatch.setattr(
+        airports_module.requests,
+        "get",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("download failed")),
+    )
+
+    missing = AirportCoordinates()
+    assert missing.get("TST") is None
+
+    class _BrokenAirportPath:
+        def exists(self) -> bool:
+            return True
+
+        def open(self, *args: object, **kwargs: object) -> object:
+            raise OSError("broken cache")
+
+    monkeypatch.setattr(airports_module, "AIRPORTS_CACHE_PATH", _BrokenAirportPath())
+    broken = AirportCoordinates()
+    assert broken.get("ZZZ") is None
+
+
 def test_utils_cover_basic_normalization_and_ranges() -> None:
     assert utils_module.normalize_codes("otp; bbu,otp", ["OTP"]) == ("OTP", "BBU")
     assert utils_module.normalize_codes([], ["OTP"]) == ("OTP",)
@@ -277,3 +340,250 @@ def test_utils_cover_datetime_guess_links_and_segments(monkeypatch) -> None:
     assert utils_module.transfer_events_from_segments([]) == 0
     assert utils_module.boundary_transfer_events("OTP", "OTP") == 1
     assert utils_module.boundary_transfer_events("OTP", "BBU") == 2
+
+
+def test_utils_and_cache_cover_additional_error_paths_and_eviction(monkeypatch) -> None:
+    assert utils_module.normalize_provider_ids(["bad"]) == ("kiwi",)
+    assert utils_module.normalize_provider_ids(None) == config_module.SUPPORTED_PROVIDER_IDS
+    assert utils_module.absolute_kiwi_url(None) is None
+    assert utils_module.absolute_kiwi_url("deep/path") == "https://www.kiwi.com/deep/path"
+    assert utils_module.absolute_kayak_url(None) is None
+    assert utils_module.connection_gap_seconds("bad", "2026-03-10T10:00:00") is None
+    assert (
+        utils_module.minimum_split_boundary_connection_seconds("OTP", "BBU")
+        == config_module.MIN_SPLIT_CONNECTION_CROSS_AIRPORT_SECONDS
+    )
+    assert utils_module.parse_money_amount_int("1,234,567") == 1234567
+    assert utils_module.parse_datetime_guess("2026-03-10Tbad") is None
+    guessed = utils_module.parse_google_flights_text_datetime("5:50 AM on Mar 12", "bad-date")
+    assert guessed is not None and guessed.endswith("T05:50:00")
+    links = utils_module.build_comparison_links(
+        "OTP",
+        "MGA",
+        "2026-03-10",
+        "2026-03-24",
+        adults=1,
+        max_stops_per_leg=2,
+        currency="EUR",
+    )
+    assert "kayak.com" in links["kayak"]
+    assert utils_module.transfer_events_from_segments([{"to": "OTP"}, {"from": "BBU"}]) == 2
+
+    with config_module._FX_CACHE_LOCK:
+        config_module._FX_RATE_CACHE.clear()
+    with utils_module._FX_CACHE_LOCK:
+        utils_module._FX_RATE_CACHE.clear()
+
+    monkeypatch.setattr(utils_module.requests, "get", lambda *args, **kwargs: _FakeResponse("bad"))
+    assert utils_module._get_fx_rates("CAD") is None
+    monkeypatch.setattr(
+        utils_module.requests,
+        "get",
+        lambda *args, **kwargs: _FakeResponse({"result": "error", "rates": {}}),
+    )
+    assert utils_module._get_fx_rates("AUD") is None
+    monkeypatch.setattr(
+        utils_module.requests,
+        "get",
+        lambda *args, **kwargs: _FakeResponse(
+            {"result": "success", "rates": {"RON": "bad", "USD": float("inf"), "EUR": 0}}
+        ),
+    )
+    assert utils_module._get_fx_rates("CHF") is None
+
+    clock = {"now": 100.0}
+    monkeypatch.setattr(utils_module.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(
+        utils_module.requests,
+        "get",
+        lambda *args, **kwargs: _FakeResponse(
+            {"result": "success", "rates": {"RON": 4.5, "USD": 1.0}}
+        ),
+    )
+    cached_rates = utils_module._get_fx_rates("USD")
+    assert cached_rates == {"RON": 4.5, "USD": 1.0}
+    monkeypatch.setattr(
+        utils_module.requests,
+        "get",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("network should not be used")),
+    )
+    clock["now"] += 1
+    assert utils_module._get_fx_rates("USD") == {"RON": 4.5, "USD": 1.0}
+    assert utils_module.convert_currency_amount(float("nan"), "USD", "RON") is None
+    assert utils_module.convert_currency_amount(10, "USD", "GBP") is None
+
+    class _Cached:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        @per_instance_lru_cache(maxsize=1)
+        def compute(self, value: int, *, bonus: int = 0) -> int:
+            self.calls += 1
+            return self.calls + value + bonus
+
+    first = _Cached()
+    assert _build_cache_key((1,), {"bonus": 2}) != (1,)
+    assert first.compute(1, bonus=2) == 4
+    assert first.compute(1, bonus=2) == 4
+    assert first.calls == 1
+    assert first.compute(2, bonus=0) == 4
+    assert first.compute(1, bonus=2) == 6
+    assert first.calls == 3
+
+    second = _Cached()
+    assert second.compute(1, bonus=2) == 4
+    assert second.calls == 1
+
+
+def test_support_edge_paths_cover_progress_route_graph_search_jobs_and_more(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    clock = {"now": 100.0}
+    monkeypatch.setattr(progress_module.time, "time", lambda: clock["now"])
+
+    tracker = SearchProgressTracker("job-support-edge")
+    tracker.start_phase("setup", total=1, detail="Setup.")
+    tracker.advance_phase("calendar", step=1)
+    clock["now"] += 5
+    tracker.complete_phase("setup")
+    clock["now"] += 10
+    tracker.start_phase("build", total=10, detail="Building.")
+    clock["now"] += 10
+    tracker.advance_phase("build", completed=5, total=10)
+    running = tracker.snapshot()
+    assert running["eta_seconds"] is not None
+
+    with tracker._lock:
+        tracker._phase_state["build"]["total"] = 0
+        tracker._maybe_log_bucket_locked("build")
+        tracker._phase_state["build"]["total"] = 10
+        tracker._phase_state["build"]["progress"] = 0.0
+        tracker._phase_log_buckets["build"] = 0
+        tracker._maybe_log_bucket_locked("build")
+        assert tracker._estimate_eta_locked(clock["now"], 0.01, 1.0) is not None
+
+    empty_tracker = SearchProgressTracker("job-support-empty")
+    with empty_tracker._lock:
+        assert empty_tracker._estimate_eta_locked(clock["now"], 0.01, 1.0) is None
+    pending_tracker = SearchProgressTracker("job-support-pending")
+    pending_tracker.start_phase("build", total=10, detail="Building.")
+    with pending_tracker._lock:
+        assert pending_tracker._estimate_eta_locked(clock["now"], 0.01, 1.0) is None
+
+    assert utils_module.normalize_codes(["", "otp", "   "], ["BBU"]) == ("OTP",)
+    assert utils_module.clamp_optional_int("bad", fallback=7, low=1, high=9) == 7
+    assert utils_module.kiwi_return_url("", "", "2026-03-10", "2026-03-24").endswith("/results/")
+    assert "maxStopsCount" not in utils_module.kiwi_return_url(
+        "OTP",
+        "MGA",
+        "2026-03-10",
+        "2026-03-24",
+        None,
+    )
+    assert (
+        utils_module.absolute_kayak_url("https://example.test/path") == "https://example.test/path"
+    )
+    assert utils_module.parse_local_datetime("") is None
+    assert (
+        utils_module.max_segment_layover_seconds(
+            [
+                {"arrive_local": "bad"},
+                {"depart_local": "2026-03-10T10:00:00"},
+            ]
+        )
+        == 0
+    )
+    assert utils_module.parse_iso8601_duration_seconds("") is None
+    assert utils_module.parse_money_amount_int("   ") is None
+    assert utils_module.parse_money_amount_int("1,234.56") == 1235
+    assert utils_module.parse_money_amount_int(float("nan")) is None
+    assert utils_module.parse_money_amount_int("1.2.3") is None
+    assert utils_module._get_fx_rates("") is None
+    assert utils_module.parse_datetime_guess("") is None
+    assert utils_module.convert_currency_amount(None, "USD", "RON") is None
+
+    with config_module._FX_CACHE_LOCK:
+        config_module._FX_RATE_CACHE.clear()
+    with utils_module._FX_CACHE_LOCK:
+        utils_module._FX_RATE_CACHE.clear()
+
+    monkeypatch.setattr(
+        utils_module.requests,
+        "get",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("fx down")),
+    )
+    assert utils_module._get_fx_rates("EUR") is None
+
+    monkeypatch.setattr(
+        utils_module.requests,
+        "get",
+        lambda *args, **kwargs: _FakeResponse({"result": "success", "rates": []}),
+    )
+    assert utils_module._get_fx_rates("GBP") is None
+
+    monkeypatch.setattr(
+        utils_module.requests,
+        "get",
+        lambda *args, **kwargs: _FakeResponse({"result": "success", "rates": {"": 4.0}}),
+    )
+    assert utils_module._get_fx_rates("CAD") is None
+    monkeypatch.setattr(utils_module, "_get_fx_rates", lambda *_args, **_kwargs: None)
+    assert utils_module.convert_currency_amount(10, "USD", "RON") is None
+
+    links = utils_module.build_comparison_links(
+        "OTP",
+        "MGA",
+        "2026-03-10",
+        "2026-03-24",
+        adults=1,
+        max_stops_per_leg=2,
+        currency="EUR",
+    )
+    assert "with+up+to+2+stops" in links["google_flights"]
+
+    graph = route_graph_module.RouteConnectivityGraph()
+    graph._loaded = True
+    graph._outgoing = {
+        "OTP": {"IST"},
+        "IST": {"IST", "USM", "BKK"},
+        "USM": {"DXB"},
+        "DXB": {"OTP"},
+    }
+    graph._incoming = {
+        "IST": {"OTP"},
+        "USM": {"IST"},
+        "OTP": {"DXB"},
+    }
+    blocked_scores = graph.score_path_hubs(origins=["OTP"], destinations=["IST"], max_split_hubs=2)
+    assert "IST" not in blocked_scores
+    assert blocked_scores["USM"] > 0
+    assert blocked_scores["DXB"] > 0
+    assert graph.score_path_hubs(origins=["OTP"], destinations=["ZZZ"], max_split_hubs=2) == {}
+    graph._outgoing = {"OTP": {"LONG"}}
+    graph._incoming = {"IST": {"LONG"}}
+    assert graph.score_path_hubs(origins=["OTP"], destinations=["IST"], max_split_hubs=1) == {}
+
+    monkeypatch.setattr(route_graph_module, "CACHE_DIR", tmp_path)
+
+    class _BrokenRoutesPath:
+        def exists(self) -> bool:
+            return True
+
+        def open(self, *args: object, **kwargs: object) -> object:
+            raise OSError("routes broken")
+
+    monkeypatch.setattr(route_graph_module, "ROUTES_CACHE_PATH", _BrokenRoutesPath())
+    broken_graph = route_graph_module.RouteConnectivityGraph()
+    assert broken_graph.available() is False
+
+    store = SearchJobStore(max_jobs=4, ttl_seconds=300)
+    expired_job = SearchJob(
+        job_id="expired",
+        progress=SearchProgressTracker("expired"),
+        finished_at=clock["now"] - 1000,
+    )
+    store._jobs["expired"] = expired_job
+    with store._lock:
+        store._prune_locked()
+    assert store.get_job("expired") is None

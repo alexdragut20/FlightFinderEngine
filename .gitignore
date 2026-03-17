@@ -12,6 +12,7 @@ venv/
 .pre-commit-cache/
 .coverage
 .coverage.*
+coverage.xml
 htmlcov/
 
 # IDE / OS

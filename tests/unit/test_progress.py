@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from flight_layover_lab.airports import AirportCoordinates
 from flight_layover_lab.engine import SplitTripOptimizer
 from flight_layover_lab.progress import SearchProgressTracker
@@ -105,3 +107,56 @@ def test_progress_tracker_snapshot_can_stream_incremental_events() -> None:
         "Progress event 3",
         "Progress event 4",
     ]
+
+
+def test_progress_tracker_edge_paths_cover_default_messages_eta_and_empty_logs(
+    monkeypatch,
+) -> None:
+    clock = {"now": 1000.0}
+    monkeypatch.setattr("flight_layover_lab.progress.time.time", lambda: clock["now"])
+
+    tracker = SearchProgressTracker("job-edge")
+    initial = tracker.snapshot(since_event_index=999)
+    assert initial["status"] == "queued"
+    assert initial["eta_seconds"] is None
+    assert initial["events"] == []
+    assert initial["events_start_index"] == initial["next_event_index"]
+
+    tracker.mark_running()
+    tracker.log_message("   ", phase="setup")
+    tracker.start_phase("calendar", total=0)
+    assert tracker.snapshot()["events"][-1]["message"] == "Fetching route calendars started."
+
+    clock["now"] += 5
+    tracker.advance_phase("calendar", step=1)
+    calendar_snapshot = tracker.snapshot()
+    assert calendar_snapshot["current"] == 1
+    assert calendar_snapshot["total"] == 1
+    assert any(
+        "Fetching route calendars: 100% (1/1)." == event["message"]
+        for event in calendar_snapshot["events"]
+    )
+
+    tracker.start_phase("oneways", total=0, detail="Validating one-way legs.")
+    tracker.add_phase_total("oneways", total=10)
+    clock["now"] += 10
+    one_way_snapshot = tracker.snapshot()
+    assert one_way_snapshot["phase"] == "oneways"
+    assert one_way_snapshot["eta_seconds"] is not None
+
+    clock["now"] += 5
+    tracker.complete_phase("returns")
+    returns_snapshot = tracker.snapshot()
+    assert returns_snapshot["phase"] == "returns"
+    assert returns_snapshot["progress_percent"] > 0
+
+    tracker.mark_completed()
+    completed = tracker.snapshot(since_event_index=999)
+    assert completed["status"] == "completed"
+    assert completed["progress_percent"] == 100.0
+    assert completed["events"] == []
+    assert completed["events_start_index"] == completed["next_event_index"]
+    assert tracker.snapshot()["events"][-1]["message"] == "Search complete."
+
+    with pytest.raises(ValueError):
+        tracker.start_phase("unknown")

@@ -324,3 +324,128 @@ def test_post_search_handles_success_and_error_paths(monkeypatch) -> None:
         HTTPStatus.INTERNAL_SERVER_ERROR,
         {"error": "Search failed: boom"},
     )
+
+
+def test_http_server_bootstrap_and_job_error_paths(monkeypatch) -> None:
+    init_called: dict[str, object] = {}
+
+    def fake_super_init(
+        self: object, *args: object, directory: str | None = None, **kwargs: object
+    ) -> None:
+        init_called["args"] = args
+        init_called["directory"] = directory
+        init_called["kwargs"] = kwargs
+
+    monkeypatch.setattr(SimpleHTTPRequestHandler, "__init__", fake_super_init)
+    AppHandler(object(), ("127.0.0.1", 8000), object())
+    assert init_called["directory"] == str(STATIC_DIR)
+
+    handler = AppHandler.__new__(AppHandler)
+    handler.path = "/api/search-jobs/job-123?since_event_index=not-a-number"
+    sent_get: dict[str, object] = {}
+
+    class _JobStub:
+        def __init__(self) -> None:
+            self.called_with: int | None = -1
+
+        def snapshot(self, *, since_event_index: int | None = None) -> dict[str, object]:
+            self.called_with = since_event_index
+            return {"job_id": "job-123", "status": "running"}
+
+    job = _JobStub()
+    handler.job_store = SimpleNamespace(get_job=lambda job_id: job if job_id == "job-123" else None)
+    handler._send_json = lambda status, payload: sent_get.update(  # type: ignore[method-assign]
+        {"status": status, "payload": payload}
+    )
+
+    AppHandler.do_GET(handler)
+    assert sent_get["status"] == HTTPStatus.OK
+    assert sent_get["payload"] == {"job_id": "job-123", "status": "running"}
+    assert job.called_with is None
+
+    monkeypatch.setattr("flight_layover_lab.http_server.log_event", lambda *args, **kwargs: None)
+
+    def _run_job_case(mode: str) -> tuple[int, dict[str, object]]:
+        job_handler = AppHandler.__new__(AppHandler)
+        job_handler.path = "/api/search-jobs"
+        job_handler.headers = {"Content-Length": "2"}
+        job_handler.rfile = io.BytesIO(b"{}")
+        job_handler.client_address = ("127.0.0.1", 12345)
+
+        class _OptimizerStub:
+            def parse_search_config(self, payload: object) -> object:
+                if mode == "bad-config":
+                    raise ValueError("invalid job config")
+                return {"parsed": True}
+
+        class _JobStoreStub:
+            def start_job(self, optimizer: object, config: object) -> object:
+                if mode == "boom":
+                    raise RuntimeError("cannot enqueue")
+                return SimpleNamespace(snapshot=lambda: {"job_id": "job-1", "status": "queued"})
+
+        sent: dict[str, object] = {}
+        job_handler.optimizer = _OptimizerStub()
+        job_handler.job_store = _JobStoreStub()
+        job_handler._send_json = lambda status, payload: sent.update(  # type: ignore[method-assign]
+            {"status": status, "payload": payload}
+        )
+        AppHandler.do_POST(job_handler)
+        return int(sent["status"]), sent["payload"]  # type: ignore[return-value]
+
+    assert _run_job_case("bad-config") == (
+        HTTPStatus.BAD_REQUEST,
+        {"error": "invalid job config"},
+    )
+    assert _run_job_case("ok") == (
+        HTTPStatus.ACCEPTED,
+        {"job_id": "job-1", "status": "queued"},
+    )
+    assert _run_job_case("boom") == (
+        HTTPStatus.INTERNAL_SERVER_ERROR,
+        {"error": "Search failed to start: cannot enqueue"},
+    )
+
+    server_runs = iter(["normal", "interrupt"])
+    created_servers: list[SimpleNamespace] = []
+    logged_events: list[dict[str, object]] = []
+    printed: list[str] = []
+
+    def fake_server(address: tuple[str, int], handler_cls: object) -> SimpleNamespace:
+        mode = next(server_runs)
+        server = SimpleNamespace(address=address, handler_cls=handler_cls, closed=False)
+
+        def serve_forever() -> None:
+            if mode == "interrupt":
+                raise KeyboardInterrupt
+
+        def server_close() -> None:
+            server.closed = True
+
+        server.serve_forever = serve_forever
+        server.server_close = server_close
+        created_servers.append(server)
+        return server
+
+    monkeypatch.setattr("flight_layover_lab.http_server.ThreadingHTTPServer", fake_server)
+    monkeypatch.setattr(
+        "flight_layover_lab.http_server.log_event",
+        lambda level, event, **fields: logged_events.append({"event": event, **fields}),
+    )
+    monkeypatch.setattr("builtins.print", lambda message: printed.append(str(message)))
+
+    monkeypatch.setenv("HOST", "0.0.0.0")
+    monkeypatch.setenv("PORT", "8123")
+    from flight_layover_lab.http_server import run_server
+
+    run_server()
+    run_server()
+
+    assert [server.address for server in created_servers] == [
+        ("0.0.0.0", 8123),
+        ("0.0.0.0", 8123),
+    ]
+    assert all(server.handler_cls is AppHandler for server in created_servers)
+    assert all(server.closed is True for server in created_servers)
+    assert any("http://0.0.0.0:8123" in message for message in printed)
+    assert logged_events[0]["event"] == "server_starting"

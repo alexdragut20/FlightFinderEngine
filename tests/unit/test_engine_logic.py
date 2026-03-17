@@ -1095,6 +1095,191 @@ def test_search_reuses_shared_oneway_validation_across_destinations() -> None:
     assert provider.return_calls[("IST", "BBB", "2026-06-01", "2026-06-03")] == 1
 
 
+def test_search_builds_direct_and_standard_split_results_from_live_validation_paths() -> None:
+    def segment(
+        source: str,
+        destination: str,
+        depart_local: str,
+        arrive_local: str,
+    ) -> dict[str, str]:
+        return {
+            "from": source,
+            "to": destination,
+            "depart_local": depart_local,
+            "arrive_local": arrive_local,
+        }
+
+    class SearchProvider:
+        provider_id = "kiwi"
+        display_name = "Kiwi"
+        supports_calendar = True
+        requires_credentials = False
+        credential_env: tuple[str, ...] = ()
+        default_enabled = True
+
+        def is_configured(self) -> bool:
+            return True
+
+        def __init__(self) -> None:
+            self.calendars = {
+                ("OTP", "MGA"): {"2026-03-10": 900},
+                ("MGA", "OTP"): {"2026-03-18": 950},
+                ("OTP", "IST"): {"2026-03-10": 220},
+                ("IST", "MGA"): {"2026-03-12": 260},
+                ("MGA", "IST"): {"2026-03-20": 280},
+                ("IST", "OTP"): {"2026-03-24": 240},
+            }
+            self.oneways = {
+                ("OTP", "IST", "2026-03-10"): {
+                    "price": 220,
+                    "formatted_price": "220 RON",
+                    "currency": "RON",
+                    "duration_seconds": 5400,
+                    "stops": 0,
+                    "transfer_events": 0,
+                    "booking_url": "https://example.test/otp-ist",
+                    "segments": [
+                        segment("OTP", "IST", "2026-03-10T08:00:00", "2026-03-10T09:30:00")
+                    ],
+                    "provider": "kiwi",
+                    "fare_mode": "selected_bags",
+                    "price_mode": "explicit_total",
+                },
+                ("IST", "MGA", "2026-03-12"): {
+                    "price": 260,
+                    "formatted_price": "260 RON",
+                    "currency": "RON",
+                    "duration_seconds": 7200,
+                    "stops": 0,
+                    "transfer_events": 0,
+                    "booking_url": "https://example.test/ist-mga",
+                    "segments": [
+                        segment("IST", "MGA", "2026-03-12T12:00:00", "2026-03-12T14:00:00")
+                    ],
+                    "provider": "kiwi",
+                    "fare_mode": "selected_bags",
+                    "price_mode": "explicit_total",
+                },
+                ("MGA", "IST", "2026-03-20"): {
+                    "price": 280,
+                    "formatted_price": "280 RON",
+                    "currency": "RON",
+                    "duration_seconds": 7200,
+                    "stops": 0,
+                    "transfer_events": 0,
+                    "booking_url": "https://example.test/mga-ist",
+                    "segments": [
+                        segment("MGA", "IST", "2026-03-20T09:00:00", "2026-03-20T11:00:00")
+                    ],
+                    "provider": "kiwi",
+                    "fare_mode": "selected_bags",
+                    "price_mode": "explicit_total",
+                },
+                ("IST", "OTP", "2026-03-24"): {
+                    "price": 240,
+                    "formatted_price": "240 RON",
+                    "currency": "RON",
+                    "duration_seconds": 5400,
+                    "stops": 0,
+                    "transfer_events": 0,
+                    "booking_url": "https://example.test/ist-otp",
+                    "segments": [
+                        segment("IST", "OTP", "2026-03-24T16:00:00", "2026-03-24T17:30:00")
+                    ],
+                    "provider": "kiwi",
+                    "fare_mode": "selected_bags",
+                    "price_mode": "explicit_total",
+                },
+            }
+            self.returns = {
+                ("OTP", "MGA", "2026-03-10", "2026-03-18"): {
+                    "price": 1200,
+                    "formatted_price": "1200 RON",
+                    "currency": "RON",
+                    "duration_seconds": 4 * 3600,
+                    "outbound_duration_seconds": 2 * 3600,
+                    "inbound_duration_seconds": 2 * 3600,
+                    "outbound_stops": 0,
+                    "inbound_stops": 0,
+                    "outbound_transfer_events": 0,
+                    "inbound_transfer_events": 0,
+                    "booking_url": "https://example.test/otp-mga-rt",
+                    "outbound_segments": [
+                        segment("OTP", "MGA", "2026-03-10T08:00:00", "2026-03-10T10:00:00")
+                    ],
+                    "inbound_segments": [
+                        segment("MGA", "OTP", "2026-03-18T18:00:00", "2026-03-18T20:00:00")
+                    ],
+                    "provider": "kiwi",
+                    "fare_mode": "selected_bags",
+                    "price_mode": "explicit_total",
+                },
+            }
+
+        def get_calendar_prices(self, **kwargs):  # type: ignore[no-untyped-def]
+            return dict(
+                self.calendars.get(
+                    (kwargs.get("source"), kwargs.get("destination")),
+                    {},
+                )
+            )
+
+        def get_best_oneway(self, **kwargs):  # type: ignore[no-untyped-def]
+            item = self.oneways.get(
+                (kwargs.get("source"), kwargs.get("destination"), kwargs.get("departure_iso"))
+            )
+            return dict(item) if item else None
+
+        def get_best_return(self, **kwargs):  # type: ignore[no-untyped-def]
+            item = self.returns.get(
+                (
+                    kwargs.get("source"),
+                    kwargs.get("destination"),
+                    kwargs.get("outbound_iso"),
+                    kwargs.get("inbound_iso"),
+                )
+            )
+            return dict(item) if item else None
+
+    class UnavailableRouteGraph:
+        def available(self) -> bool:
+            return False
+
+    optimizer = SplitTripOptimizer({"kiwi": SearchProvider()}, AirportCoordinates())
+    optimizer.route_graph = UnavailableRouteGraph()
+    config = optimizer.parse_search_config(
+        {
+            "origins": ["OTP"],
+            "destinations": ["MGA"],
+            "providers": ["kiwi"],
+            "period_start": "2026-03-10",
+            "period_end": "2026-03-24",
+            "hub_candidates": ["IST"],
+            "auto_hubs_per_direction": 1,
+            "min_stay_days": 8,
+            "max_stay_days": 8,
+            "min_stopover_days": 2,
+            "max_stopover_days": 4,
+            "max_transfers_per_direction": 1,
+            "objective": "cheapest",
+            "top_results": 5,
+            "validate_top_per_destination": 10,
+            "market_compare_fares": False,
+            "io_workers": 2,
+            "cpu_workers": 1,
+        }
+    )
+
+    result = optimizer.search(config)
+    result_types = {item["itinerary_type"] for item in result["results"]}
+    totals = {item["itinerary_type"]: item["total_price"] for item in result["results"]}
+
+    assert "direct_roundtrip" in result_types
+    assert "split_stopover" in result_types
+    assert totals["direct_roundtrip"] == 1200
+    assert totals["split_stopover"] == 1000
+
+
 def test_merge_strategy_anchors_keeps_destination_coverage() -> None:
     optimizer = SplitTripOptimizer(KiwiClient(), AirportCoordinates())
     ranked = [

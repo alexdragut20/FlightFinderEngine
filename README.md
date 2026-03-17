@@ -3,7 +3,7 @@
 [![CI](https://github.com/alexdragut20/FlightFinderEngine/actions/workflows/ci.yml/badge.svg)](https://github.com/alexdragut20/FlightFinderEngine/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.12+-3776AB?logo=python&logoColor=white)
 ![Tests](https://img.shields.io/badge/tests-pytest-0A9EDC?logo=pytest&logoColor=white)
-![Coverage](https://img.shields.io/badge/coverage-73%25-2ea44f)
+![Coverage](https://img.shields.io/badge/coverage-80%25-2ea44f)
 ![Ruff](https://img.shields.io/badge/lint%20%26%20format-ruff-D7FF64?logo=ruff&logoColor=111111)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 
