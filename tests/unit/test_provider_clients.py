@@ -2127,3 +2127,84 @@ def test_multi_provider_client_serializes_marked_provider_requests() -> None:
         assert second.result(timeout=2.0) is not None
 
     assert state["max_active"] == 1
+
+
+def test_multi_provider_client_retries_serialized_provider_before_global_block_cooldown(
+    monkeypatch,
+) -> None:
+    class _SerializedBlockingProvider:
+        provider_id = "kayak"
+        supports_calendar = False
+        serialized_requests = True
+        request_interval_seconds = 0.0
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def get_best_oneway(self, **kwargs: object) -> dict[str, object] | None:
+            self.calls += 1
+            if self.calls == 1:
+                raise ProviderBlockedError(
+                    "Kayak blocked automated scraping (captcha/anti-bot challenge).",
+                    cooldown_seconds=120,
+                )
+            return {"price": 100, "stops": 0, "duration_seconds": 1000}
+
+        def get_best_return(self, **kwargs: object) -> dict[str, object] | None:
+            return None
+
+    provider = _SerializedBlockingProvider()
+    client = MultiProviderClient([provider])
+    monkeypatch.setattr("src.providers.multi.log_event", lambda *args, **kwargs: None)
+
+    first = client.get_best_oneway("OTP", "MGA", "2026-03-10", "RON", 2, 1, 0, 0)
+    second = client.get_best_oneway("OTP", "MGA", "2026-03-11", "RON", 2, 1, 0, 0)
+    stats = client.stats_snapshot()
+
+    assert first is None
+    assert second is not None
+    assert second["provider"] == "kayak"
+    assert provider.calls == 2
+    assert client._provider_pause_remaining_seconds("kayak") == 0
+    assert stats["oneway_calls"]["kayak"] == 2
+    assert stats["oneway_blocked"]["kayak"] == 1
+    assert stats["oneway_skipped_cooldown"].get("kayak", 0) == 0
+
+
+def test_multi_provider_client_pauses_serialized_provider_after_repeated_blocks(
+    monkeypatch,
+) -> None:
+    class _SerializedBlockingProvider:
+        provider_id = "kayak"
+        supports_calendar = False
+        serialized_requests = True
+        request_interval_seconds = 0.0
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def get_best_oneway(self, **kwargs: object) -> dict[str, object] | None:
+            self.calls += 1
+            raise ProviderBlockedError(
+                "Kayak blocked automated scraping (captcha/anti-bot challenge).",
+                cooldown_seconds=120,
+            )
+
+        def get_best_return(self, **kwargs: object) -> dict[str, object] | None:
+            return None
+
+    provider = _SerializedBlockingProvider()
+    client = MultiProviderClient([provider])
+    monkeypatch.setattr("src.providers.multi.log_event", lambda *args, **kwargs: None)
+
+    for departure_iso in ("2026-03-10", "2026-03-11", "2026-03-12"):
+        assert client.get_best_oneway("OTP", "MGA", departure_iso, "RON", 2, 1, 0, 0) is None
+
+    assert provider.calls == 3
+    assert client._provider_pause_remaining_seconds("kayak") > 0
+    assert client.get_best_oneway("OTP", "MGA", "2026-03-13", "RON", 2, 1, 0, 0) is None
+
+    stats = client.stats_snapshot()
+    assert provider.calls == 3
+    assert stats["oneway_blocked"]["kayak"] == 3
+    assert stats["oneway_skipped_cooldown"]["kayak"] == 1

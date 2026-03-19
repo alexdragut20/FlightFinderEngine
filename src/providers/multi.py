@@ -81,6 +81,7 @@ class MultiProviderClient:
         self._budget_total_used = 0
         self._budget_used_by_provider: dict[str, int] = {}
         self._provider_paused_until: dict[str, float] = {}
+        self._provider_block_streaks: dict[str, int] = {}
         self._provider_issue_state: dict[str, dict[str, Any]] = {}
         self._provider_request_locks: dict[str, threading.Lock] = {}
         self._provider_next_allowed_at: dict[str, float] = {}
@@ -196,19 +197,22 @@ class MultiProviderClient:
                 )
             )
             issue = issue_state.get(provider_id) or {}
+            issue_type = str(issue.get("issue_type") or "").strip().lower()
             cooldown_seconds = self._provider_pause_remaining_seconds(provider_id)
             if cooldown_seconds <= 0:
                 cooldown_seconds = int(issue.get("cooldown_seconds") or 0)
             if selected > 0:
                 status = "selected"
-            elif blocked > 0:
+            elif cooldown_seconds > 0 or issue_type == "blocked":
                 status = "blocked"
-            elif errors > 0:
+            elif issue_type == "error" or errors > 0:
                 status = "error"
-            elif no_result > 0:
+            elif issue_type == "no_result" or no_result > 0:
                 status = "no_result"
             elif calls > 0:
                 status = "active"
+            elif blocked > 0:
+                status = "blocked"
             else:
                 status = "idle"
             providers[provider_id] = {
@@ -325,6 +329,39 @@ class MultiProviderClient:
                 float(self._provider_paused_until.get(normalized_provider_id, 0.0) or 0.0),
                 until,
             )
+
+    def _provider_block_cooldown_threshold(self, provider_id: str) -> int:
+        """Return how many consecutive blocks are tolerated before pausing a provider."""
+        normalized_provider_id = str(provider_id or "").strip().lower()
+        provider = self._provider_by_id.get(normalized_provider_id)
+        if provider is not None:
+            try:
+                configured_threshold = int(getattr(provider, "block_cooldown_threshold", 0) or 0)
+            except (TypeError, ValueError):
+                configured_threshold = 0
+            if configured_threshold > 0:
+                return configured_threshold
+            if self._provider_serialized_requests(provider):
+                return 3
+        return 1
+
+    def _increment_provider_block_streak(self, provider_id: str) -> int:
+        """Record another consecutive anti-bot block for the provider."""
+        normalized_provider_id = str(provider_id or "").strip().lower()
+        if not normalized_provider_id:
+            return 0
+        with self._stats_lock:
+            next_streak = int(self._provider_block_streaks.get(normalized_provider_id, 0)) + 1
+            self._provider_block_streaks[normalized_provider_id] = next_streak
+            return next_streak
+
+    def _reset_provider_block_streak(self, provider_id: str) -> None:
+        """Clear any accumulated anti-bot block streak for the provider."""
+        normalized_provider_id = str(provider_id or "").strip().lower()
+        if not normalized_provider_id:
+            return
+        with self._stats_lock:
+            self._provider_block_streaks.pop(normalized_provider_id, None)
 
     @staticmethod
     def _provider_serialized_requests(provider: Any) -> bool:
@@ -475,26 +512,44 @@ class MultiProviderClient:
             return
         with self._stats_lock:
             self._provider_issue_state.pop(normalized_provider_id, None)
+            self._provider_block_streaks.pop(normalized_provider_id, None)
 
     def _register_provider_block(self, provider_id: str, exc: Exception) -> None:
-        """Record provider anti-bot blocking and pause future retries."""
+        """Record provider anti-bot blocking and pause future retries when persistent."""
         blocked_exc = self._coerce_blocked_exception(exc)
         cooldown_seconds = int(blocked_exc.cooldown_seconds or PROVIDER_ERROR_COOLDOWN_SECONDS)
-        self._pause_provider(provider_id, cooldown_seconds)
+        block_streak = self._increment_provider_block_streak(provider_id)
+        block_threshold = self._provider_block_cooldown_threshold(provider_id)
+        should_pause = block_streak >= block_threshold
+        if should_pause:
+            self._pause_provider(provider_id, cooldown_seconds)
         self._set_provider_issue(
             provider_id,
             issue_type="blocked",
             message=str(blocked_exc),
             manual_search_url=blocked_exc.manual_search_url,
-            cooldown_seconds=cooldown_seconds,
+            cooldown_seconds=cooldown_seconds if should_pause else None,
         )
+        if should_pause:
+            log_event(
+                logging.WARNING,
+                "provider_paused_bot_block",
+                provider_id=provider_id,
+                cooldown_seconds=cooldown_seconds,
+                manual_search_url=blocked_exc.manual_search_url,
+                error=str(blocked_exc),
+                block_streak=block_streak,
+                block_threshold=block_threshold,
+            )
+            return
         log_event(
             logging.WARNING,
-            "provider_paused_bot_block",
+            "provider_block_observed",
             provider_id=provider_id,
-            cooldown_seconds=cooldown_seconds,
             manual_search_url=blocked_exc.manual_search_url,
             error=str(blocked_exc),
+            block_streak=block_streak,
+            block_threshold=block_threshold,
         )
 
     def _register_provider_exception(self, provider_id: str, exc: Exception) -> None:
@@ -507,6 +562,7 @@ class MultiProviderClient:
         if self._looks_like_blocked_exception(exc):
             self._register_provider_block(provider_id, exc)
             return
+        self._reset_provider_block_streak(provider_id)
         text = str(exc or "").lower()
         cooldown_seconds: int | None = None
         if "too many open files" in text or int(getattr(exc, "errno", 0) or 0) == 24:
@@ -614,6 +670,7 @@ class MultiProviderClient:
                     self._register_provider_block(provider_id, exc)
                     self._bump("calendar_blocked", provider_id)
                     continue
+                self._reset_provider_block_streak(provider_id)
                 self._set_provider_issue(provider_id, issue_type="no_result", message=str(exc))
                 self._bump("calendar_no_result", provider_id)
                 continue
@@ -761,6 +818,7 @@ class MultiProviderClient:
                     self._register_provider_block(provider_id, exc)
                     self._bump(blocked_bucket, provider_id)
                     continue
+                self._reset_provider_block_streak(provider_id)
                 self._set_provider_issue(provider_id, issue_type="no_result", message=str(exc))
                 self._bump(no_result_bucket, provider_id)
                 continue
