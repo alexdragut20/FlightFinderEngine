@@ -1188,8 +1188,9 @@ def test_optimizer_async_fetch_and_search_wrapper_cover_base_compare_and_failure
             )
         )
     assert oneway_base_count == 2
-    assert oneway_map[("OTP", "MGA", "2026-03-10")]["fare_mode"] == "selected_bags"
-    assert oneway_map[("OTP", "MGA", "2026-03-10")]["base_no_bags_price"] == 90
+    assert oneway_map[("OTP", "MGA", "2026-03-10")]["fare_mode"] == "base_no_bags"
+    assert oneway_map[("OTP", "MGA", "2026-03-10")]["price"] == 90
+    assert oneway_map[("OTP", "MGA", "2026-03-10")]["selected_bags_price"] == 150
     assert oneway_map[("OTP", "BASEONLY", "2026-03-11")]["fare_mode"] == "base_no_bags"
     assert oneway_map[("OTP", "ERR", "2026-03-12")] is None
     assert any("oneway boom" in warning for warning in oneway_warnings)
@@ -1216,8 +1217,9 @@ def test_optimizer_async_fetch_and_search_wrapper_cover_base_compare_and_failure
             )
         )
     assert return_base_count == 2
-    assert return_map[("OTP", "MGA", "2026-03-10", "2026-03-24")]["fare_mode"] == "selected_bags"
-    assert return_map[("OTP", "MGA", "2026-03-10", "2026-03-24")]["base_no_bags_price"] == 240
+    assert return_map[("OTP", "MGA", "2026-03-10", "2026-03-24")]["fare_mode"] == "base_no_bags"
+    assert return_map[("OTP", "MGA", "2026-03-10", "2026-03-24")]["price"] == 240
+    assert return_map[("OTP", "MGA", "2026-03-10", "2026-03-24")]["selected_bags_price"] == 300
     assert (
         return_map[("OTP", "BASEONLY", "2026-03-11", "2026-03-25")]["fare_mode"] == "base_no_bags"
     )

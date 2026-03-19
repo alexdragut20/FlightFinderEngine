@@ -30,6 +30,17 @@ const objectiveLabels = {
   fastest: "Fastest",
   price_per_km: "Price / 1000 km",
 };
+const objectiveResultLabels = {
+  best: "Best option",
+  cheapest: "Cheapest option",
+  fastest: "Fastest option",
+  price_per_km: "Top value / 1000 km",
+};
+
+function objectiveResultLabel(objective) {
+  return objectiveResultLabels[objective] || "Top option";
+}
+
 let providerCatalog = [];
 let lastSearchPayload = null;
 let lastSearchResponse = null;
@@ -504,7 +515,7 @@ function applyBudgetAwarePreset() {
     : 0;
   const totalPaidBudget = amadeusCalls + serpapiCalls;
 
-  setInputValue("objective", "best");
+  setInputValue("objective", "cheapest");
   document.getElementById("market-compare-fares").checked = true;
   setInputValue("max-connection-layover-hours", 0);
   setInputValue("validate-top", validateTop);
@@ -1028,7 +1039,7 @@ function buildPdfReportHtml() {
     ["Main stay", `${payload.min_stay_days ?? "?"}-${payload.max_stay_days ?? "?"} day(s)`],
     ["Stopover stay", `${payload.min_stopover_days ?? "?"}-${payload.max_stopover_days ?? "?"} day(s)`],
     ["Currency", payload.currency || "RON"],
-    ["Rank by", objectiveLabels[payload.objective] || payload.objective || "best"],
+    ["Rank by", objectiveLabels[payload.objective] || payload.objective || "Cheapest"],
     ["Max transfers/direction", payload.max_transfers_per_direction ?? "N/A"],
     ["Max connection layover", maxConnLayover],
     [
@@ -1053,11 +1064,12 @@ function buildPdfReportHtml() {
       const bestPrice = group.bestItem
         ? formatMoney(group.bestItem.total_price, group.currency)
         : "No valid itinerary";
+      const topLabel = objectiveResultLabel(payload.objective || group.bestItem?.objective);
       if (!group.items.length) {
         return `
           <section class="destination-section">
             <h2>${escapeHtml(group.name)} (${escapeHtml(group.code)})</h2>
-            <p class="section-subtitle">Best option: ${escapeHtml(bestPrice)}</p>
+            <p class="section-subtitle">${escapeHtml(topLabel)}: ${escapeHtml(bestPrice)}</p>
             <div class="empty-box">No valid itineraries for current constraints in this search run.</div>
           </section>
         `;
@@ -1159,7 +1171,12 @@ function buildPdfReportHtml() {
               <div class="itinerary-head">
                 <h3>Option ${index + 1}: ${escapeHtml(formatMoney(item.total_price, item.currency))}</h3>
                 <p>${escapeHtml(item.destination_code)} | ${escapeHtml(item.itinerary_type || "itinerary")} | ${
-                  escapeHtml(item.objective || payload.objective || "best")
+                  escapeHtml(
+                    objectiveLabels[item.objective || payload.objective] ||
+                      item.objective ||
+                      payload.objective ||
+                      "Cheapest",
+                  )
                 }</p>
               </div>
               <p class="route-line">
@@ -1209,7 +1226,7 @@ function buildPdfReportHtml() {
       return `
         <section class="destination-section">
           <h2>${escapeHtml(group.name)} (${escapeHtml(group.code)})</h2>
-          <p class="section-subtitle">Best option: ${escapeHtml(bestPrice)} | ${group.items.length} option(s)</p>
+          <p class="section-subtitle">${escapeHtml(topLabel)}: ${escapeHtml(bestPrice)} | ${group.items.length} option(s)</p>
           ${cards}
         </section>
       `;
@@ -1699,7 +1716,9 @@ function renderDestinationGroup(group, open = false) {
   right.className = "destination-group-right";
   const bestLabel = document.createElement("span");
   bestLabel.className = "destination-group-best-label";
-  bestLabel.textContent = "Best option";
+  bestLabel.textContent = objectiveResultLabel(
+    group.bestItem?.objective || lastSearchPayload?.objective,
+  );
   const bestValue = document.createElement("span");
   bestValue.className = "destination-group-best-price";
   bestValue.textContent = group.bestItem

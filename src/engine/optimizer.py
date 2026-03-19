@@ -4733,6 +4733,45 @@ class SplitTripOptimizer:
         await asyncio.gather(*(fetch_route(s, d) for s, d in routes))
         return out, warnings
 
+    @staticmethod
+    def _merge_baggage_compared_fares(
+        selected_item: dict[str, Any] | None,
+        base_item: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Keep fare comparison metadata while surfacing the cheaper eligible fare."""
+
+        def _price_value(raw_price: Any) -> float | None:
+            try:
+                return float(raw_price)
+            except (TypeError, ValueError):
+                return None
+
+        selected = dict(selected_item) if selected_item else None
+        if selected:
+            selected["fare_mode"] = "selected_bags"
+
+        base = dict(base_item) if base_item else None
+        if base:
+            base["fare_mode"] = "base_no_bags"
+
+        if selected and base:
+            selected["base_no_bags_price"] = base.get("price")
+            selected["base_no_bags_formatted_price"] = base.get("formatted_price")
+            selected["base_no_bags_provider"] = base.get("provider", "kiwi")
+            selected["base_no_bags_booking_url"] = base.get("booking_url")
+
+            base["selected_bags_price"] = selected.get("price")
+            base["selected_bags_formatted_price"] = selected.get("formatted_price")
+            base["selected_bags_provider"] = selected.get("provider")
+            base["selected_bags_booking_url"] = selected.get("booking_url")
+
+            selected_price = _price_value(selected.get("price"))
+            base_price = _price_value(base.get("price"))
+            if base_price is not None and (selected_price is None or base_price < selected_price):
+                return base
+
+        return selected or base
+
     async def _fetch_oneways_parallel(
         self,
         search_client: MultiProviderClient,
@@ -4773,7 +4812,7 @@ class SplitTripOptimizer:
             if config.max_connection_layover_hours
             else None
         )
-        # Count of legs where we also fetched a no-bag base fare (comparison only).
+        # Count of legs where we also fetched a no-bag base fare for cheaper-fare comparison.
         base_fare_checked = 0
 
         out: dict[tuple[str, str, str], dict[str, Any] | None] = {}
@@ -4801,9 +4840,7 @@ class SplitTripOptimizer:
                         provider_ids=provider_ids,
                     )
                     item = await loop.run_in_executor(io_pool, fn)
-                    if item:
-                        item = dict(item)
-                        item["fare_mode"] = "selected_bags"
+                    base_item: dict[str, Any] | None = None
 
                     if compare_to_base:
                         # Base no-bag fare is only meaningful on Kiwi (it prices bags explicitly and is free).
@@ -4827,23 +4864,7 @@ class SplitTripOptimizer:
                             base_item = await loop.run_in_executor(io_pool, base_fn)
                             if base_item:
                                 base_fare_checked += 1
-                                base_item = dict(base_item)
-                                base_item["fare_mode"] = "base_no_bags"
-                                if item:
-                                    # Keep selected baggage price as the displayed price, but attach the
-                                    # base fare for debugging/comparison if needed.
-                                    item["base_no_bags_price"] = base_item.get("price")
-                                    item["base_no_bags_formatted_price"] = base_item.get(
-                                        "formatted_price"
-                                    )
-                                    item["base_no_bags_provider"] = base_item.get(
-                                        "provider", "kiwi"
-                                    )
-                                    item["base_no_bags_booking_url"] = base_item.get("booking_url")
-                                else:
-                                    # If we couldn't find a fare matching the baggage profile, fall back
-                                    # to base and surface it clearly as no-bag.
-                                    item = base_item
+                    item = self._merge_baggage_compared_fares(item, base_item)
 
                     out[key] = item
                 except Exception as exc:
@@ -4941,9 +4962,7 @@ class SplitTripOptimizer:
                         provider_ids=provider_ids,
                     )
                     item = await loop.run_in_executor(io_pool, fn)
-                    if item:
-                        item = dict(item)
-                        item["fare_mode"] = "selected_bags"
+                    base_item: dict[str, Any] | None = None
 
                     if compare_to_base:
                         base_compare_provider_ids: tuple[str, ...] | None = None
@@ -4967,19 +4986,7 @@ class SplitTripOptimizer:
                             base_item = await loop.run_in_executor(io_pool, base_fn)
                             if base_item:
                                 base_fare_checked += 1
-                                base_item = dict(base_item)
-                                base_item["fare_mode"] = "base_no_bags"
-                                if item:
-                                    item["base_no_bags_price"] = base_item.get("price")
-                                    item["base_no_bags_formatted_price"] = base_item.get(
-                                        "formatted_price"
-                                    )
-                                    item["base_no_bags_provider"] = base_item.get(
-                                        "provider", "kiwi"
-                                    )
-                                    item["base_no_bags_booking_url"] = base_item.get("booking_url")
-                                else:
-                                    item = base_item
+                    item = self._merge_baggage_compared_fares(item, base_item)
 
                     out[key] = item
                 except Exception as exc:
@@ -6871,7 +6878,8 @@ class SplitTripOptimizer:
             warnings.append(
                 "Market compare mode also fetched Kiwi base no-bag fares for "
                 f"{base_fare_selected_returns} round-trips and "
-                f"{base_fare_selected_oneways} one-way legs (comparison only)."
+                f"{base_fare_selected_oneways} one-way legs, keeping them when cheaper "
+                "than the selected baggage fare."
             )
 
         if (config.passengers.hand_bags > 0 or config.passengers.hold_bags > 0) and any(

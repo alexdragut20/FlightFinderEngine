@@ -117,15 +117,15 @@
           </label>
 
           <label>
-            Market compare: also fetch Kiwi base no-bag fares (comparison only)
-            <input id="market-compare-fares" type="checkbox" />
+            Market compare: also fetch Kiwi base no-bag fares and keep them when cheaper
+            <input id="market-compare-fares" type="checkbox" checked />
           </label>
 
           <label>
             Rank by
             <select id="objective">
-              <option value="best" selected>Best (balanced price + time)</option>
-              <option value="cheapest">Cheapest (lowest total price)</option>
+              <option value="best">Best (balanced price + time)</option>
+              <option value="cheapest" selected>Cheapest (lowest total price)</option>
               <option value="fastest">Fastest (shortest time to destination)</option>
               <option value="price_per_km">Advanced: best price / 1000 km</option>
             </select>
