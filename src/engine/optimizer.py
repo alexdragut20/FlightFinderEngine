@@ -3555,6 +3555,45 @@ class SplitTripOptimizer:
                 limited_ids.add(chain_key)
             limited_candidates.sort(key=candidate_sort_key)
 
+        def candidate_identity(item: dict[str, Any]) -> tuple[Any, ...]:
+            candidate_type = str(item.get("candidate_type") or "split_stopover")
+            if candidate_type == "direct_roundtrip":
+                return (
+                    candidate_type,
+                    str(item.get("origin") or ""),
+                    str(item.get("destination") or destination),
+                    str(item.get("depart_origin_date") or ""),
+                    str(item.get("return_origin_date") or ""),
+                )
+            return self._split_candidate_key(item)
+
+        if config.objective != "cheapest" and estimated_candidates:
+            price_floor_quota = min(
+                len(estimated_candidates),
+                max(2, min(8, int(math.ceil(destination_validation_target / 4)))),
+            )
+            price_floor_candidates = sorted(
+                estimated_candidates,
+                key=lambda item: (
+                    int(item.get("estimated_total") or PRICE_SENTINEL),
+                    candidate_sort_key(item),
+                ),
+            )[:price_floor_quota]
+            selected_ids = {candidate_identity(item) for item in limited_candidates}
+            preserved_price_floor = 0
+            for price_floor_candidate in price_floor_candidates:
+                candidate_id = candidate_identity(price_floor_candidate)
+                if candidate_id in selected_ids:
+                    continue
+                limited_candidates.append(price_floor_candidate)
+                selected_ids.add(candidate_id)
+                preserved_price_floor += 1
+            if preserved_price_floor > 0:
+                limited_candidates.sort(key=candidate_sort_key)
+                warnings.append(
+                    f"{destination}: preserved {preserved_price_floor} price-floor candidate(s) for validation."
+                )
+
         unique_leg_keys: set[tuple[str, str, str]] = set()
         unique_return_keys: set[tuple[str, str, str, str]] = set()
         leg_rank_score: dict[tuple[str, str, str], int] = {}

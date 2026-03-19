@@ -580,6 +580,141 @@ def test_optimizer_validation_context_and_provider_fallback_helpers_cover_budget
     assert filtered_ids == {"direct-best", "split-kept"}
 
 
+def test_prepare_destination_validation_context_preserves_price_floor_candidates_for_best_objective() -> None:
+    optimizer = SplitTripOptimizer(KiwiClient(), AirportCoordinates())
+    config = optimizer.parse_search_config(
+        {
+            "origins": ["OTP"],
+            "destinations": ["USM"],
+            "providers": ["kiwi"],
+            "period_start": "2026-04-01",
+            "period_end": "2026-04-20",
+            "hub_candidates": ["IST", "DOH", "SIN", "BKK"],
+            "auto_hubs_per_direction": 4,
+            "min_stay_days": 6,
+            "max_stay_days": 6,
+            "min_stopover_days": 0,
+            "max_stopover_days": 0,
+            "max_transfers_per_direction": 1,
+            "objective": "best",
+            "validate_top_per_destination": 2,
+            "io_workers": 4,
+            "cpu_workers": 1,
+        }
+    )
+    estimated_candidates = [
+        {
+            "candidate_type": "split_stopover",
+            "destination": "USM",
+            "origin": "OTP",
+            "arrival_origin": "OTP",
+            "outbound_hub": "IST",
+            "inbound_hub": "IST",
+            "depart_origin_date": "2026-04-01",
+            "depart_destination_date": "2026-04-01",
+            "leave_destination_date": "2026-04-07",
+            "return_origin_date": "2026-04-07",
+            "outbound_stopover_days": 0,
+            "inbound_stopover_days": 0,
+            "main_stay_days": 6,
+            "estimated_total": 1300,
+            "estimated_score": 1300.0,
+            "estimated_best_value_score": 1300.0,
+            "estimated_outbound_time_to_destination_seconds": 18_000,
+        },
+        {
+            "candidate_type": "split_stopover",
+            "destination": "USM",
+            "origin": "OTP",
+            "arrival_origin": "OTP",
+            "outbound_hub": "DOH",
+            "inbound_hub": "DOH",
+            "depart_origin_date": "2026-04-02",
+            "depart_destination_date": "2026-04-02",
+            "leave_destination_date": "2026-04-08",
+            "return_origin_date": "2026-04-08",
+            "outbound_stopover_days": 0,
+            "inbound_stopover_days": 0,
+            "main_stay_days": 6,
+            "estimated_total": 1320,
+            "estimated_score": 1320.0,
+            "estimated_best_value_score": 1320.0,
+            "estimated_outbound_time_to_destination_seconds": 19_000,
+        },
+        {
+            "candidate_type": "split_stopover",
+            "destination": "USM",
+            "origin": "OTP",
+            "arrival_origin": "OTP",
+            "outbound_hub": "SIN",
+            "inbound_hub": "SIN",
+            "depart_origin_date": "2026-04-03",
+            "depart_destination_date": "2026-04-03",
+            "leave_destination_date": "2026-04-09",
+            "return_origin_date": "2026-04-09",
+            "outbound_stopover_days": 0,
+            "inbound_stopover_days": 0,
+            "main_stay_days": 6,
+            "estimated_total": 1340,
+            "estimated_score": 1340.0,
+            "estimated_best_value_score": 1340.0,
+            "estimated_outbound_time_to_destination_seconds": 20_000,
+        },
+        {
+            "candidate_type": "split_stopover",
+            "destination": "USM",
+            "origin": "OTP",
+            "arrival_origin": "OTP",
+            "outbound_hub": "BKK",
+            "inbound_hub": "BKK",
+            "depart_origin_date": "2026-04-04",
+            "depart_destination_date": "2026-04-04",
+            "leave_destination_date": "2026-04-10",
+            "return_origin_date": "2026-04-10",
+            "outbound_stopover_days": 0,
+            "inbound_stopover_days": 0,
+            "main_stay_days": 6,
+            "estimated_total": 1360,
+            "estimated_score": 1360.0,
+            "estimated_best_value_score": 1360.0,
+            "estimated_outbound_time_to_destination_seconds": 21_000,
+        },
+        {
+            "candidate_type": "split_stopover",
+            "destination": "USM",
+            "origin": "OTP",
+            "arrival_origin": "OTP",
+            "outbound_hub": "IST",
+            "inbound_hub": "IST",
+            "depart_origin_date": "2026-04-05",
+            "depart_destination_date": "2026-04-05",
+            "leave_destination_date": "2026-04-11",
+            "return_origin_date": "2026-04-11",
+            "outbound_stopover_days": 0,
+            "inbound_stopover_days": 0,
+            "main_stay_days": 6,
+            "estimated_total": 900,
+            "estimated_score": 2100.0,
+            "estimated_best_value_score": 2100.0,
+            "estimated_outbound_time_to_destination_seconds": 90_000,
+        },
+    ]
+
+    context, warnings = optimizer._prepare_destination_validation_context(
+        destination="USM",
+        estimated_candidates=estimated_candidates,
+        config=config,
+        validation_target_per_destination=2,
+        origin_rank={"OTP": 0},
+        core_provider_ids=("kiwi",),
+        serpapi_active=False,
+    )
+
+    limited_totals = {int(item.get("estimated_total") or 0) for item in context["limited_candidates"]}
+    assert 900 in limited_totals
+    assert any("price-floor candidate" in warning for warning in warnings)
+
+
 def test_optimizer_graph_strategy_and_hub_helpers_cover_diversity_and_selection_paths(
     monkeypatch,
 ) -> None:
