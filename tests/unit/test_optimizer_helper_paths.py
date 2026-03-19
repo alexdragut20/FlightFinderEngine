@@ -580,6 +580,145 @@ def test_optimizer_validation_context_and_provider_fallback_helpers_cover_budget
     assert filtered_ids == {"direct-best", "split-kept"}
 
 
+def test_prepare_destination_validation_context_preserves_price_floor_candidates_for_best_objective() -> (
+    None
+):
+    optimizer = SplitTripOptimizer(KiwiClient(), AirportCoordinates())
+    config = optimizer.parse_search_config(
+        {
+            "origins": ["OTP"],
+            "destinations": ["USM"],
+            "providers": ["kiwi"],
+            "period_start": "2026-04-01",
+            "period_end": "2026-04-20",
+            "hub_candidates": ["IST", "DOH", "SIN", "BKK"],
+            "auto_hubs_per_direction": 4,
+            "min_stay_days": 6,
+            "max_stay_days": 6,
+            "min_stopover_days": 0,
+            "max_stopover_days": 0,
+            "max_transfers_per_direction": 1,
+            "objective": "best",
+            "validate_top_per_destination": 2,
+            "io_workers": 4,
+            "cpu_workers": 1,
+        }
+    )
+    estimated_candidates = [
+        {
+            "candidate_type": "split_stopover",
+            "destination": "USM",
+            "origin": "OTP",
+            "arrival_origin": "OTP",
+            "outbound_hub": "IST",
+            "inbound_hub": "IST",
+            "depart_origin_date": "2026-04-01",
+            "depart_destination_date": "2026-04-01",
+            "leave_destination_date": "2026-04-07",
+            "return_origin_date": "2026-04-07",
+            "outbound_stopover_days": 0,
+            "inbound_stopover_days": 0,
+            "main_stay_days": 6,
+            "estimated_total": 1300,
+            "estimated_score": 1300.0,
+            "estimated_best_value_score": 1300.0,
+            "estimated_outbound_time_to_destination_seconds": 18_000,
+        },
+        {
+            "candidate_type": "split_stopover",
+            "destination": "USM",
+            "origin": "OTP",
+            "arrival_origin": "OTP",
+            "outbound_hub": "DOH",
+            "inbound_hub": "DOH",
+            "depart_origin_date": "2026-04-02",
+            "depart_destination_date": "2026-04-02",
+            "leave_destination_date": "2026-04-08",
+            "return_origin_date": "2026-04-08",
+            "outbound_stopover_days": 0,
+            "inbound_stopover_days": 0,
+            "main_stay_days": 6,
+            "estimated_total": 1320,
+            "estimated_score": 1320.0,
+            "estimated_best_value_score": 1320.0,
+            "estimated_outbound_time_to_destination_seconds": 19_000,
+        },
+        {
+            "candidate_type": "split_stopover",
+            "destination": "USM",
+            "origin": "OTP",
+            "arrival_origin": "OTP",
+            "outbound_hub": "SIN",
+            "inbound_hub": "SIN",
+            "depart_origin_date": "2026-04-03",
+            "depart_destination_date": "2026-04-03",
+            "leave_destination_date": "2026-04-09",
+            "return_origin_date": "2026-04-09",
+            "outbound_stopover_days": 0,
+            "inbound_stopover_days": 0,
+            "main_stay_days": 6,
+            "estimated_total": 1340,
+            "estimated_score": 1340.0,
+            "estimated_best_value_score": 1340.0,
+            "estimated_outbound_time_to_destination_seconds": 20_000,
+        },
+        {
+            "candidate_type": "split_stopover",
+            "destination": "USM",
+            "origin": "OTP",
+            "arrival_origin": "OTP",
+            "outbound_hub": "BKK",
+            "inbound_hub": "BKK",
+            "depart_origin_date": "2026-04-04",
+            "depart_destination_date": "2026-04-04",
+            "leave_destination_date": "2026-04-10",
+            "return_origin_date": "2026-04-10",
+            "outbound_stopover_days": 0,
+            "inbound_stopover_days": 0,
+            "main_stay_days": 6,
+            "estimated_total": 1360,
+            "estimated_score": 1360.0,
+            "estimated_best_value_score": 1360.0,
+            "estimated_outbound_time_to_destination_seconds": 21_000,
+        },
+        {
+            "candidate_type": "split_stopover",
+            "destination": "USM",
+            "origin": "OTP",
+            "arrival_origin": "OTP",
+            "outbound_hub": "IST",
+            "inbound_hub": "IST",
+            "depart_origin_date": "2026-04-05",
+            "depart_destination_date": "2026-04-05",
+            "leave_destination_date": "2026-04-11",
+            "return_origin_date": "2026-04-11",
+            "outbound_stopover_days": 0,
+            "inbound_stopover_days": 0,
+            "main_stay_days": 6,
+            "estimated_total": 900,
+            "estimated_score": 2100.0,
+            "estimated_best_value_score": 2100.0,
+            "estimated_outbound_time_to_destination_seconds": 90_000,
+        },
+    ]
+
+    context, warnings = optimizer._prepare_destination_validation_context(
+        destination="USM",
+        estimated_candidates=estimated_candidates,
+        config=config,
+        validation_target_per_destination=2,
+        origin_rank={"OTP": 0},
+        core_provider_ids=("kiwi",),
+        serpapi_active=False,
+    )
+
+    limited_totals = {
+        int(item.get("estimated_total") or 0) for item in context["limited_candidates"]
+    }
+    assert 900 in limited_totals
+    assert any("price-floor candidate" in warning for warning in warnings)
+
+
 def test_optimizer_graph_strategy_and_hub_helpers_cover_diversity_and_selection_paths(
     monkeypatch,
 ) -> None:
@@ -2403,3 +2542,405 @@ def test_optimizer_remaining_parallel_and_split_chain_paths_cover_real_executor_
         "Filtered 2 split itineraries with invalid or too-short self-transfer boundaries" in warning
         for warning in result["warnings"]
     )
+
+
+def test_optimizer_chunked_candidate_parallelism_and_progress_cover_chunk_scheduler(
+    monkeypatch,
+) -> None:
+    optimizer = SplitTripOptimizer(KiwiClient(), AirportCoordinates())
+    captured_chunks: list[dict[str, object]] = []
+
+    class _FakeChunkProcessPool:
+        created: list[_FakeChunkProcessPool] = []
+
+        def __init__(self, max_workers: int, initializer=None, initargs=()) -> None:  # type: ignore[no-untyped-def]
+            self.max_workers = max_workers
+            self.shutdown_calls: list[tuple[bool, bool]] = []
+            if initializer is not None:
+                initializer(*initargs)
+            self.__class__.created.append(self)
+
+        def submit(self, fn, *args, **kwargs):  # type: ignore[no-untyped-def]
+            future: Future = Future()
+            try:
+                future.set_result(fn(*args, **kwargs))
+            except Exception as exc:  # pragma: no cover - asserted below
+                future.set_exception(exc)
+            return future
+
+        def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
+            self.shutdown_calls.append((wait, cancel_futures))
+
+    def _fake_chunk_estimator(chunk: dict[str, object]) -> tuple[str, list[dict[str, object]]]:
+        captured_chunks.append(chunk)
+        destination = str(chunk["destination"])
+        start_index = int(chunk["chunk_start_index"])
+        end_index = int(chunk["chunk_end_index"])
+        return (
+            destination,
+            [
+                {
+                    "candidate_type": "split_stopover",
+                    "destination": destination,
+                    "origin": "OTP",
+                    "arrival_origin": "OTP",
+                    "outbound_hub": "IST",
+                    "inbound_hub": "IST",
+                    "depart_origin_date": f"2026-04-{10 + start_index:02d}",
+                    "depart_destination_date": f"2026-04-{11 + start_index:02d}",
+                    "leave_destination_date": f"2026-04-{12 + start_index:02d}",
+                    "return_origin_date": f"2026-04-{12 + end_index:02d}",
+                    "outbound_stopover_days": 0,
+                    "inbound_stopover_days": 0,
+                    "main_stay_days": 1,
+                    "estimated_total": 1000 + start_index,
+                    "distance_basis_km": 1000.0,
+                    "estimated_score": float(1000 + start_index),
+                    "estimated_outbound_time_to_destination_seconds": 7200,
+                }
+            ],
+        )
+
+    monkeypatch.setattr(optimizer_module, "ProcessPoolExecutor", _FakeChunkProcessPool)
+    monkeypatch.setattr(optimizer_module, "_estimate_candidates_for_chunk", _fake_chunk_estimator)
+
+    progress = SearchProgressTracker("chunked-parallel")
+    progress.start_phase("candidates", total=2, detail="Scoring candidate pools.")
+    config = optimizer.parse_search_config(
+        {
+            "origins": ["OTP"],
+            "destinations": ["USM", "MGA"],
+            "period_start": "2026-04-10",
+            "period_end": "2026-04-15",
+            "cpu_workers": 8,
+        }
+    )
+    task_template = {
+        "origins": ["OTP"],
+        "outbound_hubs": ["IST"],
+        "inbound_hubs": ["IST"],
+        "period_start": "2026-04-10",
+        "period_end": "2026-04-15",
+        "min_stay_days": 1,
+        "max_stay_days": 1,
+        "min_stopover_days": 0,
+        "max_stopover_days": 0,
+        "objective": "cheapest",
+        "max_candidates": 10,
+        "max_direct_candidates": 4,
+        "max_transfers_per_direction": 1,
+        "origin_to_hub": {"OTP|IST": {"2026-04-10": 100}},
+        "hub_to_origin": {"IST|OTP": {"2026-04-12": 100}},
+        "hub_to_destination": {"IST": {"2026-04-11": 100}},
+        "destination_to_hub": {"IST": {"2026-04-12": 100}},
+        "hub_to_hub": {},
+        "origin_to_destination": {"OTP|USM": {"2026-04-10": 200}},
+        "destination_to_origin": {"USM|OTP": {"2026-04-12": 200}},
+        "destination_distance_map": {"OTP|USM": 1000.0},
+    }
+
+    results = asyncio.run(
+        optimizer._estimate_candidates_parallel(
+            [
+                {**task_template, "destination": "USM"},
+                {
+                    **task_template,
+                    "destination": "MGA",
+                    "origin_to_destination": {"OTP|MGA": {"2026-04-10": 220}},
+                    "destination_to_origin": {"MGA|OTP": {"2026-04-12": 220}},
+                    "destination_distance_map": {"OTP|MGA": 1200.0},
+                },
+            ],
+            config,
+            progress,
+        )
+    )
+
+    assert set(results) == {"USM", "MGA"}
+    assert len(captured_chunks) > 2
+    assert _FakeChunkProcessPool.created[0].max_workers == min(
+        config.cpu_workers, len(captured_chunks)
+    )
+    assert _FakeChunkProcessPool.created[0].shutdown_calls[-1] == (True, False)
+    assert all("chunk_label" in chunk for chunk in captured_chunks)
+    assert "candidate chunks" in progress.snapshot()["phase_detail"]
+
+
+def test_optimizer_free_provider_discovery_helpers_cover_sampling_seed_build_probe_and_run(
+    monkeypatch,
+) -> None:
+    optimizer = SplitTripOptimizer(KiwiClient(), AirportCoordinates())
+
+    assert optimizer._sample_discovery_dates((), max_dates=4) == ()
+    assert optimizer._sample_discovery_dates(("2026-04-20",), max_dates=4) == ("2026-04-20",)
+    assert optimizer._sample_discovery_dates(
+        tuple(f"2026-04-{day:02d}" for day in range(20, 25)),
+        max_dates=1,
+    ) == ("2026-04-20",)
+    assert optimizer._sample_discovery_dates(
+        tuple(f"2026-04-{day:02d}" for day in range(20, 25)),
+        max_dates=3,
+    ) == ("2026-04-20", "2026-04-22", "2026-04-24")
+
+    task = {
+        "destination": "USM",
+        "date_keys": ("2026-04-20", "2026-04-21", "2026-04-22", "2026-04-23"),
+        "origin_to_destination": {("OTP", "USM"): (700, None, 680, 690)},
+        "destination_to_origin": {("USM", "OTP"): (710, 720, None, 700)},
+        "origin_to_hub": {("OTP", "BKK"): (300, 320, 310, None), ("", "BKK"): (1, 2, 3, 4)},
+        "hub_to_origin": {("BKK", "OTP"): (320, 310, None, 300)},
+        "hub_to_destination": {"BKK": (140, 150, 145, 148)},
+        "destination_to_hub": {"BKK": (150, 145, 148, 149)},
+        "hub_to_hub": {("IST", "BKK"): (180, 175, 170, 172)},
+    }
+    seed_map = optimizer._build_initial_free_provider_discovery_seed_map(task=task)
+    assert ("OTP", "USM") in seed_map
+    assert ("BKK", "USM") in seed_map
+    assert ("USM", "BKK") in seed_map
+    assert ("", "BKK") not in seed_map
+    assert all(len(dates) <= 8 for dates in seed_map.values())
+
+    config = optimizer.parse_search_config(
+        {
+            "origins": ["OTP"],
+            "destinations": ["USM"],
+            "period_start": "2026-04-20",
+            "period_end": "2026-04-23",
+            "providers": ["kiwi", "kayak", "momondo", "googleflights"],
+            "cpu_workers": 1,
+            "io_workers": 2,
+        }
+    )
+    assert (
+        optimizer._build_free_provider_discovery_seed_map(
+            destination="USM",
+            estimated_candidates=[],
+            config=config,
+        )
+        == {}
+    )
+
+    class _DiscoveryClient:
+        active_provider_ids = ["kiwi", "kayak", "momondo"]
+
+        def __init__(self) -> None:
+            self._calls: dict[tuple[str, str, str], int] = {}
+
+        def get_best_oneway(self, **kwargs):  # type: ignore[no-untyped-def]
+            source = kwargs["source"]
+            destination = kwargs["destination"]
+            date_iso = kwargs["departure_iso"]
+            key = (source, destination, date_iso)
+            self._calls[key] = self._calls.get(key, 0) + 1
+            if destination == "DXB":
+                raise RuntimeError("discovery exploded")
+            if destination == "LCA":
+                return None
+            if source == "OTP" and destination == "IST" and date_iso == "2026-04-20":
+                return {"price": 150 if self._calls[key] == 1 else 120}
+            if source == "OTP" and destination == "IST" and date_iso == "2026-04-21":
+                return {"price": 0}
+            return None
+
+    discovery_client = _DiscoveryClient()
+    with ThreadPoolExecutor(max_workers=2) as io_pool:
+        discovered, warnings = asyncio.run(
+            optimizer._probe_free_provider_discovery(
+                search_client=discovery_client,  # type: ignore[arg-type]
+                provider_ids=("kayak", "momondo"),
+                route_dates={
+                    ("OTP", "IST"): ("2026-04-20", "2026-04-20", "2026-04-21"),
+                    ("OTP", "LCA"): ("2026-04-20",),
+                    ("OTP", "DXB"): ("2026-04-20",),
+                },
+                config=config,
+                io_pool=io_pool,
+                io_cap=2,
+            )
+        )
+        empty_discovered, empty_warnings = asyncio.run(
+            optimizer._probe_free_provider_discovery(
+                search_client=_DiscoveryClient(),  # type: ignore[arg-type]
+                provider_ids=(),
+                route_dates={},
+                config=config,
+                io_pool=io_pool,
+            )
+        )
+    assert discovered == {("OTP", "IST"): {"2026-04-20": 120}}
+    assert any("OTP->DXB 2026-04-20" in warning for warning in warnings)
+    assert empty_discovered == {}
+    assert empty_warnings == []
+
+    progress = SearchProgressTracker("free-discovery")
+
+    async def _fake_probe(**kwargs):  # type: ignore[no-untyped-def]
+        if kwargs["route_dates"]:
+            return ({("OTP", "USM"): {"2026-04-20": 111}}, ["probe warning"])
+        return ({}, [])
+
+    monkeypatch.setattr(optimizer, "_probe_free_provider_discovery", _fake_probe)
+
+    with ThreadPoolExecutor(max_workers=2) as io_pool:
+        updated_tasks, metadata, run_warnings = asyncio.run(
+            optimizer._run_initial_free_provider_discovery(
+                search_client=_DiscoveryClient(),  # type: ignore[arg-type]
+                candidate_tasks=[
+                    task,
+                    {
+                        "destination": "MGA",
+                        "date_keys": (),
+                        "origin_to_destination": {},
+                        "destination_to_origin": {},
+                        "origin_to_hub": {},
+                        "hub_to_origin": {},
+                        "hub_to_destination": {},
+                        "destination_to_hub": {},
+                        "hub_to_hub": {},
+                    },
+                ],
+                config=config,
+                io_pool=io_pool,
+                progress=progress,
+            )
+        )
+
+    assert updated_tasks[0]["origin_to_destination"][("OTP", "USM")][0] == 111
+    assert updated_tasks[1]["destination"] == "MGA"
+    assert metadata["USM"]["discovered_routes"] == 1
+    assert metadata["USM"]["discovered_price_points"] == 1
+    assert run_warnings == ["probe warning"]
+    messages = [event["message"] for event in progress.snapshot()["events"]]
+    assert any("Free-provider discovery" in message for message in messages)
+    assert any("USM: probing" in message for message in messages)
+
+
+def test_optimizer_coverage_audit_helpers_cover_empty_and_success_paths(monkeypatch) -> None:
+    optimizer = SplitTripOptimizer(KiwiClient(), AirportCoordinates())
+    config = optimizer.parse_search_config(
+        {
+            "origins": ["OTP"],
+            "destinations": ["USM"],
+            "period_start": "2026-04-20",
+            "period_end": "2026-04-23",
+            "providers": ["kiwi", "kayak", "momondo"],
+            "cpu_workers": 1,
+        }
+    )
+
+    class _AuditClient:
+        active_provider_ids = ["kiwi", "kayak", "momondo"]
+
+    with ThreadPoolExecutor(max_workers=2) as io_pool:
+        empty_audit = asyncio.run(
+            optimizer._run_coverage_audit(
+                search_client=_AuditClient(),  # type: ignore[arg-type]
+                candidate_tasks=[],
+                estimated_by_destination={},
+                config=config,
+                io_pool=io_pool,
+                progress=None,
+            )
+        )
+    assert empty_audit == ({}, {}, [])
+
+    candidate_task = {
+        "destination": "USM",
+        "date_keys": ("2026-04-20", "2026-04-21"),
+        "max_candidates": 10,
+        "max_direct_candidates": 4,
+        "origin_to_hub": {("OTP", "BKK"): (300, 310)},
+        "hub_to_origin": {("BKK", "OTP"): (320, 330)},
+        "hub_to_destination": {"BKK": (120, 125)},
+        "destination_to_hub": {"BKK": (130, 135)},
+        "hub_to_hub": {},
+        "origin_to_destination": {("OTP", "USM"): (700, 680)},
+        "destination_to_origin": {("USM", "OTP"): (710, 690)},
+    }
+    estimated_by_destination = {
+        "USM": [
+            {
+                "candidate_type": "split_stopover",
+                "destination": "USM",
+                "origin": "OTP",
+                "arrival_origin": "OTP",
+                "outbound_hub": "BKK",
+                "inbound_hub": "BKK",
+                "depart_origin_date": "2026-04-20",
+                "depart_destination_date": "2026-04-20",
+                "leave_destination_date": "2026-04-23",
+                "return_origin_date": "2026-04-23",
+                "estimated_total": 2000,
+                "estimated_score": 2000.0,
+                "estimated_outbound_time_to_destination_seconds": 7200,
+                "main_stay_days": 3,
+            }
+        ],
+        "MGA": [],
+    }
+
+    monkeypatch.setattr(
+        optimizer,
+        "_select_coverage_audit_destinations",
+        lambda *_args, **_kwargs: ["USM", "MGA"],
+    )
+    monkeypatch.setattr(
+        optimizer,
+        "_build_free_provider_discovery_seed_map",
+        lambda **_kwargs: {("OTP", "USM"): ("2026-04-20",)},
+    )
+
+    async def _fake_probe(**kwargs):  # type: ignore[no-untyped-def]
+        return ({("OTP", "USM"): {"2026-04-20": 650}}, ["audit warning"])
+
+    monkeypatch.setattr(optimizer, "_probe_free_provider_discovery", _fake_probe)
+    monkeypatch.setattr(
+        optimizer,
+        "_estimate_candidates_parallel",
+        lambda *_args, **_kwargs: asyncio.sleep(
+            0,
+            result={
+                "USM": [
+                    {
+                        "candidate_type": "split_stopover",
+                        "destination": "USM",
+                        "origin": "OTP",
+                        "arrival_origin": "OTP",
+                        "outbound_hub": "BKK",
+                        "inbound_hub": "BKK",
+                        "depart_origin_date": "2026-04-20",
+                        "depart_destination_date": "2026-04-20",
+                        "leave_destination_date": "2026-04-23",
+                        "return_origin_date": "2026-04-23",
+                        "estimated_total": 1800,
+                        "estimated_score": 1800.0,
+                        "estimated_outbound_time_to_destination_seconds": 7000,
+                        "main_stay_days": 3,
+                    }
+                ]
+            },
+        ),
+    )
+
+    progress = SearchProgressTracker("coverage-audit")
+    progress.start_phase("candidates", total=1, detail="Scoring route candidates.")
+    with ThreadPoolExecutor(max_workers=2) as io_pool:
+        audited_estimates, audit_metadata, warnings = asyncio.run(
+            optimizer._run_coverage_audit(
+                search_client=_AuditClient(),  # type: ignore[arg-type]
+                candidate_tasks=[candidate_task],
+                estimated_by_destination=estimated_by_destination,
+                config=config,
+                io_pool=io_pool,
+                progress=progress,
+            )
+        )
+
+    assert audited_estimates["USM"][0]["estimated_total"] == 1800
+    assert audit_metadata["USM"]["discovered_routes"] == 1
+    assert audit_metadata["USM"]["discovered_price_points"] == 1
+    assert audit_metadata["USM"]["expanded_max_candidates"] > candidate_task["max_candidates"]
+    assert warnings == ["audit warning"]
+    snapshot = progress.snapshot()
+    assert snapshot["coverage_audit"]["destinations"][0]["destination"] == "USM"
+    assert any("Coverage audit complete" in event["message"] for event in snapshot["events"])

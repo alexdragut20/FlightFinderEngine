@@ -8,7 +8,7 @@ from collections.abc import Callable
 from typing import Any
 
 from ..config import _FREE_PROVIDER_IDS, PROVIDER_ERROR_COOLDOWN_SECONDS
-from ..exceptions import ProviderNoResultError
+from ..exceptions import ProviderBlockedError, ProviderNoResultError
 from ..utils.constants import PRICE_SENTINEL
 from ..utils.logging import log_event
 from ._cache import per_instance_lru_cache
@@ -42,18 +42,21 @@ class MultiProviderClient:
         self._stats_lock = threading.Lock()
         self._stats: dict[str, dict[str, int]] = {
             "calendar_calls": {},
+            "calendar_blocked": {},
             "calendar_errors": {},
             "calendar_no_result": {},
             "calendar_selected": {},
             "calendar_skipped_budget": {},
             "calendar_skipped_cooldown": {},
             "oneway_calls": {},
+            "oneway_blocked": {},
             "oneway_errors": {},
             "oneway_no_result": {},
             "oneway_selected": {},
             "oneway_skipped_budget": {},
             "oneway_skipped_cooldown": {},
             "return_calls": {},
+            "return_blocked": {},
             "return_errors": {},
             "return_no_result": {},
             "return_selected": {},
@@ -77,6 +80,11 @@ class MultiProviderClient:
         self._budget_total_used = 0
         self._budget_used_by_provider: dict[str, int] = {}
         self._provider_paused_until: dict[str, float] = {}
+        self._provider_issue_state: dict[str, dict[str, Any]] = {}
+        self._stats_listener: Callable[[dict[str, Any]], None] | None = None
+        self._stats_listener_min_interval_seconds = 0.75
+        self._stats_listener_last_sent_at = 0.0
+        self._stats_listener_lock = threading.Lock()
 
     @property
     def active_provider_ids(self) -> list[str]:
@@ -100,6 +108,26 @@ class MultiProviderClient:
         with self._stats_lock:
             target = self._stats.setdefault(bucket, {})
             target[provider_id] = target.get(provider_id, 0) + amount
+        self._notify_stats_listener()
+
+    def set_stats_listener(
+        self,
+        listener: Callable[[dict[str, Any]], None] | None,
+        *,
+        min_interval_seconds: float = 0.75,
+    ) -> None:
+        """Register a listener for throttled provider-health snapshots.
+
+        Args:
+            listener: Callback receiving aggregated provider-health payloads.
+            min_interval_seconds: Minimum interval between callback updates.
+        """
+        with self._stats_listener_lock:
+            self._stats_listener = listener
+            self._stats_listener_min_interval_seconds = max(0.0, float(min_interval_seconds))
+            self._stats_listener_last_sent_at = 0.0
+        if listener is not None:
+            self._notify_stats_listener(force=True)
 
     def stats_snapshot(self) -> dict[str, Any]:
         """Return a snapshot of provider selection and budget counters.
@@ -116,6 +144,123 @@ class MultiProviderClient:
                 "used_calls_by_provider": dict(self._budget_used_by_provider),
             }
             return snapshot
+
+    def health_snapshot(self) -> dict[str, Any]:
+        """Return aggregated provider health counters suitable for the UI.
+
+        Returns:
+            dict[str, Any]: Aggregated provider-health counters.
+        """
+        stats = self.stats_snapshot()
+        with self._stats_lock:
+            issue_state = {key: dict(value) for key, value in self._provider_issue_state.items()}
+        providers: dict[str, dict[str, Any]] = {}
+        for provider_id in self.active_provider_ids:
+            calls = sum(
+                int((stats.get(bucket) or {}).get(provider_id, 0))
+                for bucket in ("calendar_calls", "oneway_calls", "return_calls")
+            )
+            blocked = sum(
+                int((stats.get(bucket) or {}).get(provider_id, 0))
+                for bucket in ("calendar_blocked", "oneway_blocked", "return_blocked")
+            )
+            selected = sum(
+                int((stats.get(bucket) or {}).get(provider_id, 0))
+                for bucket in ("calendar_selected", "oneway_selected", "return_selected")
+            )
+            no_result = sum(
+                int((stats.get(bucket) or {}).get(provider_id, 0))
+                for bucket in ("calendar_no_result", "oneway_no_result", "return_no_result")
+            )
+            errors = sum(
+                int((stats.get(bucket) or {}).get(provider_id, 0))
+                for bucket in ("calendar_errors", "oneway_errors", "return_errors")
+            )
+            skipped_budget = sum(
+                int((stats.get(bucket) or {}).get(provider_id, 0))
+                for bucket in (
+                    "calendar_skipped_budget",
+                    "oneway_skipped_budget",
+                    "return_skipped_budget",
+                )
+            )
+            skipped_cooldown = sum(
+                int((stats.get(bucket) or {}).get(provider_id, 0))
+                for bucket in (
+                    "calendar_skipped_cooldown",
+                    "oneway_skipped_cooldown",
+                    "return_skipped_cooldown",
+                )
+            )
+            issue = issue_state.get(provider_id) or {}
+            cooldown_seconds = self._provider_pause_remaining_seconds(provider_id)
+            if cooldown_seconds <= 0:
+                cooldown_seconds = int(issue.get("cooldown_seconds") or 0)
+            if selected > 0:
+                status = "selected"
+            elif blocked > 0:
+                status = "blocked"
+            elif errors > 0:
+                status = "error"
+            elif no_result > 0:
+                status = "no_result"
+            elif calls > 0:
+                status = "active"
+            else:
+                status = "idle"
+            providers[provider_id] = {
+                "provider_id": provider_id,
+                "status": status,
+                "calls": calls,
+                "blocked": blocked,
+                "selected": selected,
+                "no_result": no_result,
+                "errors": errors,
+                "skipped_budget": skipped_budget,
+                "skipped_cooldown": skipped_cooldown,
+                "cooldown_seconds": cooldown_seconds,
+                "last_issue_type": issue.get("issue_type"),
+                "last_issue_message": issue.get("message"),
+                "manual_search_url": issue.get("manual_search_url"),
+                "calendar_calls": int((stats.get("calendar_calls") or {}).get(provider_id, 0)),
+                "calendar_selected": int(
+                    (stats.get("calendar_selected") or {}).get(provider_id, 0)
+                ),
+                "oneway_calls": int((stats.get("oneway_calls") or {}).get(provider_id, 0)),
+                "oneway_selected": int((stats.get("oneway_selected") or {}).get(provider_id, 0)),
+                "return_calls": int((stats.get("return_calls") or {}).get(provider_id, 0)),
+                "return_selected": int((stats.get("return_selected") or {}).get(provider_id, 0)),
+            }
+        return {
+            "providers": providers,
+            "budget": stats.get("budget") or {},
+            "updated_at": time.time(),
+        }
+
+    def _notify_stats_listener(self, *, force: bool = False) -> None:
+        """Send a throttled provider-health snapshot to the listener.
+
+        Args:
+            force: When True, bypass throttle interval checks.
+        """
+        listener: Callable[[dict[str, Any]], None] | None
+        with self._stats_listener_lock:
+            listener = self._stats_listener
+            if listener is None:
+                return
+            now = time.time()
+            if (
+                not force
+                and self._stats_listener_min_interval_seconds > 0.0
+                and (now - self._stats_listener_last_sent_at)
+                < self._stats_listener_min_interval_seconds
+            ):
+                return
+            self._stats_listener_last_sent_at = now
+        try:
+            listener(self.health_snapshot())
+        except Exception:
+            return
 
     def _consume_budget(self, provider_id: str) -> bool:
         """Consume a provider budget slot if one is available.
@@ -178,6 +323,90 @@ class MultiProviderClient:
                 until,
             )
 
+    @staticmethod
+    def _looks_like_blocked_error_text(text: str) -> bool:
+        """Return whether error text looks like anti-bot blocking."""
+        lowered = str(text or "").lower()
+        return any(
+            token in lowered
+            for token in (
+                "captcha",
+                "anti-bot",
+                "bot protection",
+                "blocked automated scraping",
+                "verify you are human",
+                "verify you are a human",
+                "security challenge",
+                "access denied",
+                "consent page",
+                "before you continue",
+                "temporarily paused after anti-bot blocking",
+            )
+        )
+
+    @classmethod
+    def _looks_like_blocked_exception(cls, exc: Exception) -> bool:
+        """Return whether the exception should be treated as a provider block."""
+        return isinstance(exc, ProviderBlockedError) or cls._looks_like_blocked_error_text(str(exc))
+
+    @classmethod
+    def _coerce_blocked_exception(cls, exc: Exception) -> ProviderBlockedError:
+        """Normalize any block-like exception into ProviderBlockedError."""
+        if isinstance(exc, ProviderBlockedError):
+            return exc
+        return ProviderBlockedError(str(exc))
+
+    def _set_provider_issue(
+        self,
+        provider_id: str,
+        *,
+        issue_type: str,
+        message: str,
+        manual_search_url: str | None = None,
+        cooldown_seconds: int | None = None,
+    ) -> None:
+        """Persist the latest provider issue details for the UI."""
+        normalized_provider_id = str(provider_id or "").strip().lower()
+        if not normalized_provider_id:
+            return
+        with self._stats_lock:
+            self._provider_issue_state[normalized_provider_id] = {
+                "issue_type": str(issue_type or "").strip().lower() or "error",
+                "message": str(message or "").strip(),
+                "manual_search_url": str(manual_search_url or "").strip() or None,
+                "cooldown_seconds": int(cooldown_seconds or 0) or None,
+                "updated_at": time.time(),
+            }
+
+    def _clear_provider_issue(self, provider_id: str) -> None:
+        """Clear any stale provider issue details after a successful call."""
+        normalized_provider_id = str(provider_id or "").strip().lower()
+        if not normalized_provider_id:
+            return
+        with self._stats_lock:
+            self._provider_issue_state.pop(normalized_provider_id, None)
+
+    def _register_provider_block(self, provider_id: str, exc: Exception) -> None:
+        """Record provider anti-bot blocking and pause future retries."""
+        blocked_exc = self._coerce_blocked_exception(exc)
+        cooldown_seconds = int(blocked_exc.cooldown_seconds or PROVIDER_ERROR_COOLDOWN_SECONDS)
+        self._pause_provider(provider_id, cooldown_seconds)
+        self._set_provider_issue(
+            provider_id,
+            issue_type="blocked",
+            message=str(blocked_exc),
+            manual_search_url=blocked_exc.manual_search_url,
+            cooldown_seconds=cooldown_seconds,
+        )
+        log_event(
+            logging.WARNING,
+            "provider_paused_bot_block",
+            provider_id=provider_id,
+            cooldown_seconds=cooldown_seconds,
+            manual_search_url=blocked_exc.manual_search_url,
+            error=str(blocked_exc),
+        )
+
     def _register_provider_exception(self, provider_id: str, exc: Exception) -> None:
         """Record provider exceptions that should trigger temporary cooldowns.
 
@@ -185,9 +414,14 @@ class MultiProviderClient:
             provider_id: Provider identifier involved in the request.
             exc: Exception instance for the failure path.
         """
+        if self._looks_like_blocked_exception(exc):
+            self._register_provider_block(provider_id, exc)
+            return
         text = str(exc or "").lower()
+        cooldown_seconds: int | None = None
         if "too many open files" in text or int(getattr(exc, "errno", 0) or 0) == 24:
             self._pause_provider(provider_id, PROVIDER_ERROR_COOLDOWN_SECONDS)
+            cooldown_seconds = PROVIDER_ERROR_COOLDOWN_SECONDS
             log_event(
                 logging.WARNING,
                 "provider_paused_fd_exhaustion",
@@ -195,6 +429,12 @@ class MultiProviderClient:
                 cooldown_seconds=PROVIDER_ERROR_COOLDOWN_SECONDS,
                 error=str(exc),
             )
+        self._set_provider_issue(
+            provider_id,
+            issue_type="error",
+            message=str(exc),
+            cooldown_seconds=cooldown_seconds,
+        )
 
     @per_instance_lru_cache(maxsize=128)
     def _providers_for_selection(self, provider_ids: tuple[str, ...] | None) -> tuple[Any, ...]:
@@ -275,13 +515,27 @@ class MultiProviderClient:
                     hand_bags=hand_bags,
                     hold_bags=hold_bags,
                 )
-            except ProviderNoResultError:
+            except ProviderBlockedError as exc:
+                self._register_provider_block(provider_id, exc)
+                self._bump("calendar_blocked", provider_id)
+                continue
+            except ProviderNoResultError as exc:
+                if self._looks_like_blocked_exception(exc):
+                    self._register_provider_block(provider_id, exc)
+                    self._bump("calendar_blocked", provider_id)
+                    continue
+                self._set_provider_issue(provider_id, issue_type="no_result", message=str(exc))
                 self._bump("calendar_no_result", provider_id)
                 continue
             except Exception as exc:
+                if self._looks_like_blocked_exception(exc):
+                    self._register_provider_block(provider_id, exc)
+                    self._bump("calendar_blocked", provider_id)
+                    continue
                 self._register_provider_exception(provider_id, exc)
                 self._bump("calendar_errors", provider_id)
                 continue
+            self._clear_provider_issue(provider_id)
 
             for date_iso, value in (prices or {}).items():
                 try:
@@ -295,6 +549,7 @@ class MultiProviderClient:
 
         for provider_id in set(source_by_date.values()):
             self._bump("calendar_selected", provider_id)
+        self._notify_stats_listener(force=True)
         return merged
 
     @staticmethod
@@ -366,6 +621,7 @@ class MultiProviderClient:
         skipped_cooldown_bucket: str,
         skipped_budget_bucket: str,
         calls_bucket: str,
+        blocked_bucket: str,
         no_result_bucket: str,
         errors_bucket: str,
         selected_bucket: str,
@@ -379,6 +635,7 @@ class MultiProviderClient:
             skipped_cooldown_bucket: Stats bucket used for provider cooldown skips.
             skipped_budget_bucket: Stats bucket used for budget skip accounting.
             calls_bucket: Stats bucket used for provider call counting.
+            blocked_bucket: Stats bucket used when providers are blocked by anti-bot controls.
             no_result_bucket: Stats bucket used when providers return no result.
             errors_bucket: Stats bucket used when providers raise an error.
             selected_bucket: Stats bucket used for the winning provider.
@@ -401,13 +658,27 @@ class MultiProviderClient:
             self._bump(calls_bucket, provider_id)
             try:
                 candidate = fetch_candidate(provider, provider_id)
-            except ProviderNoResultError:
+            except ProviderBlockedError as exc:
+                self._register_provider_block(provider_id, exc)
+                self._bump(blocked_bucket, provider_id)
+                continue
+            except ProviderNoResultError as exc:
+                if self._looks_like_blocked_exception(exc):
+                    self._register_provider_block(provider_id, exc)
+                    self._bump(blocked_bucket, provider_id)
+                    continue
+                self._set_provider_issue(provider_id, issue_type="no_result", message=str(exc))
                 self._bump(no_result_bucket, provider_id)
                 continue
             except Exception as exc:
+                if self._looks_like_blocked_exception(exc):
+                    self._register_provider_block(provider_id, exc)
+                    self._bump(blocked_bucket, provider_id)
+                    continue
                 self._register_provider_exception(provider_id, exc)
                 self._bump(errors_bucket, provider_id)
                 continue
+            self._clear_provider_issue(provider_id)
             if not candidate:
                 continue
             candidate = dict(candidate)
@@ -417,6 +688,7 @@ class MultiProviderClient:
                 best_provider = candidate["provider"]
         if best_provider:
             self._bump(selected_bucket, best_provider)
+        self._notify_stats_listener(force=True)
         return best
 
     @per_instance_lru_cache(maxsize=32768)
@@ -469,6 +741,7 @@ class MultiProviderClient:
             skipped_cooldown_bucket="oneway_skipped_cooldown",
             skipped_budget_bucket="oneway_skipped_budget",
             calls_bucket="oneway_calls",
+            blocked_bucket="oneway_blocked",
             no_result_bucket="oneway_no_result",
             errors_bucket="oneway_errors",
             selected_bucket="oneway_selected",
@@ -529,6 +802,7 @@ class MultiProviderClient:
             skipped_cooldown_bucket="return_skipped_cooldown",
             skipped_budget_bucket="return_skipped_budget",
             calls_bucket="return_calls",
+            blocked_bucket="return_blocked",
             no_result_bucket="return_no_result",
             errors_bucket="return_errors",
             selected_bucket="return_selected",

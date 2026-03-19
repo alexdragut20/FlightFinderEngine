@@ -272,11 +272,9 @@ class ProviderE2ERegressionPerfTests(unittest.TestCase):
         provider_stats = ((result_blocked.get("meta") or {}).get("engine") or {}).get(
             "provider_stats"
         ) or {}
-        serpapi_no_result = int((provider_stats.get("oneway_no_result") or {}).get("serpapi", 0))
-        serpapi_return_no_result = int(
-            (provider_stats.get("return_no_result") or {}).get("serpapi", 0)
-        )
-        self.assertTrue((serpapi_no_result + serpapi_return_no_result) > 0)
+        serpapi_blocked = int((provider_stats.get("oneway_blocked") or {}).get("serpapi", 0))
+        serpapi_return_blocked = int((provider_stats.get("return_blocked") or {}).get("serpapi", 0))
+        self.assertTrue((serpapi_blocked + serpapi_return_blocked) > 0)
 
     def test_perf_suite_multi_provider_finishes_under_budget(self) -> None:
         optimizer = self._optimizer_with_synthetic_providers(delay_seconds=0.01)

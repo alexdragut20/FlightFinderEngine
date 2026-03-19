@@ -93,6 +93,20 @@ Alternative console entrypoint after install:
 flightfinder-engine
 ```
 
+Platform restart helpers:
+
+```bash
+zsh ./scripts/restart_server.zsh
+```
+
+```cmd
+scripts\restart_server.cmd
+```
+
+```powershell
+.\scripts\restart_server.ps1
+```
+
 ## Using the App
 
 The web UI lets you control:
@@ -203,13 +217,29 @@ Output is written under `cache/`.
 
 ## Restart Helper
 
-macOS / Linux restart helper:
+macOS / Linux:
 
 ```bash
 zsh ./scripts/restart_server.zsh
 ```
 
-This script is Unix-specific. On Windows, restart the server directly from PowerShell using the virtual environment Python executable.
+Windows PowerShell:
+
+```powershell
+.\scripts\restart_server.ps1
+```
+
+Windows CMD or PowerShell without changing execution policy:
+
+```cmd
+scripts\restart_server.cmd
+```
+
+Useful options on both helpers include changing the port, forcing foreground mode, and enabling Playwright-backed providers. If PowerShell blocks local script execution, run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\restart_server.ps1
+```
 
 ## Notes and Tradeoffs
 

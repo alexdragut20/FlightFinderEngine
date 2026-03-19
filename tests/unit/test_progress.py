@@ -160,3 +160,40 @@ def test_progress_tracker_edge_paths_cover_default_messages_eta_and_empty_logs(
 
     with pytest.raises(ValueError):
         tracker.start_phase("unknown")
+
+
+def test_progress_tracker_runtime_payloads_are_exposed_in_snapshots() -> None:
+    tracker = SearchProgressTracker("job-runtime")
+    tracker.set_runtime_data("   ", {"ignored": True})
+    tracker.set_runtime_data(
+        "provider_health",
+        {
+            "providers": {
+                "kiwi": {
+                    "provider_id": "kiwi",
+                    "status": "selected",
+                    "selected": 3,
+                    "no_result": 1,
+                    "errors": 0,
+                }
+            }
+        },
+    )
+    tracker.update_runtime_data(
+        {
+            "coverage_audit": {
+                "destinations": [
+                    {"destination": "USM", "discovered_routes": 4, "provider_ids": ["kayak"]}
+                ]
+            },
+            "custom": {"ok": True},
+            " ": {"ignored": True},
+        }
+    )
+    tracker.update_runtime_data("not-a-dict")  # type: ignore[arg-type]
+
+    snapshot = tracker.snapshot()
+    assert snapshot["provider_health"]["providers"]["kiwi"]["selected"] == 3
+    assert snapshot["coverage_audit"]["destinations"][0]["destination"] == "USM"
+    assert snapshot["runtime_data"]["custom"] == {"ok": True}
+    assert " " not in snapshot["runtime_data"]

@@ -15,6 +15,7 @@ from functools import partial
 from typing import Any
 
 from ..config import (
+    _FREE_PROVIDER_IDS,
     AUTO_HUB_CANDIDATES,
     DEFAULT_CALENDAR_HUBS_PREFETCH,
     DEFAULT_CPU_WORKERS,
@@ -69,8 +70,34 @@ from ..utils import (
 )
 from ..utils.constants import (
     BEST_OBJECTIVE_PRICE_PER_HOUR_WEIGHT,
+    CANDIDATE_CHAIN_PAIR_LIMIT_MAX,
+    CANDIDATE_CHAIN_PAIR_LIMIT_MIN,
+    CANDIDATE_CHAIN_PAIR_PRIORITY_MULTIPLIER,
+    CANDIDATE_CHUNK_CAP_PER_DESTINATION,
+    CANDIDATE_CHUNK_WORKER_MULTIPLIER,
+    CANDIDATE_PRUNING_PRICE_MARGIN,
+    CANDIDATE_PRUNING_SCORE_MARGIN_RATIO,
+    COVERAGE_AUDIT_CHAIN_PAIR_MULTIPLIER,
+    COVERAGE_AUDIT_DATE_RADIUS_DAYS,
+    COVERAGE_AUDIT_DESTINATION_LIMIT,
+    COVERAGE_AUDIT_DIRECT_CANDIDATE_MULTIPLIER,
+    COVERAGE_AUDIT_DISCOVERY_IO_CAP,
+    COVERAGE_AUDIT_MAX_DATES_PER_ROUTE,
+    COVERAGE_AUDIT_MAX_ROUTES,
+    COVERAGE_AUDIT_PRUNING_PRICE_MARGIN,
+    COVERAGE_AUDIT_PRUNING_SCORE_MARGIN_RATIO,
+    COVERAGE_AUDIT_SPLIT_CANDIDATE_MULTIPLIER,
+    COVERAGE_AUDIT_TOP_CANDIDATES,
+    COVERAGE_AUDIT_VALIDATION_MULTIPLIER,
     FASTEST_OBJECTIVE_PRICE_MULTIPLIER,
+    FREE_PROVIDER_DISCOVERY_IO_CAP,
+    FREE_PROVIDER_DISCOVERY_MAX_DATES_PER_ROUTE,
+    FREE_PROVIDER_DISCOVERY_MAX_ROUTES_PER_DESTINATION,
     INNER_RETURN_BUNDLE_DISCOUNT_FACTOR,
+    MAX_EXHAUSTIVE_DIRECT_CANDIDATES_PER_DESTINATION,
+    MAX_EXHAUSTIVE_SPLIT_CANDIDATES_PER_DESTINATION,
+    MAX_NON_EXHAUSTIVE_DIRECT_CANDIDATES_PER_DESTINATION,
+    MAX_NON_EXHAUSTIVE_SPLIT_CANDIDATES_PER_DESTINATION,
     OUTBOUND_TIME_PROXY_BASE_SECONDS,
     OUTBOUND_TIME_PROXY_TRANSFER_PENALTY_SECONDS,
     PRICE_SENTINEL,
@@ -82,6 +109,8 @@ from ..utils.constants import (
     SECONDS_PER_HOUR,
 )
 from ..utils.logging import log_event
+
+_CANDIDATE_WORKER_TASKS: dict[str, dict[str, Any]] = {}
 
 
 def _min_calendar_price(prices: dict[str, int] | None) -> int | None:
@@ -278,15 +307,201 @@ def _estimate_objective_score(
     return (estimated_total / distance_basis_km) * 1000.0
 
 
+def _coerce_optional_price(value: Any) -> int | None:
+    """Coerce an arbitrary value into an optional integer price.
+
+    Args:
+        value: Raw value to normalize.
+
+    Returns:
+        int | None: Normalized integer price when available.
+    """
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _min_series_price(
+    series: tuple[int | None, ...] | list[int | None] | dict[Any, Any] | None,
+) -> int | None:
+    """Return the minimum non-null price from a compact calendar series.
+
+    Args:
+        series: Calendar prices indexed by day offset.
+
+    Returns:
+        int | None: The minimum non-null price from a compact calendar series.
+    """
+    if not series:
+        return None
+    raw_values = series.values() if isinstance(series, dict) else series
+    values = [int(price) for price in raw_values if price is not None]
+    if not values:
+        return None
+    return min(values)
+
+
+def _normalize_route_key(raw_key: Any) -> tuple[str, str]:
+    """Normalize a compact or legacy route key into a tuple key.
+
+    Args:
+        raw_key: Route key from a legacy string map or compact tuple map.
+
+    Returns:
+        tuple[str, str]: Tuple route key with source and destination airport codes.
+    """
+    if isinstance(raw_key, tuple) and len(raw_key) == 2:
+        return str(raw_key[0]), str(raw_key[1])
+    parts = str(raw_key).split("|", 1)
+    if len(parts) == 2:
+        return parts[0], parts[1]
+    return str(raw_key), ""
+
+
+def _calendar_series_from_prices(
+    date_keys: tuple[str, ...],
+    prices: Any,
+) -> tuple[int | None, ...]:
+    """Build a dense per-day series from a sparse calendar map.
+
+    Args:
+        date_keys: Ordered ISO dates for the full search period.
+        prices: Sparse mapping or already-compact series of prices.
+
+    Returns:
+        tuple[int | None, ...]: Dense price series aligned with `date_keys`.
+    """
+    if isinstance(prices, tuple) and len(prices) == len(date_keys):
+        return tuple(_coerce_optional_price(value) for value in prices)
+    if isinstance(prices, list) and len(prices) == len(date_keys):
+        return tuple(_coerce_optional_price(value) for value in prices)
+    if not isinstance(prices, dict):
+        return tuple(None for _ in date_keys)
+    return tuple(_coerce_optional_price(prices.get(date_key)) for date_key in date_keys)
+
+
+def _compact_candidate_task(task: dict[str, Any]) -> dict[str, Any]:
+    """Normalize an estimator task into a compact, chunk-friendly structure.
+
+    Args:
+        task: Legacy or compact estimator task payload.
+
+    Returns:
+        dict[str, Any]: Compact estimator task payload ready for chunk processing.
+    """
+    if "date_keys" in task:
+        date_keys = tuple(str(value) for value in task["date_keys"])
+    else:
+        period_start = dt.date.fromisoformat(str(task["period_start"]))
+        period_end = dt.date.fromisoformat(str(task["period_end"]))
+        date_keys = tuple(day.isoformat() for day in date_range(period_start, period_end))
+
+    destination = str(task["destination"])
+    compact_task: dict[str, Any] = {
+        "destination": destination,
+        "origins": tuple(str(origin) for origin in task["origins"]),
+        "outbound_hubs": tuple(str(hub) for hub in task["outbound_hubs"]),
+        "inbound_hubs": tuple(str(hub) for hub in task["inbound_hubs"]),
+        "date_keys": date_keys,
+        "min_stay_days": int(task["min_stay_days"]),
+        "max_stay_days": int(task["max_stay_days"]),
+        "min_stopover_days": int(task["min_stopover_days"]),
+        "max_stopover_days": int(task["max_stopover_days"]),
+        "objective": str(task["objective"]),
+        "max_candidates": int(task["max_candidates"]),
+        "max_direct_candidates": int(task.get("max_direct_candidates") or task["max_candidates"]),
+        "max_transfers_per_direction": int(task.get("max_transfers_per_direction") or 2),
+        "chunk_start_index": max(0, int(task.get("chunk_start_index") or 0)),
+        "chunk_end_index": min(
+            len(date_keys),
+            int(task.get("chunk_end_index") or len(date_keys)),
+        ),
+        "prune_score_margin_ratio": float(
+            task.get("prune_score_margin_ratio", CANDIDATE_PRUNING_SCORE_MARGIN_RATIO)
+        ),
+        "prune_price_margin": int(task.get("prune_price_margin", CANDIDATE_PRUNING_PRICE_MARGIN)),
+        "chain_pair_limit_multiplier": max(
+            1,
+            int(task.get("chain_pair_limit_multiplier") or 1),
+        ),
+        "audit_mode": bool(task.get("audit_mode")),
+    }
+
+    compact_task["origin_to_hub"] = {
+        _normalize_route_key(raw_key): _calendar_series_from_prices(date_keys, prices)
+        for raw_key, prices in dict(task["origin_to_hub"]).items()
+    }
+    compact_task["hub_to_origin"] = {
+        _normalize_route_key(raw_key): _calendar_series_from_prices(date_keys, prices)
+        for raw_key, prices in dict(task["hub_to_origin"]).items()
+    }
+    compact_task["hub_to_destination"] = {
+        str(raw_key): _calendar_series_from_prices(date_keys, prices)
+        for raw_key, prices in dict(task["hub_to_destination"]).items()
+    }
+    compact_task["destination_to_hub"] = {
+        str(raw_key): _calendar_series_from_prices(date_keys, prices)
+        for raw_key, prices in dict(task["destination_to_hub"]).items()
+    }
+    compact_task["hub_to_hub"] = {
+        _normalize_route_key(raw_key): _calendar_series_from_prices(date_keys, prices)
+        for raw_key, prices in dict(task.get("hub_to_hub", {})).items()
+    }
+    compact_task["origin_to_destination"] = {
+        _normalize_route_key(raw_key): _calendar_series_from_prices(date_keys, prices)
+        for raw_key, prices in dict(task.get("origin_to_destination", {})).items()
+    }
+    compact_task["destination_to_origin"] = {
+        _normalize_route_key(raw_key): _calendar_series_from_prices(date_keys, prices)
+        for raw_key, prices in dict(task.get("destination_to_origin", {})).items()
+    }
+    compact_task["destination_distance_map"] = {
+        _normalize_route_key(raw_key): value
+        for raw_key, value in dict(task["destination_distance_map"]).items()
+    }
+    return compact_task
+
+
+def _candidate_worker_init(task_map: dict[str, dict[str, Any]]) -> None:
+    """Initialize worker-local candidate task state.
+
+    Args:
+        task_map: Compact estimator tasks keyed by task identifier.
+    """
+    global _CANDIDATE_WORKER_TASKS
+    _CANDIDATE_WORKER_TASKS = task_map
+
+
+def _lookup_route_prices(
+    mapping: dict[Any, Any],
+    source: str,
+    destination: str,
+) -> Any:
+    """Look up route pricing from compact or legacy keyed mappings.
+
+    Args:
+        mapping: Price mapping keyed by tuples or legacy `A|B` strings.
+        source: Source airport code for the route.
+        destination: Destination airport code for the route.
+
+    Returns:
+        Any: Matching pricing payload, if present.
+    """
+    return mapping.get((source, destination), mapping.get(f"{source}|{destination}"))
+
+
 def _rank_chain_pairs(
     *,
     origins: list[str],
     first_hubs: list[str],
     second_hubs: list[str],
-    leg_a_map: dict[str, dict[str, int]],
-    leg_b_map: dict[str, dict[str, int]],
-    leg_c_map: dict[str, dict[str, int]],
-    reverse_leg_c_map: dict[str, dict[str, int]] | None = None,
+    leg_a_map: dict[tuple[str, str], tuple[int | None, ...]],
+    leg_b_map: dict[tuple[str, str], tuple[int | None, ...]],
+    leg_c_map: dict[str, tuple[int | None, ...]],
+    reverse_leg_c_map: dict[str, tuple[int | None, ...]] | None = None,
     pair_limit: int,
 ) -> list[tuple[str, str, str]]:
     """Rank outbound chain pairs before validation.
@@ -307,21 +522,21 @@ def _rank_chain_pairs(
     scored: list[tuple[int, str, str, str]] = []
     for origin in origins:
         for first_hub in first_hubs:
-            min_a = _min_calendar_price(leg_a_map.get(f"{origin}|{first_hub}", {}))
+            min_a = _min_series_price(_lookup_route_prices(leg_a_map, origin, first_hub))
             if min_a is None:
                 continue
             for second_hub in second_hubs:
                 if second_hub == first_hub:
                     continue
-                min_b = _min_calendar_price(leg_b_map.get(f"{first_hub}|{second_hub}", {}))
+                min_b = _min_series_price(_lookup_route_prices(leg_b_map, first_hub, second_hub))
                 if min_b is None:
                     continue
-                min_c = _min_calendar_price(leg_c_map.get(second_hub, {}))
+                min_c = _min_series_price(leg_c_map.get(second_hub))
                 if min_c is None:
                     continue
                 market_c = _estimate_inner_return_bundle_price(
                     min_c,
-                    _min_calendar_price((reverse_leg_c_map or {}).get(second_hub, {})),
+                    _min_series_price((reverse_leg_c_map or {}).get(second_hub)),
                 )
                 scored.append(
                     (
@@ -350,10 +565,10 @@ def _rank_inbound_chain_pairs(
     origins: list[str],
     first_hubs: list[str],
     second_hubs: list[str],
-    destination_to_hub: dict[str, dict[str, int]],
-    hub_to_destination: dict[str, dict[str, int]] | None,
-    hub_to_hub: dict[str, dict[str, int]],
-    hub_to_origin: dict[str, dict[str, int]],
+    destination_to_hub: dict[str, tuple[int | None, ...]],
+    hub_to_destination: dict[str, tuple[int | None, ...]] | None,
+    hub_to_hub: dict[tuple[str, str], tuple[int | None, ...]],
+    hub_to_origin: dict[tuple[str, str], tuple[int | None, ...]],
     pair_limit: int,
 ) -> list[tuple[str, str, str]]:
     """Rank inbound chain pairs before validation.
@@ -374,20 +589,22 @@ def _rank_inbound_chain_pairs(
     scored: list[tuple[int, str, str, str]] = []
     for arrival_origin in origins:
         for first_hub in first_hubs:
-            min_a = _min_calendar_price(destination_to_hub.get(first_hub, {}))
+            min_a = _min_series_price(destination_to_hub.get(first_hub))
             if min_a is None:
                 continue
             for second_hub in second_hubs:
                 if second_hub == first_hub:
                     continue
-                min_b = _min_calendar_price(hub_to_hub.get(f"{first_hub}|{second_hub}", {}))
+                min_b = _min_series_price(_lookup_route_prices(hub_to_hub, first_hub, second_hub))
                 if min_b is None:
                     continue
-                min_c = _min_calendar_price(hub_to_origin.get(f"{second_hub}|{arrival_origin}", {}))
+                min_c = _min_series_price(
+                    _lookup_route_prices(hub_to_origin, second_hub, arrival_origin)
+                )
                 if min_c is None:
                     continue
                 market_a = _estimate_inner_return_bundle_price(
-                    _min_calendar_price((hub_to_destination or {}).get(first_hub, {})),
+                    _min_series_price((hub_to_destination or {}).get(first_hub)),
                     min_a,
                 )
                 scored.append(
@@ -412,6 +629,162 @@ def _rank_inbound_chain_pairs(
     return out
 
 
+def _finalize_estimated_candidates(
+    candidates: list[dict[str, Any]],
+    *,
+    objective: str,
+    max_candidates: int,
+    max_direct_candidates: int,
+) -> list[dict[str, Any]]:
+    """Sort and trim estimated candidates after chunk or destination scoring.
+
+    Args:
+        candidates: Estimated candidates to finalize.
+        objective: Ranking objective for the search.
+        max_candidates: Maximum split candidates to keep.
+        max_direct_candidates: Maximum direct round-trip candidates to keep.
+
+    Returns:
+        list[dict[str, Any]]: Finalized estimated candidates ordered by objective.
+    """
+    split_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate.get("candidate_type") != "direct_roundtrip"
+    ]
+    direct_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate.get("candidate_type") == "direct_roundtrip"
+    ]
+
+    if objective == "best":
+        _apply_price_time_score(
+            split_candidates + direct_candidates,
+            price_key="estimated_total",
+            time_key="estimated_outbound_time_to_destination_seconds",
+            score_key="estimated_best_value_score",
+        )
+
+    def candidate_sort_key(candidate: dict[str, Any]) -> tuple[float, int, int]:
+        best_value_score = candidate.get("estimated_best_value_score")
+        outbound_time = candidate.get("estimated_outbound_time_to_destination_seconds")
+        return (
+            float(
+                best_value_score
+                if objective == "best" and best_value_score is not None
+                else candidate["estimated_score"]
+            ),
+            int(candidate["estimated_total"]),
+            int(outbound_time) if outbound_time is not None else PRICE_SENTINEL,
+        )
+
+    split_candidates.sort(key=candidate_sort_key)
+    direct_candidates.sort(key=candidate_sort_key)
+
+    if max_direct_candidates > 0:
+        direct_candidates = direct_candidates[:max_direct_candidates]
+    if max_candidates > 0:
+        split_candidates = split_candidates[:max_candidates]
+    else:
+        split_candidates = []
+
+    out = split_candidates + direct_candidates
+    out.sort(key=candidate_sort_key)
+    return out
+
+
+def _filter_finalized_estimated_candidates(
+    candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep only estimator outputs that already include ranking metrics.
+
+    Args:
+        candidates: Candidate records to filter.
+
+    Returns:
+        list[dict[str, Any]]: Candidates ready for estimate-based ranking.
+    """
+    return [
+        candidate
+        for candidate in candidates
+        if "estimated_total" in candidate and "estimated_score" in candidate
+    ]
+
+
+def _build_candidate_chunk_specs(
+    tasks: list[dict[str, Any]],
+    cpu_workers: int,
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    """Build compact candidate tasks and chunk descriptors for parallel scoring.
+
+    Args:
+        tasks: Candidate task payloads for each destination.
+        cpu_workers: Configured CPU worker count.
+
+    Returns:
+        tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]: Compact task map and chunk specs.
+    """
+    if not tasks:
+        return {}, []
+
+    compact_tasks: dict[str, dict[str, Any]] = {}
+    chunk_specs: list[dict[str, Any]] = []
+    destinations_count = max(1, len(tasks))
+    target_chunks_per_destination = max(
+        1,
+        min(
+            CANDIDATE_CHUNK_CAP_PER_DESTINATION,
+            math.ceil(
+                (max(1, cpu_workers) * CANDIDATE_CHUNK_WORKER_MULTIPLIER) / destinations_count
+            ),
+        ),
+    )
+
+    for task in tasks:
+        compact_task = _compact_candidate_task(task)
+        task_id = str(compact_task["destination"])
+        compact_tasks[task_id] = compact_task
+        date_keys = tuple(compact_task["date_keys"])
+        date_count = len(date_keys)
+        if date_count <= 1:
+            chunks_per_destination = 1
+        else:
+            chunks_per_destination = min(date_count, target_chunks_per_destination)
+        chunk_size = max(1, math.ceil(date_count / max(1, chunks_per_destination)))
+        for chunk_start_index in range(0, date_count, chunk_size):
+            chunk_end_index = min(date_count, chunk_start_index + chunk_size)
+            chunk_specs.append(
+                {
+                    "task_id": task_id,
+                    "destination": task_id,
+                    "chunk_start_index": chunk_start_index,
+                    "chunk_end_index": chunk_end_index,
+                    "chunk_label": f"{date_keys[chunk_start_index]}..{date_keys[chunk_end_index - 1]}",
+                    "base_task": compact_task,
+                }
+            )
+    return compact_tasks, chunk_specs
+
+
+def _estimate_candidates_for_chunk(chunk: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+    """Estimate candidates for one chunk of destination dates.
+
+    Args:
+        chunk: Chunk descriptor for the estimator worker.
+
+    Returns:
+        tuple[str, list[dict[str, Any]]]: Destination code and estimated candidates for the chunk.
+    """
+    task_id = str(chunk["task_id"])
+    base_task = _CANDIDATE_WORKER_TASKS.get(task_id) or dict(chunk["base_task"])
+    chunk_task = dict(base_task)
+    chunk_task["chunk_start_index"] = int(chunk["chunk_start_index"])
+    chunk_task["chunk_end_index"] = int(chunk["chunk_end_index"])
+    destination = str(chunk_task["destination"])
+    return destination, _estimate_candidates_for_destination(chunk_task)
+
+
 def _estimate_candidates_for_destination(task: dict[str, Any]) -> list[dict[str, Any]]:
     """Estimate candidate routes for a destination.
 
@@ -421,31 +794,74 @@ def _estimate_candidates_for_destination(task: dict[str, Any]) -> list[dict[str,
     Returns:
         list[dict[str, Any]]: Estimated candidate routes for a destination.
     """
-    destination = task["destination"]
-    origins: list[str] = task["origins"]
-    outbound_hubs: list[str] = task["outbound_hubs"]
-    inbound_hubs: list[str] = task["inbound_hubs"]
+    return _estimate_candidates_for_destination_compact(task)
 
-    period_start = dt.date.fromisoformat(task["period_start"])
-    period_end = dt.date.fromisoformat(task["period_end"])
 
-    min_stay_days = task["min_stay_days"]
-    max_stay_days = task["max_stay_days"]
-    min_stopover_days = task["min_stopover_days"]
-    max_stopover_days = task["max_stopover_days"]
-    objective = task["objective"]
-    max_candidates = task["max_candidates"]
+def _estimate_candidates_for_destination_compact(task: dict[str, Any]) -> list[dict[str, Any]]:
+    """Estimate candidate routes for a compact destination task.
+
+    Args:
+        task: Compact estimator task payload.
+
+    Returns:
+        list[dict[str, Any]]: Estimated candidate routes for the provided chunk.
+    """
+    task = _compact_candidate_task(task)
+    destination = str(task["destination"])
+    origins = list(task["origins"])
+    outbound_hubs = list(task["outbound_hubs"])
+    inbound_hubs = list(task["inbound_hubs"])
+    date_keys = list(task["date_keys"])
+    date_count = len(date_keys)
+    chunk_start_index = max(0, int(task.get("chunk_start_index") or 0))
+    chunk_end_index = min(date_count, int(task.get("chunk_end_index") or date_count))
+
+    min_stay_days = int(task["min_stay_days"])
+    max_stay_days = int(task["max_stay_days"])
+    min_stopover_days = int(task["min_stopover_days"])
+    max_stopover_days = int(task["max_stopover_days"])
+    objective = str(task["objective"])
+    max_candidates = int(task["max_candidates"])
     max_direct_candidates = int(task.get("max_direct_candidates") or max_candidates)
-
-    origin_to_hub = task["origin_to_hub"]
-    hub_to_origin = task["hub_to_origin"]
-    hub_to_destination = task["hub_to_destination"]
-    destination_to_hub = task["destination_to_hub"]
-    hub_to_hub = task.get("hub_to_hub", {})
-    origin_to_destination = task.get("origin_to_destination", {})
-    destination_to_origin = task.get("destination_to_origin", {})
-    destination_distance_map = task["destination_distance_map"]
     max_transfers_per_direction = int(task.get("max_transfers_per_direction") or 2)
+    prune_score_margin_ratio = max(
+        0.0,
+        float(task.get("prune_score_margin_ratio", CANDIDATE_PRUNING_SCORE_MARGIN_RATIO)),
+    )
+    prune_price_margin = max(
+        0,
+        int(task.get("prune_price_margin", CANDIDATE_PRUNING_PRICE_MARGIN)),
+    )
+    chain_pair_limit_multiplier = max(
+        1,
+        int(task.get("chain_pair_limit_multiplier") or 1),
+    )
+
+    origin_to_hub: dict[tuple[str, str], tuple[int | None, ...]] = dict(task["origin_to_hub"])
+    hub_to_origin: dict[tuple[str, str], tuple[int | None, ...]] = dict(task["hub_to_origin"])
+    hub_to_destination: dict[str, tuple[int | None, ...]] = dict(task["hub_to_destination"])
+    destination_to_hub: dict[str, tuple[int | None, ...]] = dict(task["destination_to_hub"])
+    hub_to_hub: dict[tuple[str, str], tuple[int | None, ...]] = dict(task.get("hub_to_hub", {}))
+    origin_to_destination: dict[tuple[str, str], tuple[int | None, ...]] = dict(
+        task.get("origin_to_destination", {})
+    )
+    destination_to_origin: dict[tuple[str, str], tuple[int | None, ...]] = dict(
+        task.get("destination_to_origin", {})
+    )
+    destination_distance_map: dict[tuple[str, str], float | None] = dict(
+        task["destination_distance_map"]
+    )
+
+    min_hub_to_origin = {key: _min_series_price(series) for key, series in hub_to_origin.items()}
+    min_hub_to_any_origin: dict[str, int | None] = {}
+    for hub in inbound_hubs:
+        values = [
+            price
+            for (route_hub, _arrival_origin), price in min_hub_to_origin.items()
+            if route_hub == hub and price is not None
+        ]
+        min_hub_to_any_origin[hub] = min(values) if values else None
+    min_hub_to_hub = {key: _min_series_price(series) for key, series in hub_to_hub.items()}
 
     counter = 0
     heap: list[tuple[float, int, int, dict[str, Any]]] = []
@@ -471,62 +887,152 @@ def _estimate_candidates_for_destination(task: dict[str, Any]) -> list[dict[str,
         ):
             heapq.heapreplace(heap, marker)
 
-    for depart_origin_date in date_range(period_start, period_end):
-        depart_origin_key = depart_origin_date.isoformat()
+    def candidate_bound_is_competitive(
+        *,
+        lower_total: int,
+        distance_basis_km: float | None,
+        outbound_time_proxy_seconds: int | None,
+    ) -> bool:
+        if max_candidates <= 0 or len(heap) < max_candidates:
+            return True
+        worst_score = -heap[0][0]
+        worst_total = -heap[0][1]
+        lower_score = _estimate_objective_score(
+            objective=objective,
+            estimated_total=lower_total,
+            distance_basis_km=distance_basis_km,
+            outbound_time_proxy_seconds=outbound_time_proxy_seconds,
+        )
+        score_margin_limit = worst_score * (1.0 + prune_score_margin_ratio)
+        total_margin_limit = worst_total + prune_price_margin
+        return (
+            lower_score <= score_margin_limit
+            or lower_total <= total_margin_limit
+            or (math.isclose(lower_score, worst_score) and lower_total < worst_total)
+        )
+
+    for depart_index in range(chunk_start_index, chunk_end_index):
+        depart_origin_key = date_keys[depart_index]
 
         for origin in origins:
+            distance_basis_km = destination_distance_map.get((origin, destination))
             for outbound_hub in outbound_hubs:
-                first_leg_price = origin_to_hub.get(f"{origin}|{outbound_hub}", {}).get(
-                    depart_origin_key
+                first_leg_prices = origin_to_hub.get((origin, outbound_hub), ())
+                first_leg_price = (
+                    first_leg_prices[depart_index] if depart_index < len(first_leg_prices) else None
                 )
                 if first_leg_price is None:
                     continue
 
                 for outbound_stopover_days in range(min_stopover_days, max_stopover_days + 1):
-                    depart_destination_date = depart_origin_date + dt.timedelta(
-                        days=outbound_stopover_days
-                    )
-                    if depart_destination_date > period_end:
+                    depart_destination_index = depart_index + outbound_stopover_days
+                    if depart_destination_index >= date_count:
                         continue
-                    depart_destination_key = depart_destination_date.isoformat()
+                    depart_destination_key = date_keys[depart_destination_index]
 
-                    second_leg_price = hub_to_destination.get(outbound_hub, {}).get(
-                        depart_destination_key
+                    second_leg_prices = hub_to_destination.get(outbound_hub, ())
+                    second_leg_price = (
+                        second_leg_prices[depart_destination_index]
+                        if depart_destination_index < len(second_leg_prices)
+                        else None
                     )
                     if second_leg_price is None:
                         continue
 
+                    estimated_outbound_time_seconds = _estimated_outbound_time_proxy_seconds(
+                        depart_origin_date=dt.date.fromisoformat(depart_origin_key),
+                        depart_destination_date=dt.date.fromisoformat(depart_destination_key),
+                        outbound_transfer_count=1,
+                    )
+
                     for main_stay_days in range(min_stay_days, max_stay_days + 1):
-                        leave_destination_date = depart_destination_date + dt.timedelta(
-                            days=main_stay_days
-                        )
-                        if leave_destination_date > period_end:
+                        leave_destination_index = depart_destination_index + main_stay_days
+                        if leave_destination_index >= date_count:
                             continue
-                        leave_destination_key = leave_destination_date.isoformat()
+                        leave_destination_key = date_keys[leave_destination_index]
 
                         for inbound_hub in inbound_hubs:
-                            third_leg_price = destination_to_hub.get(inbound_hub, {}).get(
-                                leave_destination_key
+                            third_leg_prices = destination_to_hub.get(inbound_hub, ())
+                            third_leg_price = (
+                                third_leg_prices[leave_destination_index]
+                                if leave_destination_index < len(third_leg_prices)
+                                else None
                             )
                             if third_leg_price is None:
                                 continue
 
-                            for inbound_stopover_days in range(
-                                min_stopover_days,
-                                max_stopover_days + 1,
-                            ):
-                                return_origin_date = leave_destination_date + dt.timedelta(
-                                    days=inbound_stopover_days
+                            base_three_leg_total = (
+                                first_leg_price + second_leg_price + third_leg_price
+                            )
+                            global_min_fourth_leg = min_hub_to_any_origin.get(inbound_hub)
+                            if global_min_fourth_leg is not None:
+                                global_lower_bound_total = (
+                                    base_three_leg_total + global_min_fourth_leg
                                 )
-                                if return_origin_date > period_end:
+                                if outbound_hub == inbound_hub:
+                                    bundled_origin_return = min_hub_to_origin.get(
+                                        (inbound_hub, origin)
+                                    )
+                                    if bundled_origin_return is not None:
+                                        bundled_lower_bound_total, _ = (
+                                            _apply_inner_return_bundle_estimate(
+                                                base_total=base_three_leg_total
+                                                + bundled_origin_return,
+                                                outbound_market_price=second_leg_price,
+                                                inbound_market_price=third_leg_price,
+                                            )
+                                        )
+                                        global_lower_bound_total = min(
+                                            global_lower_bound_total,
+                                            bundled_lower_bound_total,
+                                        )
+                                if not candidate_bound_is_competitive(
+                                    lower_total=global_lower_bound_total,
+                                    distance_basis_km=distance_basis_km,
+                                    outbound_time_proxy_seconds=estimated_outbound_time_seconds,
+                                ):
                                     continue
 
-                                return_origin_key = return_origin_date.isoformat()
+                            for arrival_origin in origins:
+                                min_fourth_leg = min_hub_to_origin.get(
+                                    (inbound_hub, arrival_origin)
+                                )
+                                if min_fourth_leg is None:
+                                    continue
 
-                                for arrival_origin in origins:
-                                    fourth_leg_price = hub_to_origin.get(
-                                        f"{inbound_hub}|{arrival_origin}", {}
-                                    ).get(return_origin_key)
+                                lower_bound_total = base_three_leg_total + min_fourth_leg
+                                if origin == arrival_origin and outbound_hub == inbound_hub:
+                                    lower_bound_total, _ = _apply_inner_return_bundle_estimate(
+                                        base_total=lower_bound_total,
+                                        outbound_market_price=second_leg_price,
+                                        inbound_market_price=third_leg_price,
+                                    )
+                                if not candidate_bound_is_competitive(
+                                    lower_total=lower_bound_total,
+                                    distance_basis_km=distance_basis_km,
+                                    outbound_time_proxy_seconds=estimated_outbound_time_seconds,
+                                ):
+                                    continue
+
+                                fourth_leg_prices = hub_to_origin.get(
+                                    (inbound_hub, arrival_origin), ()
+                                )
+                                for inbound_stopover_days in range(
+                                    min_stopover_days,
+                                    max_stopover_days + 1,
+                                ):
+                                    return_origin_index = (
+                                        leave_destination_index + inbound_stopover_days
+                                    )
+                                    if return_origin_index >= date_count:
+                                        continue
+                                    return_origin_key = date_keys[return_origin_index]
+
+                                    fourth_leg_price = (
+                                        fourth_leg_prices[return_origin_index]
+                                        if return_origin_index < len(fourth_leg_prices)
+                                        else None
+                                    )
                                     if fourth_leg_price is None:
                                         continue
 
@@ -549,15 +1055,6 @@ def _estimate_candidates_for_destination(task: dict[str, Any]) -> list[dict[str,
                                             estimated_total = bundle_total
                                             estimated_pricing_strategy = "inner_return_bundle_proxy"
 
-                                    distance_key = f"{origin}|{destination}"
-                                    distance_basis_km = destination_distance_map.get(distance_key)
-                                    estimated_outbound_time_seconds = (
-                                        _estimated_outbound_time_proxy_seconds(
-                                            depart_origin_date=depart_origin_date,
-                                            depart_destination_date=depart_destination_date,
-                                            outbound_transfer_count=1,
-                                        )
-                                    )
                                     estimated_score = _estimate_objective_score(
                                         objective=objective,
                                         estimated_total=estimated_total,
@@ -565,39 +1062,41 @@ def _estimate_candidates_for_destination(task: dict[str, Any]) -> list[dict[str,
                                         outbound_time_proxy_seconds=estimated_outbound_time_seconds,
                                     )
 
-                                    candidate = {
-                                        "candidate_type": "split_stopover",
-                                        "destination": destination,
-                                        "origin": origin,
-                                        "arrival_origin": arrival_origin,
-                                        "outbound_hub": outbound_hub,
-                                        "inbound_hub": inbound_hub,
-                                        "depart_origin_date": depart_origin_key,
-                                        "depart_destination_date": depart_destination_key,
-                                        "leave_destination_date": leave_destination_key,
-                                        "return_origin_date": return_origin_key,
-                                        "outbound_stopover_days": outbound_stopover_days,
-                                        "inbound_stopover_days": inbound_stopover_days,
-                                        "main_stay_days": main_stay_days,
-                                        "estimated_total": estimated_total,
-                                        "distance_basis_km": distance_basis_km,
-                                        "estimated_score": estimated_score,
-                                        "estimated_outbound_time_to_destination_seconds": (
-                                            estimated_outbound_time_seconds
-                                        ),
-                                        "estimated_pricing_strategy": estimated_pricing_strategy,
-                                    }
                                     push_candidate(
-                                        candidate,
+                                        {
+                                            "candidate_type": "split_stopover",
+                                            "destination": destination,
+                                            "origin": origin,
+                                            "arrival_origin": arrival_origin,
+                                            "outbound_hub": outbound_hub,
+                                            "inbound_hub": inbound_hub,
+                                            "depart_origin_date": depart_origin_key,
+                                            "depart_destination_date": depart_destination_key,
+                                            "leave_destination_date": leave_destination_key,
+                                            "return_origin_date": return_origin_key,
+                                            "outbound_stopover_days": outbound_stopover_days,
+                                            "inbound_stopover_days": inbound_stopover_days,
+                                            "main_stay_days": main_stay_days,
+                                            "estimated_total": estimated_total,
+                                            "distance_basis_km": distance_basis_km,
+                                            "estimated_score": estimated_score,
+                                            "estimated_outbound_time_to_destination_seconds": (
+                                                estimated_outbound_time_seconds
+                                            ),
+                                            "estimated_pricing_strategy": estimated_pricing_strategy,
+                                        },
                                         estimated_score=estimated_score,
                                         estimated_total=estimated_total,
                                     )
 
-    # Destination-first manual chain mode:
-    # origin -> hub_a -> hub_b -> destination and back, as separately ticketed legs.
-    # Enabled only when transfer cap allows at least two boundary changes per direction.
     if max_transfers_per_direction >= 2 and hub_to_hub:
-        pair_limit = min(36, max(8, int(math.sqrt(max_candidates))))
+        pair_limit = max(CANDIDATE_CHAIN_PAIR_LIMIT_MIN, int(math.sqrt(max_candidates)))
+        if objective in {"best", "cheapest"}:
+            pair_limit *= CANDIDATE_CHAIN_PAIR_PRIORITY_MULTIPLIER
+        if max_transfers_per_direction >= 3:
+            pair_limit = int(math.ceil(pair_limit * 1.25))
+        pair_limit *= chain_pair_limit_multiplier
+        pair_limit = min(CANDIDATE_CHAIN_PAIR_LIMIT_MAX, pair_limit)
         outbound_pairs = _rank_chain_pairs(
             origins=origins,
             first_hubs=outbound_hubs,
@@ -619,76 +1118,123 @@ def _estimate_candidates_for_destination(task: dict[str, Any]) -> list[dict[str,
             pair_limit=pair_limit,
         )
 
-        for depart_origin_date in date_range(period_start, period_end):
-            depart_origin_key = depart_origin_date.isoformat()
+        for depart_index in range(chunk_start_index, chunk_end_index):
+            depart_origin_key = date_keys[depart_index]
             for origin, out_hub_a, out_hub_b in outbound_pairs:
-                first_leg_price = origin_to_hub.get(f"{origin}|{out_hub_a}", {}).get(
-                    depart_origin_key
+                distance_basis_km = destination_distance_map.get((origin, destination))
+                first_leg_prices = origin_to_hub.get((origin, out_hub_a), ())
+                first_leg_price = (
+                    first_leg_prices[depart_index] if depart_index < len(first_leg_prices) else None
                 )
                 if first_leg_price is None:
                     continue
 
                 for out_stop_days_a in range(min_stopover_days, max_stopover_days + 1):
-                    date_leg_2 = depart_origin_date + dt.timedelta(days=out_stop_days_a)
-                    if date_leg_2 > period_end:
+                    date_leg_2_index = depart_index + out_stop_days_a
+                    if date_leg_2_index >= date_count:
                         continue
-                    date_leg_2_key = date_leg_2.isoformat()
-                    second_leg_price = hub_to_hub.get(f"{out_hub_a}|{out_hub_b}", {}).get(
-                        date_leg_2_key
+                    date_leg_2_key = date_keys[date_leg_2_index]
+                    second_leg_prices = hub_to_hub.get((out_hub_a, out_hub_b), ())
+                    second_leg_price = (
+                        second_leg_prices[date_leg_2_index]
+                        if date_leg_2_index < len(second_leg_prices)
+                        else None
                     )
                     if second_leg_price is None:
                         continue
 
                     for out_stop_days_b in range(min_stopover_days, max_stopover_days + 1):
-                        date_leg_3 = date_leg_2 + dt.timedelta(days=out_stop_days_b)
-                        if date_leg_3 > period_end:
+                        date_leg_3_index = date_leg_2_index + out_stop_days_b
+                        if date_leg_3_index >= date_count:
                             continue
-                        date_leg_3_key = date_leg_3.isoformat()
-                        third_leg_price = hub_to_destination.get(out_hub_b, {}).get(date_leg_3_key)
+                        date_leg_3_key = date_keys[date_leg_3_index]
+                        third_leg_prices = hub_to_destination.get(out_hub_b, ())
+                        third_leg_price = (
+                            third_leg_prices[date_leg_3_index]
+                            if date_leg_3_index < len(third_leg_prices)
+                            else None
+                        )
                         if third_leg_price is None:
                             continue
 
+                        estimated_outbound_time_seconds = _estimated_outbound_time_proxy_seconds(
+                            depart_origin_date=dt.date.fromisoformat(depart_origin_key),
+                            depart_destination_date=dt.date.fromisoformat(date_leg_3_key),
+                            outbound_transfer_count=2,
+                        )
+
                         for main_stay_days in range(min_stay_days, max_stay_days + 1):
-                            leave_destination_date = date_leg_3 + dt.timedelta(days=main_stay_days)
-                            if leave_destination_date > period_end:
+                            leave_destination_index = date_leg_3_index + main_stay_days
+                            if leave_destination_index >= date_count:
                                 continue
-                            leave_destination_key = leave_destination_date.isoformat()
+                            leave_destination_key = date_keys[leave_destination_index]
 
                             for arrival_origin, in_hub_a, in_hub_b in inbound_pairs:
-                                fourth_leg_price = destination_to_hub.get(in_hub_a, {}).get(
-                                    leave_destination_key
+                                fourth_leg_prices = destination_to_hub.get(in_hub_a, ())
+                                fourth_leg_price = (
+                                    fourth_leg_prices[leave_destination_index]
+                                    if leave_destination_index < len(fourth_leg_prices)
+                                    else None
                                 )
                                 if fourth_leg_price is None:
                                     continue
 
+                                min_fifth_leg = min_hub_to_hub.get((in_hub_a, in_hub_b))
+                                min_sixth_leg = min_hub_to_origin.get((in_hub_b, arrival_origin))
+                                if min_fifth_leg is None or min_sixth_leg is None:
+                                    continue
+
+                                lower_bound_total = (
+                                    first_leg_price
+                                    + second_leg_price
+                                    + third_leg_price
+                                    + fourth_leg_price
+                                    + min_fifth_leg
+                                    + min_sixth_leg
+                                )
+                                if origin == arrival_origin and out_hub_b == in_hub_a:
+                                    lower_bound_total, _ = _apply_inner_return_bundle_estimate(
+                                        base_total=lower_bound_total,
+                                        outbound_market_price=third_leg_price,
+                                        inbound_market_price=fourth_leg_price,
+                                    )
+                                if not candidate_bound_is_competitive(
+                                    lower_total=lower_bound_total,
+                                    distance_basis_km=distance_basis_km,
+                                    outbound_time_proxy_seconds=estimated_outbound_time_seconds,
+                                ):
+                                    continue
+
+                                fifth_leg_prices = hub_to_hub.get((in_hub_a, in_hub_b), ())
+                                sixth_leg_prices = hub_to_origin.get((in_hub_b, arrival_origin), ())
                                 for in_stop_days_a in range(
                                     min_stopover_days, max_stopover_days + 1
                                 ):
-                                    date_leg_5 = leave_destination_date + dt.timedelta(
-                                        days=in_stop_days_a
-                                    )
-                                    if date_leg_5 > period_end:
+                                    date_leg_5_index = leave_destination_index + in_stop_days_a
+                                    if date_leg_5_index >= date_count:
                                         continue
-                                    date_leg_5_key = date_leg_5.isoformat()
-                                    fifth_leg_price = hub_to_hub.get(
-                                        f"{in_hub_a}|{in_hub_b}", {}
-                                    ).get(date_leg_5_key)
+                                    date_leg_5_key = date_keys[date_leg_5_index]
+                                    fifth_leg_price = (
+                                        fifth_leg_prices[date_leg_5_index]
+                                        if date_leg_5_index < len(fifth_leg_prices)
+                                        else None
+                                    )
                                     if fifth_leg_price is None:
                                         continue
 
                                     for in_stop_days_b in range(
-                                        min_stopover_days, max_stopover_days + 1
+                                        min_stopover_days,
+                                        max_stopover_days + 1,
                                     ):
-                                        return_origin_date = date_leg_5 + dt.timedelta(
-                                            days=in_stop_days_b
-                                        )
-                                        if return_origin_date > period_end:
+                                        return_origin_index = date_leg_5_index + in_stop_days_b
+                                        if return_origin_index >= date_count:
                                             continue
-                                        return_origin_key = return_origin_date.isoformat()
-                                        sixth_leg_price = hub_to_origin.get(
-                                            f"{in_hub_b}|{arrival_origin}",
-                                            {},
-                                        ).get(return_origin_key)
+                                        return_origin_key = date_keys[return_origin_index]
+                                        sixth_leg_price = (
+                                            sixth_leg_prices[return_origin_index]
+                                            if return_origin_index < len(sixth_leg_prices)
+                                            else None
+                                        )
                                         if sixth_leg_price is None:
                                             continue
 
@@ -715,17 +1261,6 @@ def _estimate_candidates_for_destination(task: dict[str, Any]) -> list[dict[str,
                                                     "inner_return_bundle_proxy"
                                                 )
 
-                                        distance_key = f"{origin}|{destination}"
-                                        distance_basis_km = destination_distance_map.get(
-                                            distance_key
-                                        )
-                                        estimated_outbound_time_seconds = (
-                                            _estimated_outbound_time_proxy_seconds(
-                                                depart_origin_date=depart_origin_date,
-                                                depart_destination_date=date_leg_3,
-                                                outbound_transfer_count=2,
-                                            )
-                                        )
                                         estimated_score = _estimate_objective_score(
                                             objective=objective,
                                             estimated_total=estimated_total,
@@ -733,100 +1268,105 @@ def _estimate_candidates_for_destination(task: dict[str, Any]) -> list[dict[str,
                                             outbound_time_proxy_seconds=estimated_outbound_time_seconds,
                                         )
 
-                                        candidate = {
-                                            "candidate_type": "split_chain",
-                                            "destination": destination,
-                                            "origin": origin,
-                                            "arrival_origin": arrival_origin,
-                                            "outbound_hub": f"{out_hub_a}/{out_hub_b}",
-                                            "inbound_hub": f"{in_hub_a}/{in_hub_b}",
-                                            "depart_origin_date": depart_origin_key,
-                                            "depart_destination_date": date_leg_3_key,
-                                            "leave_destination_date": leave_destination_key,
-                                            "return_origin_date": return_origin_key,
-                                            "outbound_stopover_days": out_stop_days_a
-                                            + out_stop_days_b,
-                                            "inbound_stopover_days": in_stop_days_a
-                                            + in_stop_days_b,
-                                            "outbound_boundary_stopover_days": [
-                                                out_stop_days_a,
-                                                out_stop_days_b,
-                                            ],
-                                            "inbound_boundary_stopover_days": [
-                                                in_stop_days_a,
-                                                in_stop_days_b,
-                                            ],
-                                            "main_stay_days": main_stay_days,
-                                            "estimated_total": estimated_total,
-                                            "distance_basis_km": distance_basis_km,
-                                            "estimated_score": estimated_score,
-                                            "estimated_outbound_time_to_destination_seconds": (
-                                                estimated_outbound_time_seconds
-                                            ),
-                                            "estimated_pricing_strategy": estimated_pricing_strategy,
-                                            "outbound_legs": [
-                                                {
-                                                    "source": origin,
-                                                    "destination": out_hub_a,
-                                                    "date": depart_origin_key,
-                                                },
-                                                {
-                                                    "source": out_hub_a,
-                                                    "destination": out_hub_b,
-                                                    "date": date_leg_2_key,
-                                                },
-                                                {
-                                                    "source": out_hub_b,
-                                                    "destination": destination,
-                                                    "date": date_leg_3_key,
-                                                },
-                                            ],
-                                            "inbound_legs": [
-                                                {
-                                                    "source": destination,
-                                                    "destination": in_hub_a,
-                                                    "date": leave_destination_key,
-                                                },
-                                                {
-                                                    "source": in_hub_a,
-                                                    "destination": in_hub_b,
-                                                    "date": date_leg_5_key,
-                                                },
-                                                {
-                                                    "source": in_hub_b,
-                                                    "destination": arrival_origin,
-                                                    "date": return_origin_key,
-                                                },
-                                            ],
-                                        }
                                         push_candidate(
-                                            candidate,
+                                            {
+                                                "candidate_type": "split_chain",
+                                                "destination": destination,
+                                                "origin": origin,
+                                                "arrival_origin": arrival_origin,
+                                                "outbound_hub": f"{out_hub_a}/{out_hub_b}",
+                                                "inbound_hub": f"{in_hub_a}/{in_hub_b}",
+                                                "depart_origin_date": depart_origin_key,
+                                                "depart_destination_date": date_leg_3_key,
+                                                "leave_destination_date": leave_destination_key,
+                                                "return_origin_date": return_origin_key,
+                                                "outbound_stopover_days": out_stop_days_a
+                                                + out_stop_days_b,
+                                                "inbound_stopover_days": in_stop_days_a
+                                                + in_stop_days_b,
+                                                "outbound_boundary_stopover_days": [
+                                                    out_stop_days_a,
+                                                    out_stop_days_b,
+                                                ],
+                                                "inbound_boundary_stopover_days": [
+                                                    in_stop_days_a,
+                                                    in_stop_days_b,
+                                                ],
+                                                "main_stay_days": main_stay_days,
+                                                "estimated_total": estimated_total,
+                                                "distance_basis_km": distance_basis_km,
+                                                "estimated_score": estimated_score,
+                                                "estimated_outbound_time_to_destination_seconds": (
+                                                    estimated_outbound_time_seconds
+                                                ),
+                                                "estimated_pricing_strategy": estimated_pricing_strategy,
+                                                "outbound_legs": [
+                                                    {
+                                                        "source": origin,
+                                                        "destination": out_hub_a,
+                                                        "date": depart_origin_key,
+                                                    },
+                                                    {
+                                                        "source": out_hub_a,
+                                                        "destination": out_hub_b,
+                                                        "date": date_leg_2_key,
+                                                    },
+                                                    {
+                                                        "source": out_hub_b,
+                                                        "destination": destination,
+                                                        "date": date_leg_3_key,
+                                                    },
+                                                ],
+                                                "inbound_legs": [
+                                                    {
+                                                        "source": destination,
+                                                        "destination": in_hub_a,
+                                                        "date": leave_destination_key,
+                                                    },
+                                                    {
+                                                        "source": in_hub_a,
+                                                        "destination": in_hub_b,
+                                                        "date": date_leg_5_key,
+                                                    },
+                                                    {
+                                                        "source": in_hub_b,
+                                                        "destination": arrival_origin,
+                                                        "date": return_origin_key,
+                                                    },
+                                                ],
+                                            },
                                             estimated_score=estimated_score,
                                             estimated_total=estimated_total,
                                         )
 
-    # Baseline regular round-trip candidates (no planned multi-day stopover city).
-    for depart_origin_date in date_range(period_start, period_end):
-        depart_origin_key = depart_origin_date.isoformat()
+    for depart_index in range(chunk_start_index, chunk_end_index):
+        depart_origin_key = date_keys[depart_index]
         for origin in origins:
-            outbound_prices = origin_to_destination.get(f"{origin}|{destination}", {})
-            inbound_prices = destination_to_origin.get(f"{destination}|{origin}", {})
+            distance_basis_km = destination_distance_map.get((origin, destination))
+            outbound_prices = origin_to_destination.get((origin, destination), ())
+            inbound_prices = destination_to_origin.get((destination, origin), ())
 
-            fallback_outbound = min(outbound_prices.values()) if outbound_prices else 999_999
-            fallback_inbound = min(inbound_prices.values()) if inbound_prices else 999_999
+            fallback_outbound = _min_series_price(outbound_prices) or 999_999
+            fallback_inbound = _min_series_price(inbound_prices) or 999_999
 
-            first_leg_price = outbound_prices.get(depart_origin_key)
+            first_leg_price = (
+                outbound_prices[depart_index] if depart_index < len(outbound_prices) else None
+            )
             first_leg_missing = first_leg_price is None
             if first_leg_missing:
                 first_leg_price = fallback_outbound
 
             for main_stay_days in range(min_stay_days, max_stay_days + 1):
-                return_origin_date = depart_origin_date + dt.timedelta(days=main_stay_days)
-                if return_origin_date > period_end:
+                return_origin_index = depart_index + main_stay_days
+                if return_origin_index >= date_count:
                     continue
-                return_origin_key = return_origin_date.isoformat()
+                return_origin_key = date_keys[return_origin_index]
 
-                second_leg_price = inbound_prices.get(return_origin_key)
+                second_leg_price = (
+                    inbound_prices[return_origin_index]
+                    if return_origin_index < len(inbound_prices)
+                    else None
+                )
                 second_leg_missing = second_leg_price is None
                 if second_leg_missing:
                     second_leg_price = fallback_inbound
@@ -838,10 +1378,9 @@ def _estimate_candidates_for_destination(task: dict[str, Any]) -> list[dict[str,
                     availability_penalty += 250
 
                 estimated_total = first_leg_price + second_leg_price + availability_penalty
-                distance_basis_km = destination_distance_map.get(f"{origin}|{destination}")
                 estimated_outbound_time_seconds = _estimated_outbound_time_proxy_seconds(
-                    depart_origin_date=depart_origin_date,
-                    depart_destination_date=depart_origin_date,
+                    depart_origin_date=dt.date.fromisoformat(depart_origin_key),
+                    depart_destination_date=dt.date.fromisoformat(depart_origin_key),
                     outbound_transfer_count=0,
                 )
                 estimated_score = _estimate_objective_score(
@@ -851,59 +1390,33 @@ def _estimate_candidates_for_destination(task: dict[str, Any]) -> list[dict[str,
                     outbound_time_proxy_seconds=estimated_outbound_time_seconds,
                 )
 
-                candidate = {
-                    "candidate_type": "direct_roundtrip",
-                    "destination": destination,
-                    "origin": origin,
-                    "arrival_origin": origin,
-                    "depart_origin_date": depart_origin_key,
-                    "return_origin_date": return_origin_key,
-                    "main_stay_days": main_stay_days,
-                    "estimated_total": estimated_total,
-                    "calendar_outbound_missing": first_leg_missing,
-                    "calendar_inbound_missing": second_leg_missing,
-                    "distance_basis_km": distance_basis_km,
-                    "estimated_score": estimated_score,
-                    "estimated_outbound_time_to_destination_seconds": (
-                        estimated_outbound_time_seconds
-                    ),
-                }
-                direct_candidates.append(candidate)
+                direct_candidates.append(
+                    {
+                        "candidate_type": "direct_roundtrip",
+                        "destination": destination,
+                        "origin": origin,
+                        "arrival_origin": origin,
+                        "depart_origin_date": depart_origin_key,
+                        "return_origin_date": return_origin_key,
+                        "main_stay_days": main_stay_days,
+                        "estimated_total": estimated_total,
+                        "calendar_outbound_missing": first_leg_missing,
+                        "calendar_inbound_missing": second_leg_missing,
+                        "distance_basis_km": distance_basis_km,
+                        "estimated_score": estimated_score,
+                        "estimated_outbound_time_to_destination_seconds": (
+                            estimated_outbound_time_seconds
+                        ),
+                    }
+                )
 
     split_candidates = [item[3] for item in heap]
-    if objective == "best":
-        _apply_price_time_score(
-            split_candidates + direct_candidates,
-            price_key="estimated_total",
-            time_key="estimated_outbound_time_to_destination_seconds",
-            score_key="estimated_best_value_score",
-        )
-
-    def candidate_sort_key(candidate: dict[str, Any]) -> tuple[float, int, int]:
-        best_value_score = candidate.get("estimated_best_value_score")
-        outbound_time = candidate.get("estimated_outbound_time_to_destination_seconds")
-        return (
-            float(
-                best_value_score
-                if objective == "best" and best_value_score is not None
-                else candidate["estimated_score"]
-            ),
-            int(candidate["estimated_total"]),
-            int(outbound_time) if outbound_time is not None else PRICE_SENTINEL,
-        )
-
-    split_candidates.sort(key=candidate_sort_key)
-
-    if not direct_candidates:
-        return split_candidates[:max_candidates]
-
-    direct_candidates.sort(key=candidate_sort_key)
-    if max_direct_candidates > 0:
-        direct_candidates = direct_candidates[:max_direct_candidates]
-
-    out = split_candidates[:max_candidates] + direct_candidates
-    out.sort(key=candidate_sort_key)
-    return out
+    return _finalize_estimated_candidates(
+        split_candidates + direct_candidates,
+        objective=objective,
+        max_candidates=max_candidates,
+        max_direct_candidates=max_direct_candidates,
+    )
 
 
 class SplitTripOptimizer:
@@ -2866,6 +3379,8 @@ class SplitTripOptimizer:
         origin_rank: dict[str, int],
         core_provider_ids: tuple[str, ...],
         serpapi_active: bool,
+        audit_destinations: set[str] | None = None,
+        audit_metadata: dict[str, dict[str, Any]] | None = None,
     ) -> tuple[dict[str, Any], list[str]]:
         """Handle prepare destination validation context.
 
@@ -2877,6 +3392,8 @@ class SplitTripOptimizer:
             origin_rank: Mapping of origin rank.
             core_provider_ids: Identifiers for core provider.
             serpapi_active: Flag that controls whether serpapi active is used.
+            audit_destinations: Destinations receiving an expanded audit pass.
+            audit_metadata: Coverage-audit metadata keyed by destination.
 
         Returns:
             tuple[dict[str, Any], list[str]]: Handle prepare destination validation context.
@@ -2902,6 +3419,18 @@ class SplitTripOptimizer:
                     len(estimated_candidates),
                     validation_target_per_destination * 2,
                 ),
+            )
+        destination_audit_meta = dict((audit_metadata or {}).get(destination) or {})
+        if destination in (audit_destinations or set()):
+            destination_validation_target = min(
+                len(estimated_candidates),
+                max(
+                    destination_validation_target,
+                    validation_target_per_destination * COVERAGE_AUDIT_VALIDATION_MULTIPLIER,
+                ),
+            )
+            warnings.append(
+                f"{destination}: coverage audit expanded validation to {destination_validation_target} candidates."
             )
 
         def candidate_sort_key(item: dict[str, Any]) -> tuple[float, int, int]:
@@ -3025,6 +3554,45 @@ class SplitTripOptimizer:
                 limited_candidates.append(chain_candidate)
                 limited_ids.add(chain_key)
             limited_candidates.sort(key=candidate_sort_key)
+
+        def candidate_identity(item: dict[str, Any]) -> tuple[Any, ...]:
+            candidate_type = str(item.get("candidate_type") or "split_stopover")
+            if candidate_type == "direct_roundtrip":
+                return (
+                    candidate_type,
+                    str(item.get("origin") or ""),
+                    str(item.get("destination") or destination),
+                    str(item.get("depart_origin_date") or ""),
+                    str(item.get("return_origin_date") or ""),
+                )
+            return self._split_candidate_key(item)
+
+        if config.objective != "cheapest" and estimated_candidates:
+            price_floor_quota = min(
+                len(estimated_candidates),
+                max(2, min(8, int(math.ceil(destination_validation_target / 4)))),
+            )
+            price_floor_candidates = sorted(
+                estimated_candidates,
+                key=lambda item: (
+                    int(item.get("estimated_total") or PRICE_SENTINEL),
+                    candidate_sort_key(item),
+                ),
+            )[:price_floor_quota]
+            selected_ids = {candidate_identity(item) for item in limited_candidates}
+            preserved_price_floor = 0
+            for price_floor_candidate in price_floor_candidates:
+                candidate_id = candidate_identity(price_floor_candidate)
+                if candidate_id in selected_ids:
+                    continue
+                limited_candidates.append(price_floor_candidate)
+                selected_ids.add(candidate_id)
+                preserved_price_floor += 1
+            if preserved_price_floor > 0:
+                limited_candidates.sort(key=candidate_sort_key)
+                warnings.append(
+                    f"{destination}: preserved {preserved_price_floor} price-floor candidate(s) for validation."
+                )
 
         unique_leg_keys: set[tuple[str, str, str]] = set()
         unique_return_keys: set[tuple[str, str, str, str]] = set()
@@ -3170,9 +3738,615 @@ class SplitTripOptimizer:
                 "ordered_return_keys": ordered_return_keys,
                 "oneway_provider_map": oneway_provider_map,
                 "return_provider_map": return_provider_map,
+                "coverage_audit": destination_audit_meta,
             },
             warnings,
         )
+
+    def _select_coverage_audit_destinations(
+        self,
+        estimated_by_destination: dict[str, list[dict[str, Any]]],
+        *,
+        objective: str,
+    ) -> list[str]:
+        """Pick the destinations that deserve an expanded coverage audit.
+
+        Args:
+            estimated_by_destination: Estimated candidates grouped by destination.
+            objective: Ranking objective for the search.
+
+        Returns:
+            list[str]: Destination codes ordered by audit priority.
+        """
+        ranked: list[tuple[tuple[float, int, str], str]] = []
+        for destination, items in estimated_by_destination.items():
+            if not items:
+                continue
+            best_item = min(
+                items,
+                key=lambda item: (
+                    float(
+                        item.get("estimated_best_value_score")
+                        if objective == "best"
+                        and item.get("estimated_best_value_score") is not None
+                        else item.get("estimated_score") or PRICE_SENTINEL
+                    ),
+                    int(item.get("estimated_total") or PRICE_SENTINEL),
+                    str(item.get("destination") or destination),
+                ),
+            )
+            ranked.append(
+                (
+                    (
+                        float(
+                            best_item.get("estimated_best_value_score")
+                            if objective == "best"
+                            and best_item.get("estimated_best_value_score") is not None
+                            else best_item.get("estimated_score") or PRICE_SENTINEL
+                        ),
+                        int(best_item.get("estimated_total") or PRICE_SENTINEL),
+                        destination,
+                    ),
+                    destination,
+                )
+            )
+        ranked.sort(key=lambda entry: entry[0])
+        return [destination for _, destination in ranked[:COVERAGE_AUDIT_DESTINATION_LIMIT]]
+
+    @staticmethod
+    def _sample_discovery_dates(
+        date_keys: tuple[str, ...],
+        *,
+        max_dates: int,
+    ) -> tuple[str, ...]:
+        """Select evenly distributed date seeds for sparse provider discovery.
+
+        Args:
+            date_keys: Candidate date keys available for the task.
+            max_dates: Maximum number of dates to retain.
+
+        Returns:
+            tuple[str, ...]: Sampled date seeds ordered chronologically.
+        """
+        if not date_keys:
+            return ()
+        if len(date_keys) <= max_dates:
+            return tuple(date_keys)
+        if max_dates <= 1:
+            return (date_keys[0],)
+        indexes = {
+            round(index * (len(date_keys) - 1) / float(max_dates - 1)) for index in range(max_dates)
+        }
+        return tuple(date_keys[index] for index in sorted(indexes))
+
+    def _build_initial_free_provider_discovery_seed_map(
+        self,
+        *,
+        task: dict[str, Any],
+    ) -> dict[tuple[str, str], tuple[str, ...]]:
+        """Build sparse route/date seeds for baseline free-provider discovery.
+
+        Args:
+            task: Estimator task to augment before candidate scoring.
+
+        Returns:
+            dict[tuple[str, str], tuple[str, ...]]: Sparse route/date seeds.
+        """
+        sampled_dates = self._sample_discovery_dates(
+            tuple(str(value) for value in task.get("date_keys") or ()),
+            max_dates=FREE_PROVIDER_DISCOVERY_MAX_DATES_PER_ROUTE,
+        )
+        if not sampled_dates:
+            return {}
+
+        destination = str(task.get("destination") or "")
+        route_scores: dict[tuple[str, str], int] = {}
+
+        def register_route(
+            route_key: tuple[str, str],
+            series: tuple[int | None, ...] | None,
+        ) -> None:
+            if not route_key[0] or not route_key[1]:
+                return
+            min_price = _min_series_price(series)
+            current = route_scores.get(route_key, PRICE_SENTINEL)
+            route_scores[route_key] = min(current, int(min_price or PRICE_SENTINEL))
+
+        for route_key, series in dict(task.get("origin_to_destination") or {}).items():
+            register_route((str(route_key[0]), str(route_key[1])), tuple(series))
+        for route_key, series in dict(task.get("destination_to_origin") or {}).items():
+            register_route((str(route_key[0]), str(route_key[1])), tuple(series))
+        for route_key, series in dict(task.get("origin_to_hub") or {}).items():
+            register_route((str(route_key[0]), str(route_key[1])), tuple(series))
+        for route_key, series in dict(task.get("hub_to_origin") or {}).items():
+            register_route((str(route_key[0]), str(route_key[1])), tuple(series))
+        for hub, series in dict(task.get("hub_to_destination") or {}).items():
+            register_route((str(hub), destination), tuple(series))
+        for hub, series in dict(task.get("destination_to_hub") or {}).items():
+            register_route((destination, str(hub)), tuple(series))
+        for route_key, series in dict(task.get("hub_to_hub") or {}).items():
+            register_route((str(route_key[0]), str(route_key[1])), tuple(series))
+
+        selected_routes = sorted(
+            route_scores,
+            key=lambda route_key: (
+                route_scores.get(route_key, PRICE_SENTINEL),
+                route_key[0],
+                route_key[1],
+            ),
+        )[:FREE_PROVIDER_DISCOVERY_MAX_ROUTES_PER_DESTINATION]
+        return {route_key: sampled_dates for route_key in selected_routes}
+
+    def _build_free_provider_discovery_seed_map(
+        self,
+        *,
+        destination: str,
+        estimated_candidates: list[dict[str, Any]],
+        config: SearchConfig,
+    ) -> dict[tuple[str, str], tuple[str, ...]]:
+        """Build route/date seeds for free-provider discovery probes.
+
+        Args:
+            destination: Destination airport code for the request.
+            estimated_candidates: Estimated candidates for the destination.
+            config: Search configuration for the operation.
+
+        Returns:
+            dict[tuple[str, str], tuple[str, ...]]: Route keys mapped to candidate date seeds.
+        """
+        route_dates: dict[tuple[str, str], set[str]] = {}
+        route_rank: dict[tuple[str, str], int] = {}
+
+        ranked_candidates = sorted(
+            estimated_candidates,
+            key=lambda item: (
+                float(
+                    item.get("estimated_best_value_score")
+                    if config.objective == "best"
+                    and item.get("estimated_best_value_score") is not None
+                    else item.get("estimated_score") or PRICE_SENTINEL
+                ),
+                int(item.get("estimated_total") or PRICE_SENTINEL),
+            ),
+        )[:COVERAGE_AUDIT_TOP_CANDIDATES]
+
+        for candidate in ranked_candidates:
+            estimated_total = int(candidate.get("estimated_total") or PRICE_SENTINEL)
+            candidate_type = str(candidate.get("candidate_type") or "split_stopover")
+            seed_keys: list[tuple[str, str, str]] = []
+            if candidate_type == "direct_roundtrip":
+                seed_keys.extend(
+                    [
+                        (
+                            str(candidate["origin"]),
+                            destination,
+                            str(candidate["depart_origin_date"]),
+                        ),
+                        (
+                            destination,
+                            str(candidate["arrival_origin"]),
+                            str(candidate["return_origin_date"]),
+                        ),
+                    ]
+                )
+            else:
+                split_plans = self._candidate_split_plans(candidate)
+                if split_plans is not None:
+                    seed_keys.extend([*split_plans["outbound_plan"], *split_plans["inbound_plan"]])
+            for source, target, date_iso in seed_keys:
+                route_key = (str(source), str(target))
+                route_dates.setdefault(route_key, set()).add(str(date_iso))
+                route_rank[route_key] = min(
+                    route_rank.get(route_key, PRICE_SENTINEL), estimated_total
+                )
+
+        if not route_dates:
+            return {}
+
+        selected_routes = sorted(
+            route_dates,
+            key=lambda route_key: (
+                route_rank.get(route_key, PRICE_SENTINEL),
+                route_key[0],
+                route_key[1],
+            ),
+        )[:COVERAGE_AUDIT_MAX_ROUTES]
+
+        out: dict[tuple[str, str], tuple[str, ...]] = {}
+        for route_key in selected_routes:
+            expanded_dates: set[str] = set()
+            for date_iso in route_dates[route_key]:
+                base_date = dt.date.fromisoformat(str(date_iso))
+                for delta in range(
+                    -COVERAGE_AUDIT_DATE_RADIUS_DAYS,
+                    COVERAGE_AUDIT_DATE_RADIUS_DAYS + 1,
+                ):
+                    candidate_date = base_date + dt.timedelta(days=delta)
+                    if candidate_date < config.period_start or candidate_date > config.period_end:
+                        continue
+                    expanded_dates.add(candidate_date.isoformat())
+            out[route_key] = tuple(sorted(expanded_dates)[:COVERAGE_AUDIT_MAX_DATES_PER_ROUTE])
+        return out
+
+    async def _probe_free_provider_discovery(
+        self,
+        *,
+        search_client: MultiProviderClient,
+        provider_ids: tuple[str, ...],
+        route_dates: dict[tuple[str, str], tuple[str, ...]],
+        config: SearchConfig,
+        io_pool: ThreadPoolExecutor,
+        io_cap: int | None = None,
+    ) -> tuple[dict[tuple[str, str], dict[str, int]], list[str]]:
+        """Probe free providers for sparse route/date discovery prices.
+
+        Args:
+            search_client: Client used to execute search requests.
+            provider_ids: Free-provider identifiers used for discovery.
+            route_dates: Route seeds mapped to outbound ISO dates.
+            config: Search configuration for the operation.
+            io_pool: Thread pool used for I/O-bound provider validation.
+            io_cap: Maximum concurrency cap for the sparse discovery stage.
+
+        Returns:
+            tuple[dict[tuple[str, str], dict[str, int]], list[str]]: Sparse discovered prices and warnings.
+        """
+        if not provider_ids or not route_dates:
+            return {}, []
+
+        loop = asyncio.get_running_loop()
+        sem = asyncio.Semaphore(
+            max(
+                1,
+                min(
+                    int(io_cap or COVERAGE_AUDIT_DISCOVERY_IO_CAP),
+                    bounded_io_concurrency(config.io_workers),
+                ),
+            )
+        )
+        max_connection_layover_seconds = (
+            int(config.max_connection_layover_hours * SECONDS_PER_HOUR)
+            if config.max_connection_layover_hours
+            else None
+        )
+        discovered: dict[tuple[str, str], dict[str, int]] = {}
+        warnings: list[str] = []
+
+        async def probe_date(source: str, target: str, date_iso: str) -> None:
+            async with sem:
+                try:
+                    fn = partial(
+                        search_client.get_best_oneway,
+                        source=source,
+                        destination=target,
+                        departure_iso=date_iso,
+                        currency=config.currency,
+                        max_stops_per_leg=config.max_stops_per_leg,
+                        adults=config.passengers.adults,
+                        hand_bags=config.passengers.hand_bags,
+                        hold_bags=config.passengers.hold_bags,
+                        max_connection_layover_seconds=max_connection_layover_seconds,
+                        provider_ids=provider_ids,
+                    )
+                    item = await loop.run_in_executor(io_pool, fn)
+                except Exception as exc:
+                    warnings.append(
+                        f"Coverage audit discovery failed {source}->{target} {date_iso}: {exc}"
+                    )
+                    return
+                if not item:
+                    return
+                price = int(item.get("price") or 0)
+                if price <= 0:
+                    return
+                route_key = (source, target)
+                route_prices = discovered.setdefault(route_key, {})
+                current = route_prices.get(date_iso)
+                if current is None or price < current:
+                    route_prices[date_iso] = price
+
+        await asyncio.gather(
+            *(
+                probe_date(source, target, date_iso)
+                for (source, target), dates in route_dates.items()
+                for date_iso in dates
+            )
+        )
+        return discovered, warnings
+
+    async def _run_initial_free_provider_discovery(
+        self,
+        *,
+        search_client: MultiProviderClient,
+        candidate_tasks: list[dict[str, Any]],
+        config: SearchConfig,
+        io_pool: ThreadPoolExecutor,
+        progress: SearchProgressTracker | None = None,
+    ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], list[str]]:
+        """Augment baseline candidate tasks with sparse free-provider discoveries.
+
+        Args:
+            search_client: Client used to execute search requests.
+            candidate_tasks: Estimator tasks used for the baseline run.
+            config: Search configuration for the operation.
+            io_pool: Thread pool used for I/O-bound provider validation.
+            progress: Progress tracker for the search job.
+
+        Returns:
+            tuple[list[dict[str, Any]], dict[str, dict[str, Any]], list[str]]:
+                Updated candidate tasks, discovery metadata, and warnings.
+        """
+        free_discovery_provider_ids = tuple(
+            provider_id
+            for provider_id in search_client.active_provider_ids
+            if provider_id in _FREE_PROVIDER_IDS and provider_id != "kiwi"
+        )
+        if not free_discovery_provider_ids or not candidate_tasks:
+            return candidate_tasks, {}, []
+
+        if progress is not None:
+            progress.log_message(
+                "Free-provider discovery: probing non-Kiwi providers for extra candidate dates.",
+                phase="setup",
+            )
+
+        updated_tasks: list[dict[str, Any]] = []
+        discovery_metadata: dict[str, dict[str, Any]] = {}
+        warnings: list[str] = []
+        for task in candidate_tasks:
+            destination = str(task.get("destination") or "")
+            route_dates = self._build_initial_free_provider_discovery_seed_map(task=task)
+            if not route_dates:
+                updated_tasks.append(task)
+                continue
+            if progress is not None:
+                progress.log_message(
+                    f"{destination}: probing {len(route_dates)} route(s) on "
+                    f"{'/'.join(free_discovery_provider_ids)} before candidate scoring.",
+                    phase="setup",
+                )
+            discovered_prices, discovery_warnings = await self._probe_free_provider_discovery(
+                search_client=search_client,
+                provider_ids=free_discovery_provider_ids,
+                route_dates=route_dates,
+                config=config,
+                io_pool=io_pool,
+                io_cap=FREE_PROVIDER_DISCOVERY_IO_CAP,
+            )
+            warnings.extend(discovery_warnings[:12])
+            updated_tasks.append(
+                self._merge_discovery_prices_into_task(
+                    task=task,
+                    discovered_prices=discovered_prices,
+                )
+            )
+            discovery_metadata[destination] = {
+                "destination": destination,
+                "provider_ids": list(free_discovery_provider_ids),
+                "seed_routes": len(route_dates),
+                "discovered_routes": len(discovered_prices),
+                "discovered_price_points": sum(
+                    len(prices) for prices in discovered_prices.values()
+                ),
+            }
+        return updated_tasks, discovery_metadata, warnings
+
+    def _merge_discovery_prices_into_task(
+        self,
+        *,
+        task: dict[str, Any],
+        discovered_prices: dict[tuple[str, str], dict[str, int]],
+    ) -> dict[str, Any]:
+        """Merge sparse discovery prices back into an estimator task.
+
+        Args:
+            task: Estimator task to augment.
+            discovered_prices: Sparse prices keyed by route/date.
+
+        Returns:
+            dict[str, Any]: Augmented estimator task.
+        """
+        if not discovered_prices:
+            return dict(task)
+
+        date_keys = tuple(str(value) for value in task["date_keys"])
+        destination = str(task["destination"])
+
+        def merged_series(
+            series: tuple[int | None, ...],
+            route_key: tuple[str, str],
+        ) -> tuple[int | None, ...]:
+            route_prices = discovered_prices.get(route_key) or {}
+            if not route_prices:
+                return tuple(series)
+            out = list(series)
+            for index, date_iso in enumerate(date_keys):
+                price = route_prices.get(date_iso)
+                if price is None:
+                    continue
+                current = out[index]
+                if current is None or int(price) < int(current):
+                    out[index] = int(price)
+            return tuple(out)
+
+        merged_task = dict(task)
+        merged_task["origin_to_hub"] = {
+            key: merged_series(tuple(series), key)
+            for key, series in dict(task["origin_to_hub"]).items()
+        }
+        merged_task["hub_to_origin"] = {
+            key: merged_series(tuple(series), key)
+            for key, series in dict(task["hub_to_origin"]).items()
+        }
+        merged_task["hub_to_destination"] = {
+            hub: merged_series(tuple(series), (str(hub), destination))
+            for hub, series in dict(task["hub_to_destination"]).items()
+        }
+        merged_task["destination_to_hub"] = {
+            hub: merged_series(tuple(series), (destination, str(hub)))
+            for hub, series in dict(task["destination_to_hub"]).items()
+        }
+        merged_task["hub_to_hub"] = {
+            key: merged_series(tuple(series), key)
+            for key, series in dict(task.get("hub_to_hub", {})).items()
+        }
+        merged_task["origin_to_destination"] = {
+            key: merged_series(tuple(series), key)
+            for key, series in dict(task.get("origin_to_destination", {})).items()
+        }
+        merged_task["destination_to_origin"] = {
+            key: merged_series(tuple(series), key)
+            for key, series in dict(task.get("destination_to_origin", {})).items()
+        }
+        return merged_task
+
+    async def _run_coverage_audit(
+        self,
+        *,
+        search_client: MultiProviderClient,
+        candidate_tasks: list[dict[str, Any]],
+        estimated_by_destination: dict[str, list[dict[str, Any]]],
+        config: SearchConfig,
+        io_pool: ThreadPoolExecutor,
+        progress: SearchProgressTracker | None = None,
+    ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, dict[str, Any]], list[str]]:
+        """Run a widened audit pass for the most promising destinations.
+
+        Args:
+            search_client: Client used to execute search requests.
+            candidate_tasks: Estimator tasks used for the baseline run.
+            estimated_by_destination: Baseline estimated candidates by destination.
+            config: Search configuration for the operation.
+            io_pool: Thread pool used for I/O-bound provider validation.
+            progress: Progress tracker for the search job.
+
+        Returns:
+            tuple[dict[str, list[dict[str, Any]]], dict[str, dict[str, Any]], list[str]]:
+                Audited estimates, audit metadata, and warnings.
+        """
+        task_by_destination = {
+            str(task["destination"]): dict(task)
+            for task in candidate_tasks
+            if task.get("destination")
+        }
+        audit_destinations = self._select_coverage_audit_destinations(
+            estimated_by_destination,
+            objective=config.objective,
+        )
+        if not audit_destinations:
+            return {}, {}, []
+
+        free_discovery_provider_ids = tuple(
+            provider_id
+            for provider_id in search_client.active_provider_ids
+            if provider_id in _FREE_PROVIDER_IDS and provider_id != "kiwi"
+        )
+        if progress is not None:
+            progress.log_message(
+                f"Coverage audit: widening search for {len(audit_destinations)} destination(s).",
+                phase="candidates",
+            )
+
+        audit_tasks: list[dict[str, Any]] = []
+        audit_metadata: dict[str, dict[str, Any]] = {}
+        warnings: list[str] = []
+
+        for destination in audit_destinations:
+            base_task = task_by_destination.get(destination)
+            baseline_candidates = list(estimated_by_destination.get(destination) or [])
+            if not base_task or not baseline_candidates:
+                continue
+            route_dates = self._build_free_provider_discovery_seed_map(
+                destination=destination,
+                estimated_candidates=baseline_candidates,
+                config=config,
+            )
+            discovered_prices: dict[tuple[str, str], dict[str, int]] = {}
+            discovery_warnings: list[str] = []
+            if free_discovery_provider_ids and route_dates:
+                if progress is not None:
+                    progress.log_message(
+                        f"{destination}: probing {len(route_dates)} route(s) on "
+                        f"{'/'.join(free_discovery_provider_ids)} for extra date discovery.",
+                        phase="candidates",
+                    )
+                discovered_prices, discovery_warnings = await self._probe_free_provider_discovery(
+                    search_client=search_client,
+                    provider_ids=free_discovery_provider_ids,
+                    route_dates=route_dates,
+                    config=config,
+                    io_pool=io_pool,
+                )
+                warnings.extend(discovery_warnings[:12])
+
+            audited_task = self._merge_discovery_prices_into_task(
+                task=base_task,
+                discovered_prices=discovered_prices,
+            )
+            audited_task["audit_mode"] = True
+            audited_task["prune_score_margin_ratio"] = COVERAGE_AUDIT_PRUNING_SCORE_MARGIN_RATIO
+            audited_task["prune_price_margin"] = COVERAGE_AUDIT_PRUNING_PRICE_MARGIN
+            audited_task["chain_pair_limit_multiplier"] = COVERAGE_AUDIT_CHAIN_PAIR_MULTIPLIER
+            audited_task["max_candidates"] = min(
+                MAX_EXHAUSTIVE_SPLIT_CANDIDATES_PER_DESTINATION,
+                max(
+                    int(base_task["max_candidates"]) * COVERAGE_AUDIT_SPLIT_CANDIDATE_MULTIPLIER,
+                    len(baseline_candidates) * COVERAGE_AUDIT_SPLIT_CANDIDATE_MULTIPLIER,
+                ),
+            )
+            audited_task["max_direct_candidates"] = min(
+                MAX_EXHAUSTIVE_DIRECT_CANDIDATES_PER_DESTINATION,
+                max(
+                    int(base_task.get("max_direct_candidates") or base_task["max_candidates"])
+                    * COVERAGE_AUDIT_DIRECT_CANDIDATE_MULTIPLIER,
+                    len(baseline_candidates) * COVERAGE_AUDIT_DIRECT_CANDIDATE_MULTIPLIER,
+                ),
+            )
+            audit_tasks.append(audited_task)
+            discovery_route_count = len(discovered_prices)
+            discovery_price_points = sum(len(prices) for prices in discovered_prices.values())
+            audit_metadata[destination] = {
+                "destination": destination,
+                "provider_ids": list(free_discovery_provider_ids),
+                "seed_routes": len(route_dates),
+                "discovered_routes": discovery_route_count,
+                "discovered_price_points": discovery_price_points,
+                "baseline_candidates": len(baseline_candidates),
+                "expanded_max_candidates": audited_task["max_candidates"],
+                "expanded_direct_candidates": audited_task["max_direct_candidates"],
+            }
+            if progress is not None:
+                progress.log_message(
+                    f"{destination}: coverage audit prepared "
+                    f"{discovery_price_points} discovered price point(s) across "
+                    f"{discovery_route_count} route(s).",
+                    phase="candidates",
+                )
+
+        if progress is not None:
+            progress.set_runtime_data(
+                "coverage_audit",
+                {
+                    "destinations": list(audit_metadata.values()),
+                    "provider_ids": list(free_discovery_provider_ids),
+                },
+            )
+
+        if not audit_tasks:
+            return {}, audit_metadata, warnings
+
+        audited_estimates = await self._estimate_candidates_parallel(
+            audit_tasks,
+            config,
+            progress=None,
+        )
+        if progress is not None:
+            progress.log_message(
+                "Coverage audit complete: "
+                f"{sum(len(items or []) for items in audited_estimates.values())} extra estimates reviewed.",
+                phase="candidates",
+            )
+        return audited_estimates, audit_metadata, warnings
 
     @staticmethod
     def _prune_dominated_split_results(
@@ -3852,52 +5026,182 @@ class SplitTripOptimizer:
         if not tasks:
             return {}
 
-        if config.cpu_workers <= 1 or len(tasks) == 1:
+        if not all(
+            "origins" in task and "outbound_hubs" in task and "inbound_hubs" in task
+            for task in tasks
+        ):
+            if config.cpu_workers <= 1 or len(tasks) == 1:
+                out: dict[str, list[dict[str, Any]]] = {}
+                for index, task in enumerate(tasks, start=1):
+                    out[task["destination"]] = _estimate_candidates_for_destination(task)
+                    if progress is not None:
+                        progress.advance_phase(
+                            "candidates",
+                            completed=index,
+                            total=len(tasks),
+                            detail=(
+                                f"Scored {index}/{len(tasks)} destination candidate pools "
+                                f"(latest {task['destination']})."
+                            ),
+                        )
+                return out
+
+            loop = asyncio.get_running_loop()
+            results: dict[str, list[dict[str, Any]]] = {}
+            futures: list[asyncio.Task[tuple[str, list[dict[str, Any]]]]] = []
+            cpu_pool = ProcessPoolExecutor(max_workers=min(config.cpu_workers, len(tasks)))
+            wait_for_shutdown = True
+            try:
+
+                async def run_task(task: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+                    data = await loop.run_in_executor(
+                        cpu_pool, _estimate_candidates_for_destination, task
+                    )
+                    return task["destination"], data
+
+                futures = [asyncio.create_task(run_task(task)) for task in tasks]
+                completed = 0
+                for future in asyncio.as_completed(futures):
+                    destination, data = await future
+                    results[destination] = data
+                    completed += 1
+                    if progress is not None:
+                        progress.advance_phase(
+                            "candidates",
+                            completed=completed,
+                            total=len(tasks),
+                            detail=(
+                                f"Scored {completed}/{len(tasks)} destination candidate pools "
+                                f"(latest {destination})."
+                            ),
+                        )
+            except asyncio.CancelledError:
+                wait_for_shutdown = False
+                for future in futures:
+                    future.cancel()
+                cpu_pool.shutdown(wait=False, cancel_futures=True)
+                raise
+            except Exception:
+                wait_for_shutdown = False
+                for future in futures:
+                    future.cancel()
+                cpu_pool.shutdown(wait=False, cancel_futures=True)
+                raise
+            finally:
+                if wait_for_shutdown:
+                    with contextlib.suppress(Exception):
+                        cpu_pool.shutdown(wait=True, cancel_futures=False)
+            return results
+
+        compact_tasks, chunk_specs = _build_candidate_chunk_specs(tasks, config.cpu_workers)
+        if not chunk_specs:
+            return {}
+
+        if progress is not None:
+            progress.add_phase_total(
+                "candidates",
+                total=len(chunk_specs),
+                detail=(
+                    f"Scoring {len(chunk_specs)} candidate chunks across "
+                    f"{len(compact_tasks)} destinations."
+                ),
+            )
+
+        destination_total_chunks: dict[str, int] = {}
+        for chunk in chunk_specs:
+            destination = str(chunk["destination"])
+            destination_total_chunks[destination] = destination_total_chunks.get(destination, 0) + 1
+
+        if config.cpu_workers <= 1 or len(chunk_specs) == 1:
             out: dict[str, list[dict[str, Any]]] = {}
-            for index, task in enumerate(tasks, start=1):
-                out[task["destination"]] = _estimate_candidates_for_destination(task)
+            partial_batches: dict[str, list[list[dict[str, Any]]]] = {}
+            completed_chunks = 0
+            destination_completed_chunks: dict[str, int] = {}
+            for chunk in chunk_specs:
+                destination, batch = _estimate_candidates_for_chunk(chunk)
+                partial_batches.setdefault(destination, []).append(batch)
+                destination_completed_chunks[destination] = (
+                    destination_completed_chunks.get(destination, 0) + 1
+                )
+                completed_chunks += 1
                 if progress is not None:
+                    finished_destinations = sum(
+                        1
+                        for key, total in destination_total_chunks.items()
+                        if destination_completed_chunks.get(key, 0) >= total
+                    )
                     progress.advance_phase(
                         "candidates",
-                        completed=index,
-                        total=len(tasks),
+                        completed=completed_chunks,
+                        total=len(chunk_specs),
                         detail=(
-                            f"Scored {index}/{len(tasks)} destination candidate pools "
-                            f"(latest {task['destination']})."
+                            f"Scored {completed_chunks}/{len(chunk_specs)} candidate chunks "
+                            f"({finished_destinations}/{len(destination_total_chunks)} destinations "
+                            f"finished, latest {destination} {chunk['chunk_label']})."
                         ),
                     )
+            for destination, batches in partial_batches.items():
+                merged = [candidate for batch in batches for candidate in batch]
+                task_meta = compact_tasks[destination]
+                out[destination] = _finalize_estimated_candidates(
+                    merged,
+                    objective=str(task_meta["objective"]),
+                    max_candidates=int(task_meta["max_candidates"]),
+                    max_direct_candidates=int(task_meta["max_direct_candidates"]),
+                )
             return out
 
         loop = asyncio.get_running_loop()
         results: dict[str, list[dict[str, Any]]] = {}
+        partial_batches: dict[str, list[list[dict[str, Any]]]] = {}
         futures: list[asyncio.Task[tuple[str, list[dict[str, Any]]]]] = []
 
-        cpu_pool = ProcessPoolExecutor(max_workers=min(config.cpu_workers, len(tasks)))
+        cpu_pool = ProcessPoolExecutor(
+            max_workers=min(config.cpu_workers, len(chunk_specs)),
+            initializer=_candidate_worker_init,
+            initargs=(compact_tasks,),
+        )
         wait_for_shutdown = True
         try:
 
-            async def run_task(task: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
-                data = await loop.run_in_executor(
-                    cpu_pool, _estimate_candidates_for_destination, task
-                )
-                return task["destination"], data
+            async def run_task(chunk: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+                return await loop.run_in_executor(cpu_pool, _estimate_candidates_for_chunk, chunk)
 
-            futures = [asyncio.create_task(run_task(task)) for task in tasks]
-            completed = 0
+            futures = [asyncio.create_task(run_task(chunk)) for chunk in chunk_specs]
+            completed_chunks = 0
+            destination_completed_chunks: dict[str, int] = {}
             for future in asyncio.as_completed(futures):
                 destination, data = await future
-                results[destination] = data
-                completed += 1
+                partial_batches.setdefault(destination, []).append(data)
+                destination_completed_chunks[destination] = (
+                    destination_completed_chunks.get(destination, 0) + 1
+                )
+                completed_chunks += 1
                 if progress is not None:
+                    finished_destinations = sum(
+                        1
+                        for key, total in destination_total_chunks.items()
+                        if destination_completed_chunks.get(key, 0) >= total
+                    )
                     progress.advance_phase(
                         "candidates",
-                        completed=completed,
-                        total=len(tasks),
+                        completed=completed_chunks,
+                        total=len(chunk_specs),
                         detail=(
-                            f"Scored {completed}/{len(tasks)} destination candidate pools "
-                            f"(latest {destination})."
+                            f"Scored {completed_chunks}/{len(chunk_specs)} candidate chunks "
+                            f"({finished_destinations}/{len(destination_total_chunks)} destinations "
+                            f"finished, latest {destination})."
                         ),
                     )
+            for destination, batches in partial_batches.items():
+                merged = [candidate for batch in batches for candidate in batch]
+                task_meta = compact_tasks[destination]
+                results[destination] = _finalize_estimated_candidates(
+                    merged,
+                    objective=str(task_meta["objective"]),
+                    max_candidates=int(task_meta["max_candidates"]),
+                    max_direct_candidates=int(task_meta["max_direct_candidates"]),
+                )
         except asyncio.CancelledError:
             wait_for_shutdown = False
             for future in futures:
@@ -3956,6 +5260,26 @@ class SplitTripOptimizer:
                 )
         search_client, provider_status, provider_warnings = self._build_search_client(config)
         warnings.extend(provider_warnings)
+        if hasattr(search_client, "health_snapshot"):
+            current_provider_health = search_client.health_snapshot()
+        elif hasattr(search_client, "stats_snapshot"):
+            current_provider_health = {
+                "providers": {},
+                "budget": dict((search_client.stats_snapshot() or {}).get("budget") or {}),
+            }
+        else:
+            current_provider_health = {"providers": {}, "budget": {}}
+        if progress is not None:
+            progress.set_runtime_data("provider_health", current_provider_health)
+            progress.set_runtime_data(
+                "coverage_audit",
+                {"destinations": [], "provider_ids": []},
+            )
+            stats_listener_setter = getattr(search_client, "set_stats_listener", None)
+            if callable(stats_listener_setter):
+                stats_listener_setter(
+                    lambda payload: progress.set_runtime_data("provider_health", payload)
+                )
         log_event(
             logging.INFO,
             "search_phase_providers_ready",
@@ -4072,6 +5396,7 @@ class SplitTripOptimizer:
 
         chosen_hubs: dict[str, dict[str, list[str]]] = {}
         candidate_tasks: list[dict[str, Any]] = []
+        free_provider_discovery_metadata: dict[str, dict[str, Any]] = {}
 
         # Candidate pool multiplier should increase *estimated* coverage, not multiply
         # the number of live validations (which becomes explosive for multi-destination
@@ -4081,22 +5406,28 @@ class SplitTripOptimizer:
             validation_target_per_destination,
             validation_target_per_destination * config.estimated_pool_multiplier,
         )
+        coverage_priority_multiplier = (
+            CANDIDATE_CHAIN_PAIR_PRIORITY_MULTIPLIER
+            if config.objective in {"best", "cheapest"}
+            else 1
+        )
         max_candidates = estimated_pool_target_per_destination
         if config.exhaustive_hub_scan:
             max_candidates = max(
                 max_candidates,
                 min(
-                    20000,
+                    MAX_EXHAUSTIVE_SPLIT_CANDIDATES_PER_DESTINATION,
                     config.validate_top_per_destination
-                    * max(24, config.estimated_pool_multiplier * 2),
+                    * max(24, config.estimated_pool_multiplier * coverage_priority_multiplier),
                 ),
             )
         else:
             max_candidates = min(
-                15000,
+                MAX_NON_EXHAUSTIVE_SPLIT_CANDIDATES_PER_DESTINATION,
                 max(
                     max_candidates,
-                    config.validate_top_per_destination * max(6, config.estimated_pool_multiplier),
+                    config.validate_top_per_destination
+                    * max(8, config.estimated_pool_multiplier * coverage_priority_multiplier),
                 ),
             )
         date_span_days = max(1, (config.period_end - config.period_start).days + 1)
@@ -4107,9 +5438,18 @@ class SplitTripOptimizer:
             max_candidates * 2,
         )
         if config.exhaustive_hub_scan:
-            max_direct_candidates = min(20000, max(1200, direct_target))
+            max_direct_candidates = min(
+                MAX_EXHAUSTIVE_DIRECT_CANDIDATES_PER_DESTINATION,
+                max(1600, direct_target),
+            )
         else:
-            max_direct_candidates = min(12000, max(400, direct_target))
+            max_direct_candidates = min(
+                MAX_NON_EXHAUSTIVE_DIRECT_CANDIDATES_PER_DESTINATION,
+                max(600, direct_target),
+            )
+        candidate_date_keys = tuple(
+            day.isoformat() for day in date_range(config.period_start, config.period_end)
+        )
 
         for destination in config.destinations:
             outbound_hubs, inbound_hubs = self._pick_auto_hubs(destination, config, calendars)
@@ -4121,44 +5461,57 @@ class SplitTripOptimizer:
             if not outbound_hubs or not inbound_hubs:
                 continue
 
-            origin_to_hub: dict[str, dict[str, int]] = {}
-            hub_to_origin: dict[str, dict[str, int]] = {}
-            hub_to_destination: dict[str, dict[str, int]] = {}
-            destination_to_hub: dict[str, dict[str, int]] = {}
-            hub_to_hub: dict[str, dict[str, int]] = {}
-            origin_to_destination: dict[str, dict[str, int]] = {}
-            destination_to_origin: dict[str, dict[str, int]] = {}
-            destination_distance_map: dict[str, float | None] = {}
+            origin_to_hub: dict[tuple[str, str], tuple[int | None, ...]] = {}
+            hub_to_origin: dict[tuple[str, str], tuple[int | None, ...]] = {}
+            hub_to_destination: dict[str, tuple[int | None, ...]] = {}
+            destination_to_hub: dict[str, tuple[int | None, ...]] = {}
+            hub_to_hub: dict[tuple[str, str], tuple[int | None, ...]] = {}
+            origin_to_destination: dict[tuple[str, str], tuple[int | None, ...]] = {}
+            destination_to_origin: dict[tuple[str, str], tuple[int | None, ...]] = {}
+            destination_distance_map: dict[tuple[str, str], float | None] = {}
 
             for origin in config.origins:
                 for hub in outbound_hubs:
-                    origin_to_hub[f"{origin}|{hub}"] = calendars.get((origin, hub), {})
+                    origin_to_hub[(origin, hub)] = _calendar_series_from_prices(
+                        candidate_date_keys,
+                        calendars.get((origin, hub), {}),
+                    )
             for origin in config.origins:
                 for hub in inbound_hubs:
-                    hub_to_origin[f"{hub}|{origin}"] = calendars.get((hub, origin), {})
+                    hub_to_origin[(hub, origin)] = _calendar_series_from_prices(
+                        candidate_date_keys,
+                        calendars.get((hub, origin), {}),
+                    )
             for hub in outbound_hubs:
-                hub_to_destination[hub] = calendars.get((hub, destination), {})
+                hub_to_destination[hub] = _calendar_series_from_prices(
+                    candidate_date_keys,
+                    calendars.get((hub, destination), {}),
+                )
             for hub in inbound_hubs:
-                destination_to_hub[hub] = calendars.get((destination, hub), {})
+                destination_to_hub[hub] = _calendar_series_from_prices(
+                    candidate_date_keys,
+                    calendars.get((destination, hub), {}),
+                )
             selected_hubs = list(dict.fromkeys(outbound_hubs + inbound_hubs))
             for first_hub in selected_hubs:
                 for second_hub in selected_hubs:
                     if first_hub == second_hub:
                         continue
-                    hub_to_hub[f"{first_hub}|{second_hub}"] = calendars.get(
-                        (first_hub, second_hub), {}
+                    hub_to_hub[(first_hub, second_hub)] = _calendar_series_from_prices(
+                        candidate_date_keys,
+                        calendars.get((first_hub, second_hub), {}),
                     )
 
             for origin in config.origins:
-                origin_to_destination[f"{origin}|{destination}"] = calendars.get(
-                    (origin, destination),
-                    {},
+                origin_to_destination[(origin, destination)] = _calendar_series_from_prices(
+                    candidate_date_keys,
+                    calendars.get((origin, destination), {}),
                 )
-                destination_to_origin[f"{destination}|{origin}"] = calendars.get(
-                    (destination, origin),
-                    {},
+                destination_to_origin[(destination, origin)] = _calendar_series_from_prices(
+                    candidate_date_keys,
+                    calendars.get((destination, origin), {}),
                 )
-                destination_distance_map[f"{origin}|{destination}"] = self._distance_km(
+                destination_distance_map[(origin, destination)] = self._distance_km(
                     origin,
                     destination,
                 )
@@ -4169,6 +5522,7 @@ class SplitTripOptimizer:
                     "origins": list(config.origins),
                     "outbound_hubs": outbound_hubs,
                     "inbound_hubs": inbound_hubs,
+                    "date_keys": candidate_date_keys,
                     "period_start": config.period_start.isoformat(),
                     "period_end": config.period_end.isoformat(),
                     "min_stay_days": config.min_stay_days,
@@ -4190,6 +5544,20 @@ class SplitTripOptimizer:
                 }
             )
 
+        if candidate_tasks:
+            (
+                candidate_tasks,
+                free_provider_discovery_metadata,
+                free_provider_discovery_warnings,
+            ) = await self._run_initial_free_provider_discovery(
+                search_client=search_client,
+                candidate_tasks=candidate_tasks,
+                config=config,
+                io_pool=io_pool,
+                progress=progress,
+            )
+            warnings.extend(free_provider_discovery_warnings)
+
         if progress is not None:
             progress.start_phase(
                 "candidates",
@@ -4201,6 +5569,69 @@ class SplitTripOptimizer:
             config,
             progress=progress,
         )
+        coverage_audit_estimates: dict[str, list[dict[str, Any]]] = {}
+        coverage_audit_metadata: dict[str, dict[str, Any]] = {}
+        if estimated_by_destination:
+            (
+                coverage_audit_estimates,
+                coverage_audit_metadata,
+                coverage_audit_warnings,
+            ) = await self._run_coverage_audit(
+                search_client=search_client,
+                candidate_tasks=candidate_tasks,
+                estimated_by_destination=estimated_by_destination,
+                config=config,
+                io_pool=io_pool,
+                progress=progress,
+            )
+            warnings.extend(coverage_audit_warnings)
+            for destination, audited_candidates in coverage_audit_estimates.items():
+                base_task = next(
+                    (
+                        task
+                        for task in candidate_tasks
+                        if str(task.get("destination") or "") == destination
+                    ),
+                    None,
+                )
+                if base_task is None:
+                    continue
+                audit_meta = coverage_audit_metadata.get(destination) or {}
+                finalized_base_candidates = _filter_finalized_estimated_candidates(
+                    list(estimated_by_destination.get(destination) or [])
+                )
+                finalized_audited_candidates = _filter_finalized_estimated_candidates(
+                    list(audited_candidates or [])
+                )
+                if not finalized_base_candidates and not finalized_audited_candidates:
+                    continue
+                merged_candidates = _finalize_estimated_candidates(
+                    finalized_base_candidates + finalized_audited_candidates,
+                    objective=str(base_task["objective"]),
+                    max_candidates=max(
+                        int(base_task["max_candidates"]),
+                        int(audit_meta.get("expanded_max_candidates") or 0),
+                    ),
+                    max_direct_candidates=max(
+                        int(base_task.get("max_direct_candidates") or base_task["max_candidates"]),
+                        int(audit_meta.get("expanded_direct_candidates") or 0),
+                    ),
+                )
+                estimated_by_destination[destination] = merged_candidates
+            if progress is not None and coverage_audit_metadata:
+                progress.set_runtime_data(
+                    "coverage_audit",
+                    {
+                        "destinations": list(coverage_audit_metadata.values()),
+                        "provider_ids": sorted(
+                            {
+                                provider_id
+                                for meta in coverage_audit_metadata.values()
+                                for provider_id in (meta.get("provider_ids") or [])
+                            }
+                        ),
+                    },
+                )
         if progress is not None:
             progress.complete_phase(
                 "candidates",
@@ -4276,6 +5707,8 @@ class SplitTripOptimizer:
                     origin_rank=origin_rank,
                     core_provider_ids=core_provider_ids,
                     serpapi_active=serpapi_active,
+                    audit_destinations=set(coverage_audit_metadata),
+                    audit_metadata=coverage_audit_metadata,
                 )
             )
             warnings.extend(destination_warnings)
@@ -5560,7 +6993,31 @@ class SplitTripOptimizer:
         )
 
         provider_stats = search_client.stats_snapshot()
+        provider_health = (
+            search_client.health_snapshot()
+            if hasattr(search_client, "health_snapshot")
+            else {
+                "providers": {},
+                "budget": dict(provider_stats.get("budget") or {}),
+            }
+        )
+        provider_health_entries = provider_health.get("providers") or {}
+        if progress is not None:
+            progress.set_runtime_data("provider_health", provider_health)
         provider_error_messages: list[str] = []
+        for provider_id, entry in provider_health_entries.items():
+            blocked_count = int((entry or {}).get("blocked") or 0)
+            if blocked_count <= 0:
+                continue
+            blocked_message = (
+                f"Provider {provider_id} hit anti-bot protection on {blocked_count} live checks."
+            )
+            cooldown_seconds = int((entry or {}).get("cooldown_seconds") or 0)
+            if cooldown_seconds > 0:
+                blocked_message += f" Retry in ~{cooldown_seconds}s."
+            if str((entry or {}).get("manual_search_url") or "").strip():
+                blocked_message += " Manual provider search is available from provider health."
+            provider_error_messages.append(blocked_message)
         for bucket in ("calendar_errors", "oneway_errors", "return_errors"):
             errors = provider_stats.get(bucket) or {}
             for provider_id, count in errors.items():
@@ -5586,10 +7043,19 @@ class SplitTripOptimizer:
             for provider_id, count in skipped.items():
                 if int(count) <= 0:
                     continue
-                provider_error_messages.append(
-                    f"Provider {provider_id} temporarily paused after runtime errors; "
-                    f"skipped {count} {bucket.replace('_', ' ')} checks."
+                issue_type = str(
+                    (provider_health_entries.get(provider_id) or {}).get("last_issue_type") or ""
                 )
+                if issue_type == "blocked":
+                    provider_error_messages.append(
+                        f"Provider {provider_id} temporarily paused after bot protection; "
+                        f"skipped {count} {bucket.replace('_', ' ')} checks."
+                    )
+                else:
+                    provider_error_messages.append(
+                        f"Provider {provider_id} temporarily paused after runtime errors; "
+                        f"skipped {count} {bucket.replace('_', ' ')} checks."
+                    )
         for bucket in ("calendar_no_result", "oneway_no_result", "return_no_result"):
             no_results = provider_stats.get(bucket) or {}
             for provider_id, count in no_results.items():
@@ -5698,6 +7164,9 @@ class SplitTripOptimizer:
                     "providers_used": providers_used,
                     "provider_status": provider_status,
                     "provider_stats": provider_stats,
+                    "provider_health": provider_health,
+                    "free_provider_discovery": list(free_provider_discovery_metadata.values()),
+                    "coverage_audit": list(coverage_audit_metadata.values()),
                     "max_total_provider_calls": config.max_total_provider_calls,
                     "max_calls_kiwi": config.max_calls_kiwi,
                     "max_calls_amadeus": config.max_calls_amadeus,

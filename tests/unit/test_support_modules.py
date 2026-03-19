@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import importlib
 import runpy
+import sys
 import warnings
 from datetime import date
 from pathlib import Path
+
+import pytest
 
 from src import app as app_module
 from src import config as config_module
@@ -46,15 +49,37 @@ def test_package_entrypoints_delegate_to_run_server(monkeypatch) -> None:
     calls: list[str] = []
     monkeypatch.setattr(
         "src.services.http_server.run_server",
-        lambda: calls.append("run"),
+        lambda host=None, port=None: calls.append("run"),
     )
 
     runpy.run_module("src.__main__", run_name="__main__")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
-        runpy.run_module("src.app", run_name="__main__")
+        original_argv = sys.argv[:]
+        try:
+            sys.argv = ["flightfinder-engine"]
+            with pytest.raises(SystemExit) as exc:
+                runpy.run_module("src.app", run_name="__main__")
+        finally:
+            sys.argv = original_argv
+    assert exc.value.code == 0
 
     assert calls == ["run", "run"]
+
+    cli_calls: list[tuple[str | None, int | None]] = []
+    monkeypatch.setattr(
+        app_module,
+        "run_server",
+        lambda host=None, port=None: cli_calls.append((host, port)),
+    )
+
+    assert app_module.main(["--host", "127.0.0.2", "--port", "8010"]) == 0
+    assert cli_calls == [("127.0.0.2", 8010)]
+
+    with pytest.raises(SystemExit) as exc:
+        app_module.main(["--help"])
+    assert exc.value.code == 0
+    assert cli_calls == [("127.0.0.2", 8010)]
 
 
 def test_reload_config_handles_invalid_env_values(monkeypatch) -> None:
@@ -69,11 +94,13 @@ def test_reload_config_handles_invalid_env_values(monkeypatch) -> None:
     monkeypatch.setenv("SKYSCANNER_PLAYWRIGHT_MAX_CONCURRENCY", "oops")
     monkeypatch.setenv("SKYSCANNER_PLAYWRIGHT_HOST_ATTEMPTS", "oops")
     monkeypatch.setenv("SKYSCANNER_PLAYWRIGHT_ACQUIRE_TIMEOUT_SECONDS", "oops")
+    monkeypatch.setenv("SKYSCANNER_PLAYWRIGHT_ASSIST_TIMEOUT_SECONDS", "oops")
     monkeypatch.setenv("SKYSCANNER_WAF_COOLDOWN_SECONDS", "oops")
     monkeypatch.setenv("SKYSCANNER_PLAYWRIGHT_ERROR_COOLDOWN_SECONDS", "oops")
     monkeypatch.setenv("SKYSCANNER_SCRAPE_HOSTS", "one.example, two.example ")
     monkeypatch.setenv("ALLOW_PLAYWRIGHT_PROVIDERS", "yes")
     monkeypatch.setenv("SKYSCANNER_SCRAPE_PLAYWRIGHT_FALLBACK", "yes")
+    monkeypatch.setenv("SKYSCANNER_PLAYWRIGHT_ASSISTED", "yes")
 
     reloaded = importlib.reload(config_module)
     try:
@@ -88,10 +115,12 @@ def test_reload_config_handles_invalid_env_values(monkeypatch) -> None:
         assert reloaded.SKYSCANNER_PLAYWRIGHT_MAX_CONCURRENCY == 1
         assert reloaded.SKYSCANNER_PLAYWRIGHT_HOST_ATTEMPTS == 1
         assert reloaded.SKYSCANNER_PLAYWRIGHT_ACQUIRE_TIMEOUT_SECONDS == 6.0
+        assert reloaded.SKYSCANNER_PLAYWRIGHT_ASSIST_TIMEOUT_SECONDS == 90
         assert reloaded.SKYSCANNER_WAF_COOLDOWN_SECONDS == 900
         assert reloaded.SKYSCANNER_PLAYWRIGHT_ERROR_COOLDOWN_SECONDS == 300
         assert reloaded.SKYSCANNER_SCRAPE_HOSTS == ["one.example", "two.example"]
         assert reloaded.SKYSCANNER_SCRAPE_PLAYWRIGHT_FALLBACK is True
+        assert reloaded.SKYSCANNER_PLAYWRIGHT_ASSISTED is True
     finally:
         monkeypatch.delenv("DEFAULT_SEARCH_TIMEOUT_SECONDS", raising=False)
         monkeypatch.delenv("PROVIDER_ERROR_COOLDOWN_SECONDS", raising=False)
@@ -104,11 +133,31 @@ def test_reload_config_handles_invalid_env_values(monkeypatch) -> None:
         monkeypatch.delenv("SKYSCANNER_PLAYWRIGHT_MAX_CONCURRENCY", raising=False)
         monkeypatch.delenv("SKYSCANNER_PLAYWRIGHT_HOST_ATTEMPTS", raising=False)
         monkeypatch.delenv("SKYSCANNER_PLAYWRIGHT_ACQUIRE_TIMEOUT_SECONDS", raising=False)
+        monkeypatch.delenv("SKYSCANNER_PLAYWRIGHT_ASSIST_TIMEOUT_SECONDS", raising=False)
         monkeypatch.delenv("SKYSCANNER_WAF_COOLDOWN_SECONDS", raising=False)
         monkeypatch.delenv("SKYSCANNER_PLAYWRIGHT_ERROR_COOLDOWN_SECONDS", raising=False)
         monkeypatch.delenv("SKYSCANNER_SCRAPE_HOSTS", raising=False)
         monkeypatch.delenv("ALLOW_PLAYWRIGHT_PROVIDERS", raising=False)
         monkeypatch.delenv("SKYSCANNER_SCRAPE_PLAYWRIGHT_FALLBACK", raising=False)
+        monkeypatch.delenv("SKYSCANNER_PLAYWRIGHT_ASSISTED", raising=False)
+        importlib.reload(config_module)
+
+
+def test_skyscanner_playwright_fallback_defaults_on_when_playwright_is_allowed(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("ALLOW_PLAYWRIGHT_PROVIDERS", "yes")
+    monkeypatch.delenv("SKYSCANNER_SCRAPE_PLAYWRIGHT_FALLBACK", raising=False)
+
+    reloaded = importlib.reload(config_module)
+    try:
+        assert reloaded.ALLOW_PLAYWRIGHT_PROVIDERS is True
+        assert reloaded.SKYSCANNER_SCRAPE_PLAYWRIGHT_FALLBACK is True
+        assert reloaded.SKYSCANNER_PLAYWRIGHT_ASSISTED is False
+    finally:
+        monkeypatch.delenv("ALLOW_PLAYWRIGHT_PROVIDERS", raising=False)
+        monkeypatch.delenv("SKYSCANNER_SCRAPE_PLAYWRIGHT_FALLBACK", raising=False)
+        monkeypatch.delenv("SKYSCANNER_PLAYWRIGHT_ASSISTED", raising=False)
         importlib.reload(config_module)
 
 

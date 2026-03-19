@@ -5,14 +5,18 @@ import re
 from typing import Any
 
 from ..config import ALLOW_PLAYWRIGHT_PROVIDERS
-from ..exceptions import ProviderNoResultError
+from ..exceptions import ProviderBlockedError, ProviderNoResultError
 from ..utils import (
     build_comparison_links,
     parse_duration_text_seconds,
     parse_google_flights_text_datetime,
     parse_money_amount_int,
 )
-from ..utils.constants import PRICE_SENTINEL
+from ..utils.constants import (
+    GOOGLE_FLIGHTS_CONSENT_MARKER,
+    GOOGLE_FLIGHTS_IMPERSONATE_PROFILE,
+    PRICE_SENTINEL,
+)
 from ._cache import per_instance_lru_cache
 
 
@@ -26,6 +30,16 @@ class GoogleFlightsLocalClient:
     credential_env: tuple[str, ...] = ()
     docs_url = "https://www.google.com/travel/flights"
     default_enabled = True
+
+    @staticmethod
+    def _local_mode_setup_hint() -> str:
+        """Return setup guidance for the Playwright-backed Google Flights path."""
+        return (
+            "Install Playwright (`python3 -m pip install playwright` and "
+            "`python3 -m playwright install chromium`) and restart with "
+            "`ALLOW_PLAYWRIGHT_PROVIDERS=1` or "
+            "`scripts/restart_server.ps1 -AllowPlaywright` to use Google Flights local mode."
+        )
 
     def __init__(
         self,
@@ -61,10 +75,29 @@ class GoogleFlightsLocalClient:
             return self._fast_flights_available
         self._fast_flights_loaded = True
         try:
+            import fast_flights.core as fast_flights_core
             from fast_flights import FlightData as FF_FlightData
             from fast_flights import Passengers as FF_Passengers
             from fast_flights import get_flights as ff_get_flights
+            from primp import Client as PrimpClient
 
+            def _patched_fetch(params: dict[str, Any]) -> Any:
+                client = PrimpClient(
+                    impersonate=GOOGLE_FLIGHTS_IMPERSONATE_PROFILE,
+                    verify=False,
+                    headers={"Accept-Language": "en-US,en;q=0.9"},
+                )
+                response = client.get("https://www.google.com/travel/flights", params=params)
+                response_text = str(
+                    getattr(response, "text_markdown", None) or getattr(response, "text", "") or ""
+                )
+                if response.status_code != 200:
+                    raise AssertionError(f"{response.status_code} Result: {response_text}")
+                if GOOGLE_FLIGHTS_CONSENT_MARKER in response_text:
+                    raise RuntimeError("Google Flights returned a consent page instead of fares.")
+                return response
+
+            fast_flights_core.fetch = _patched_fetch
             self._FlightData = FF_FlightData
             self._Passengers = FF_Passengers
             self._get_flights_fn = ff_get_flights
@@ -85,6 +118,36 @@ class GoogleFlightsLocalClient:
                 )
         return self._fast_flights_available
 
+    def _fetch_mode_ready(self, fetch_mode: str) -> bool:
+        """Return whether the requested fetch mode is ready for use.
+
+        Args:
+            fetch_mode: Fetch strategy to use for the provider request.
+
+        Returns:
+            bool: True when the requested mode is ready; otherwise, False.
+        """
+        if not self._ensure_fast_flights():
+            return False
+        normalized_mode = str(fetch_mode or "common").strip().lower()
+        if normalized_mode != "local":
+            return True
+        if not ALLOW_PLAYWRIGHT_PROVIDERS:
+            self._fast_flights_error = (
+                "Google Flights local mode requires ALLOW_PLAYWRIGHT_PROVIDERS=1."
+            )
+            return False
+        try:
+            import playwright.async_api  # noqa: F401
+        except Exception as exc:
+            self._fast_flights_error = (
+                "playwright is required for local Google Flights mode "
+                f"(install with `python3 -m pip install playwright` and "
+                f"`python3 -m playwright install chromium`): {exc}"
+            )
+            return False
+        return True
+
     def is_configured(self) -> bool:
         """Return whether the client is configured for use.
 
@@ -101,6 +164,8 @@ class GoogleFlightsLocalClient:
         """
         if self._ensure_fast_flights():
             return None
+        if "playwright is required" in str(self._fast_flights_error or "").lower():
+            return self._local_mode_setup_hint()
         return "Install fast-flights to enable Google Flights."
 
     @staticmethod
@@ -220,6 +285,29 @@ class GoogleFlightsLocalClient:
             int(candidate.get("duration_seconds") or PRICE_SENTINEL),
         )
 
+    @staticmethod
+    def _manual_search_url(
+        *,
+        source: str,
+        destination: str,
+        outbound_iso: str,
+        inbound_iso: str | None,
+        currency: str,
+        adults: int,
+        max_stops_per_leg: int,
+    ) -> str | None:
+        """Build the Google Flights manual search URL for the current query."""
+        comparison_links = build_comparison_links(
+            source,
+            destination,
+            outbound_iso,
+            inbound_iso or outbound_iso,
+            adults=adults,
+            max_stops_per_leg=max_stops_per_leg,
+            currency=currency,
+        )
+        return str(comparison_links.get("google_flights") or "").strip() or None
+
     def _fetch_flights(
         self,
         *,
@@ -229,6 +317,7 @@ class GoogleFlightsLocalClient:
         currency: str,
         adults: int,
         max_stops_per_leg: int,
+        manual_search_url: str | None = None,
     ) -> list[Any]:
         """Fetch flight options from the provider backend.
 
@@ -248,6 +337,86 @@ class GoogleFlightsLocalClient:
                 "Google Flights provider is not ready. "
                 + (self._fast_flights_error or "fast-flights is unavailable.")
             )
+        candidate_modes = [self._fetch_mode]
+        if self._fetch_mode == "common" and ALLOW_PLAYWRIGHT_PROVIDERS:
+            candidate_modes.append("local")
+        elif self._fetch_mode == "local":
+            candidate_modes.append("common")
+
+        last_error: Exception | None = None
+        unavailable_modes: dict[str, str] = {}
+        seen_modes: set[str] = set()
+        for fetch_mode in candidate_modes:
+            normalized_mode = str(fetch_mode or "common").strip().lower()
+            if normalized_mode in seen_modes:
+                continue
+            seen_modes.add(normalized_mode)
+            if not self._fetch_mode_ready(normalized_mode):
+                reason = str(self._fast_flights_error or "").strip()
+                if reason:
+                    unavailable_modes[normalized_mode] = reason
+                continue
+            try:
+                return self._fetch_flights_for_mode(
+                    source=source,
+                    destination=destination,
+                    date_iso=date_iso,
+                    currency=currency,
+                    adults=adults,
+                    max_stops_per_leg=max_stops_per_leg,
+                    fetch_mode=normalized_mode,
+                    manual_search_url=manual_search_url,
+                )
+            except ProviderNoResultError as exc:
+                last_error = exc
+                continue
+            except RuntimeError as exc:
+                last_error = exc
+                continue
+        if last_error is not None:
+            if unavailable_modes and isinstance(last_error, ProviderBlockedError):
+                skipped_summary = "; ".join(
+                    f"{mode}: {reason}" for mode, reason in unavailable_modes.items()
+                )
+                raise ProviderBlockedError(
+                    f"{last_error} Browser-backed fallback unavailable ({skipped_summary}).",
+                    manual_search_url=last_error.manual_search_url,
+                    cooldown_seconds=last_error.cooldown_seconds,
+                ) from last_error
+            raise last_error
+        if unavailable_modes:
+            skipped_summary = "; ".join(
+                f"{mode}: {reason}" for mode, reason in unavailable_modes.items()
+            )
+            raise RuntimeError(f"Google Flights provider is not ready. {skipped_summary}")
+        raise ProviderNoResultError("Google Flights returned no offers for this query.")
+
+    def _fetch_flights_for_mode(
+        self,
+        *,
+        source: str,
+        destination: str,
+        date_iso: str,
+        currency: str,
+        adults: int,
+        max_stops_per_leg: int,
+        fetch_mode: str,
+        manual_search_url: str | None = None,
+    ) -> list[Any]:
+        """Fetch flight options for a specific Google Flights fetch mode.
+
+        Args:
+            source: Origin airport code for the request.
+            destination: Destination airport code for the request.
+            date_iso: Travel date in ISO 8601 format.
+            currency: Currency code for pricing output.
+            adults: Number of adult travelers.
+            max_stops_per_leg: Max stops per leg.
+            fetch_mode: Fetch strategy to use for the provider request.
+
+        Returns:
+            list[Any]: Flight options returned by the provider backend.
+        """
         flight_data = [
             self._FlightData(
                 date=date_iso,
@@ -263,13 +432,18 @@ class GoogleFlightsLocalClient:
                 trip="one-way",
                 passengers=passengers,
                 seat="economy",
-                fetch_mode=self._fetch_mode,
+                fetch_mode=fetch_mode,
                 max_stops=max(0, int(max_stops_per_leg)),
             )
         except RuntimeError as exc:
             message = str(exc)
             lowered = message.lower()
-            if "no flights found" in lowered or "before you continue" in lowered:
+            if "before you continue" in lowered or "consent page" in lowered:
+                raise ProviderBlockedError(
+                    "Google Flights returned a consent or challenge page instead of fares.",
+                    manual_search_url=manual_search_url,
+                ) from exc
+            if "no flights found" in lowered:
                 raise ProviderNoResultError(
                     "Google Flights returned no offers for this query."
                 ) from exc
@@ -345,16 +519,15 @@ class GoogleFlightsLocalClient:
             return None
         source_code = source.upper()
         destination_code = destination.upper()
-        comparison_links = build_comparison_links(
-            source_code,
-            destination_code,
-            departure_iso,
-            departure_iso,
+        booking_url = self._manual_search_url(
+            source=source_code,
+            destination=destination_code,
+            outbound_iso=departure_iso,
+            inbound_iso=None,
+            currency=currency,
             adults=adults,
             max_stops_per_leg=max_stops_per_leg,
-            currency=currency,
         )
-        booking_url = comparison_links.get("google_flights")
         flights = self._fetch_flights(
             source=source_code,
             destination=destination_code,
@@ -362,6 +535,7 @@ class GoogleFlightsLocalClient:
             currency=currency,
             adults=adults,
             max_stops_per_leg=max_stops_per_leg,
+            manual_search_url=booking_url,
         )
         best: dict[str, Any] | None = None
         for flight in flights:
@@ -413,41 +587,47 @@ class GoogleFlightsLocalClient:
         """
         if not self.is_configured():
             return None
-        outbound = self.get_best_oneway(
-            source=source,
-            destination=destination,
-            departure_iso=outbound_iso,
+        booking_url = self._manual_search_url(
+            source=source.upper(),
+            destination=destination.upper(),
+            outbound_iso=outbound_iso,
+            inbound_iso=inbound_iso,
             currency=currency,
-            max_stops_per_leg=max_stops_per_leg,
             adults=adults,
-            hand_bags=hand_bags,
-            hold_bags=hold_bags,
-            max_connection_layover_seconds=max_connection_layover_seconds,
-        )
-        inbound = self.get_best_oneway(
-            source=destination,
-            destination=source,
-            departure_iso=inbound_iso,
-            currency=currency,
             max_stops_per_leg=max_stops_per_leg,
-            adults=adults,
-            hand_bags=hand_bags,
-            hold_bags=hold_bags,
-            max_connection_layover_seconds=max_connection_layover_seconds,
         )
+        try:
+            outbound = self.get_best_oneway(
+                source=source,
+                destination=destination,
+                departure_iso=outbound_iso,
+                currency=currency,
+                max_stops_per_leg=max_stops_per_leg,
+                adults=adults,
+                hand_bags=hand_bags,
+                hold_bags=hold_bags,
+                max_connection_layover_seconds=max_connection_layover_seconds,
+            )
+            inbound = self.get_best_oneway(
+                source=destination,
+                destination=source,
+                departure_iso=inbound_iso,
+                currency=currency,
+                max_stops_per_leg=max_stops_per_leg,
+                adults=adults,
+                hand_bags=hand_bags,
+                hold_bags=hold_bags,
+                max_connection_layover_seconds=max_connection_layover_seconds,
+            )
+        except ProviderBlockedError as exc:
+            raise ProviderBlockedError(
+                str(exc),
+                manual_search_url=booking_url or exc.manual_search_url,
+                cooldown_seconds=exc.cooldown_seconds,
+            ) from exc
         if not outbound or not inbound:
             return None
         total_price = int(outbound["price"]) + int(inbound["price"])
-        comparison_links = build_comparison_links(
-            source,
-            destination,
-            outbound_iso,
-            inbound_iso,
-            adults=adults,
-            max_stops_per_leg=max_stops_per_leg,
-            currency=currency,
-        )
-        booking_url = comparison_links.get("google_flights")
         outbound_duration_seconds = outbound.get("duration_seconds")
         inbound_duration_seconds = inbound.get("duration_seconds")
         total_duration_seconds = (

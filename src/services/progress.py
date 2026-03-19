@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import datetime as dt
 import threading
 import time
@@ -68,6 +69,7 @@ class SearchProgressTracker:
         }
         self._phase_log_buckets = {name: -1 for name in _PHASE_META}
         self._events: list[dict[str, Any]] = []
+        self._runtime_data: dict[str, Any] = {}
         self._append_event_locked(SEARCH_EVENT_QUEUED)
 
     def mark_running(self, detail: str | None = None) -> None:
@@ -219,6 +221,36 @@ class SearchProgressTracker:
             self.updated_at = time.time()
             self._append_event_locked(message, phase=phase)
 
+    def set_runtime_data(self, key: str, value: Any) -> None:
+        """Store an auxiliary runtime payload for polling clients.
+
+        Args:
+            key: Metadata key to update.
+            value: Serializable value to expose in snapshots.
+        """
+        normalized_key = str(key or "").strip()
+        if not normalized_key:
+            return
+        with self._lock:
+            self._runtime_data[normalized_key] = copy.deepcopy(value)
+            self.updated_at = time.time()
+
+    def update_runtime_data(self, values: dict[str, Any]) -> None:
+        """Merge auxiliary runtime payloads for polling clients.
+
+        Args:
+            values: Serializable key-value payload to expose in snapshots.
+        """
+        if not isinstance(values, dict):
+            return
+        with self._lock:
+            for key, value in values.items():
+                normalized_key = str(key or "").strip()
+                if not normalized_key:
+                    continue
+                self._runtime_data[normalized_key] = copy.deepcopy(value)
+            self.updated_at = time.time()
+
     def mark_completed(self, *, result_count: int | None = None) -> None:
         """Mark the search as completed.
 
@@ -297,6 +329,9 @@ class SearchProgressTracker:
                 "events_start_index": event_start_index,
                 "next_event_index": len(self._events),
                 "events": list(self._events[event_start_index:]),
+                "runtime_data": copy.deepcopy(self._runtime_data),
+                "provider_health": copy.deepcopy(self._runtime_data.get("provider_health")),
+                "coverage_audit": copy.deepcopy(self._runtime_data.get("coverage_audit")),
             }
 
     def _estimate_eta_locked(

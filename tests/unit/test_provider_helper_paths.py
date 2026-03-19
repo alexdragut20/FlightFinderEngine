@@ -10,10 +10,11 @@ from types import SimpleNamespace
 import pytest
 import requests
 
-from src.exceptions import ProviderNoResultError
+from src.exceptions import ProviderBlockedError, ProviderNoResultError
+from src.providers import google_flights as google_flights_module
 from src.providers.amadeus import AmadeusClient
 from src.providers.google_flights import GoogleFlightsLocalClient
-from src.providers.kayak import KayakScrapeClient
+from src.providers.kayak import KayakScrapeClient, MomondoScrapeClient
 from src.providers.serpapi import SerpApiGoogleFlightsClient
 from src.providers.skyscanner import SkyscannerScrapeClient
 from src.services.progress import SearchProgressTracker
@@ -199,6 +200,116 @@ def test_google_flights_helper_paths_cover_error_and_candidate_filters(monkeypat
             max_stops_per_leg=1,
         )
 
+    monkeypatch.setattr(client, "_ensure_fast_flights", lambda: False)
+    assert client._fetch_mode_ready("common") is False
+
+    local_gate_client = GoogleFlightsLocalClient(fetch_mode="local")
+    monkeypatch.setattr(local_gate_client, "_ensure_fast_flights", lambda: True)
+    monkeypatch.setattr(google_flights_module, "ALLOW_PLAYWRIGHT_PROVIDERS", False)
+    assert local_gate_client._fetch_mode_ready("local") is False
+    assert "ALLOW_PLAYWRIGHT_PROVIDERS=1" in local_gate_client._fast_flights_error
+
+    playwright_client = GoogleFlightsLocalClient(fetch_mode="local")
+    monkeypatch.setattr(playwright_client, "_ensure_fast_flights", lambda: True)
+    monkeypatch.setattr(google_flights_module, "ALLOW_PLAYWRIGHT_PROVIDERS", True)
+    original_import = builtins.__import__
+
+    def fake_import(name: str, *args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        if name == "playwright.async_api":
+            raise ImportError("playwright missing")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    assert playwright_client._fetch_mode_ready("local") is False
+    assert "playwright is required" in playwright_client._fast_flights_error
+
+    ready_local_client = GoogleFlightsLocalClient(fetch_mode="local")
+    monkeypatch.setattr(ready_local_client, "_ensure_fast_flights", lambda: True)
+
+    def fake_import_success(name: str, *args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        if name == "playwright.async_api":
+            return object()
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import_success)
+    assert ready_local_client._fetch_mode_ready("local") is True
+
+    fallback_client = GoogleFlightsLocalClient(fetch_mode="common")
+    monkeypatch.setattr(fallback_client, "_ensure_fast_flights", lambda: True)
+    monkeypatch.setattr(google_flights_module, "ALLOW_PLAYWRIGHT_PROVIDERS", True)
+    tried_modes: list[str] = []
+    monkeypatch.setattr(
+        fallback_client,
+        "_fetch_mode_ready",
+        lambda fetch_mode: fetch_mode == "common",
+    )
+    monkeypatch.setattr(
+        fallback_client,
+        "_fetch_flights_for_mode",
+        lambda **kwargs: (
+            tried_modes.append(str(kwargs["fetch_mode"]))
+            or [SimpleNamespace(price=100, stops=0, duration="2h", name="Carrier")]
+        ),
+    )
+    assert (
+        len(
+            fallback_client._fetch_flights(
+                source="OTP",
+                destination="BKK",
+                date_iso="2026-04-25",
+                currency="RON",
+                adults=1,
+                max_stops_per_leg=1,
+            )
+        )
+        == 1
+    )
+    assert tried_modes == ["common"]
+
+    local_fallback_client = GoogleFlightsLocalClient(fetch_mode="local")
+    monkeypatch.setattr(local_fallback_client, "_ensure_fast_flights", lambda: True)
+    local_tried_modes: list[str] = []
+    monkeypatch.setattr(
+        local_fallback_client,
+        "_fetch_mode_ready",
+        lambda fetch_mode: fetch_mode == "common",
+    )
+    monkeypatch.setattr(
+        local_fallback_client,
+        "_fetch_flights_for_mode",
+        lambda **kwargs: (
+            local_tried_modes.append(str(kwargs["fetch_mode"]))
+            or [SimpleNamespace(price=100, stops=0, duration="2h", name="Carrier")]
+        ),
+    )
+    assert (
+        len(
+            local_fallback_client._fetch_flights(
+                source="OTP",
+                destination="BKK",
+                date_iso="2026-04-25",
+                currency="RON",
+                adults=1,
+                max_stops_per_leg=1,
+            )
+        )
+        == 1
+    )
+    assert local_tried_modes == ["common"]
+
+    no_mode_client = GoogleFlightsLocalClient(fetch_mode="common")
+    monkeypatch.setattr(no_mode_client, "_ensure_fast_flights", lambda: True)
+    monkeypatch.setattr(no_mode_client, "_fetch_mode_ready", lambda _mode: False)
+    with pytest.raises(ProviderNoResultError):
+        no_mode_client._fetch_flights(
+            source="OTP",
+            destination="BKK",
+            date_iso="2026-04-25",
+            currency="RON",
+            adults=1,
+            max_stops_per_leg=1,
+        )
+
     monkeypatch.setattr(client, "is_configured", lambda: False)
     assert (
         client.get_best_return(
@@ -309,7 +420,9 @@ def test_serpapi_helper_paths_cover_payload_parsing_and_errors(monkeypatch) -> N
 
 def test_kayak_helper_paths_cover_bootstrap_polling_and_static_helpers(monkeypatch) -> None:
     client = KayakScrapeClient(host="www.kayak.com", poll_rounds=2)
+    momondo = MomondoScrapeClient(host="www.momondo.com", poll_rounds=2)
     assert "www.kayak.com" in client._search_page_url("otp", "mga", "2026-03-10", None, "eur", 2)
+    assert "/flight-search/" in momondo._search_page_url("otp", "mga", "2026-03-10", None, "eur", 2)
     assert len(client._build_legs_payload("otp", "mga", "2026-03-10", "2026-03-24")) == 2
     assert KayakScrapeClient._safe_json_from_response(_FakeResponse(ValueError("bad"))) == {}
     assert (
@@ -326,9 +439,15 @@ def test_kayak_helper_paths_cover_bootstrap_polling_and_static_helpers(monkeypat
     assert KayakScrapeClient._booking_price_per_person_flag({"priceMode": "perPassenger"}) is True
     assert KayakScrapeClient._booking_price_per_person_flag({"priceMode": "total"}) is False
     assert KayakScrapeClient._booking_price_per_person_flag({"nested": {"perPerson": True}}) is True
+    assert client._is_blocked_page("Verify you are human", "https://www.kayak.com", 200) is True
 
     with pytest.raises(RuntimeError, match="missing"):
         client._extract_bootstrap("<html></html>")
+    with pytest.raises(ProviderBlockedError, match="blocked automated scraping"):
+        client._extract_bootstrap(
+            "<html><body>Verify you are human</body></html>",
+            manual_search_url="https://www.kayak.com/flights/OTP-MGA/2026-03-10",
+        )
     with pytest.raises(RuntimeError, match="parse failed"):
         client._extract_bootstrap('<script id="jsonData_R9DataStorage">{bad}</script>')
     with pytest.raises(RuntimeError, match="formtoken is missing"):
@@ -361,6 +480,21 @@ def test_kayak_helper_paths_cover_bootstrap_polling_and_static_helpers(monkeypat
     monkeypatch.setattr(client, "_post_poll", lambda **kwargs: next(polls))
     payload = client._search_payload("OTP", "MGA", "2026-03-10", None, "RON", 2)
     assert payload["status"] == "complete"
+
+    blocked_session = _FakeSession(
+        get_responses=[
+            _FakeResponse(
+                {},
+                text="<html><body>Verify you are human</body></html>",
+                status_code=403,
+                url="https://www.kayak.com/captcha",
+            )
+        ]
+    )
+    monkeypatch.setattr(client, "_session", lambda: blocked_session)
+    with pytest.raises(ProviderBlockedError, match="blocked automated scraping") as blocked_exc:
+        client._search_payload("OTP", "MGA", "2026-03-10", None, "RON", 2)
+    assert blocked_exc.value.manual_search_url == "https://www.kayak.com/captcha"
 
     result = {
         "bookingOptions": [{"displayPrice": {"price": "100", "currency": "USD"}}],
@@ -417,6 +551,22 @@ def test_kayak_helper_paths_cover_bootstrap_polling_and_static_helpers(monkeypat
     with pytest.raises(ProviderNoResultError):
         client._post_poll("https://www.kayak.com", "csrf", {"legs": []})
 
+    blocked_session = _FakeSession(
+        post_responses=[
+            _FakeResponse(
+                {"errors": [{"code": "CAPTCHA_REQUIRED", "description": "Verify you are human"}]},
+                status_code=429,
+                text='{"errors":[{"code":"CAPTCHA_REQUIRED","description":"Verify you are human"}]}',
+            )
+        ]
+    )
+    monkeypatch.setattr(client, "_session", lambda: blocked_session)
+    with pytest.raises(ProviderBlockedError, match="blocked automated scraping") as blocked_poll:
+        client._post_poll("https://www.kayak.com/flights/OTP-MGA/2026-03-10", "csrf", {"legs": []})
+    assert (
+        blocked_poll.value.manual_search_url == "https://www.kayak.com/flights/OTP-MGA/2026-03-10"
+    )
+
 
 def test_skyscanner_helper_paths_cover_regex_and_runtime_errors(monkeypatch) -> None:
     client = SkyscannerScrapeClient(
@@ -470,6 +620,70 @@ def test_skyscanner_helper_paths_cover_regex_and_runtime_errors(monkeypatch) -> 
     )
     with pytest.raises(ProviderNoResultError):
         client.get_best_oneway("OTP", "MGA", "2026-03-10", "RON", 1, 1, 0, 0)
+
+    placeholder_client = SkyscannerScrapeClient(
+        host="www.skyscanner.com",
+        host_candidates=["www.skyscanner.net"],
+        http_retries=1,
+        playwright_fallback=False,
+    )
+    http_attempts: list[str] = []
+
+    def fake_placeholder_then_valid(
+        url: str,
+        attempt_idx: int = 0,
+    ) -> tuple[str, str, int]:
+        http_attempts.append(url)
+        if len(http_attempts) == 1:
+            return "<html><body><div id='__next'>Loading fares...</div></body></html>", url, 200
+        return '{"providerName":"OTA","rawPrice":222}', url, 200
+
+    monkeypatch.setattr(
+        placeholder_client,
+        "_http_fetch_search_html",
+        fake_placeholder_then_valid,
+    )
+    html, final_url = placeholder_client._fetch_search_html(
+        "https://www.skyscanner.com/transport/flights/otp/mga/20260310"
+    )
+    assert '"rawPrice":222' in html
+    assert final_url.startswith("https://www.skyscanner.net/")
+
+    cooldown_client = SkyscannerScrapeClient(
+        host="www.skyscanner.com",
+        host_candidates=["www.skyscanner.net"],
+        http_retries=1,
+        playwright_fallback=False,
+    )
+    monkeypatch.setattr(cooldown_client, "_provider_cooldown_remaining_seconds", lambda: 11)
+    with pytest.raises(ProviderBlockedError, match="retry in ~11s") as cooldown_exc:
+        cooldown_client._fetch_search_html(
+            "https://www.skyscanner.com/transport/flights/otp/mga/20260310"
+        )
+    assert (
+        cooldown_exc.value.manual_search_url
+        == "https://www.skyscanner.com/transport/flights/otp/mga/20260310"
+    )
+    assert cooldown_exc.value.cooldown_seconds == 11
+
+    monkeypatch.setattr(cooldown_client, "_provider_cooldown_remaining_seconds", lambda: 0)
+    monkeypatch.setattr(
+        cooldown_client,
+        "_http_fetch_search_html",
+        lambda url, attempt_idx=0: (
+            "<html><body>Verify you are human</body></html>",
+            url,
+            200,
+        ),
+    )
+    with pytest.raises(ProviderBlockedError, match="blocked automated scraping") as blocked_exc:
+        cooldown_client._fetch_search_html(
+            "https://www.skyscanner.com/transport/flights/otp/mga/20260310"
+        )
+    assert (
+        blocked_exc.value.manual_search_url
+        == "https://www.skyscanner.com/transport/flights/otp/mga/20260310"
+    )
 
     monkeypatch.setattr(
         client,
@@ -536,6 +750,51 @@ def test_skyscanner_playwright_runtime_paths_cover_gate_cooldown_and_shutdown(
     SkyscannerScrapeClient._close_playwright_runtime()
     assert browser.closed is True
     assert playwright.stopped is True
+
+
+def test_skyscanner_playwright_assisted_paths_cover_manual_browser_fallback(monkeypatch) -> None:
+    client = SkyscannerScrapeClient(
+        host="www.skyscanner.com",
+        host_candidates=["www.skyscanner.net"],
+        http_retries=1,
+        playwright_fallback=True,
+        playwright_assisted=True,
+    )
+    monkeypatch.setattr(client, "_provider_cooldown_remaining_seconds", lambda: 0)
+    monkeypatch.setattr(
+        client,
+        "_http_fetch_search_html",
+        lambda url, attempt_idx=0: ("server error", url, 500),
+    )
+    monkeypatch.setattr(
+        client,
+        "_fetch_search_html_playwright",
+        lambda url: ("captcha blocked", url),
+    )
+    monkeypatch.setattr(
+        client,
+        "_fetch_search_html_playwright_assisted",
+        lambda url: ('{"providerName":"OTA","rawPrice":210}', "https://www.skyscanner.com/final"),
+    )
+    html, final_url = client._fetch_search_html("https://www.skyscanner.com/path")
+    assert '"rawPrice":210' in html
+    assert final_url == "https://www.skyscanner.com/final"
+
+    monkeypatch.setattr(
+        client,
+        "_fetch_search_html_playwright_assisted",
+        lambda url: (_ for _ in ()).throw(
+            ProviderBlockedError(
+                "Skyscanner browser-assisted mode needs you to complete the visible verification window, then rerun the search.",
+                manual_search_url=url,
+            )
+        ),
+    )
+    with pytest.raises(
+        ProviderBlockedError,
+        match="browser-assisted mode needs you to complete the visible verification window",
+    ):
+        client._fetch_search_html("https://www.skyscanner.com/path")
 
 
 def test_kayak_helper_paths_cover_session_poll_errors_and_result_selection(monkeypatch) -> None:
@@ -1063,7 +1322,11 @@ def test_kayak_client_remaining_edge_paths_cover_search_payload_and_filtering(mo
         get_responses=[_FakeResponse({}, text="<html></html>", url="https://www.kayak.com/flights")]
     )
     monkeypatch.setattr(search_client, "_session", lambda: search_session)
-    monkeypatch.setattr(search_client, "_extract_bootstrap", lambda _html: ("csrf", {}))
+    monkeypatch.setattr(
+        search_client,
+        "_extract_bootstrap",
+        lambda _html, manual_search_url=None: ("csrf", {}),
+    )
     monkeypatch.setattr(search_client, "_post_poll", lambda **_kwargs: {"status": "pending"})
     assert search_client._search_payload(
         source="OTP",
@@ -1409,6 +1672,23 @@ def test_skyscanner_client_remaining_edge_paths_cover_offer_parsing_and_selectio
     monkeypatch.setattr(
         client,
         "_http_fetch_search_html",
+        lambda url, attempt_idx=0: (
+            "<html><body><div id='__next'>Loading</div></body></html>",
+            url,
+            200,
+        ),
+    )
+    monkeypatch.setattr(
+        client,
+        "_fetch_search_html_playwright",
+        lambda url: ("<html><body><div id='__next'>Loading</div></body></html>", url),
+    )
+    with pytest.raises(ProviderNoResultError, match="without fare data"):
+        client._fetch_search_html("https://www.skyscanner.com/path")
+
+    monkeypatch.setattr(
+        client,
+        "_http_fetch_search_html",
         lambda url, attempt_idx=0: ("captcha blocked", url, 403),
     )
     monkeypatch.setattr(
@@ -1605,6 +1885,7 @@ def test_google_and_amadeus_helper_paths_cover_runtime_caching_and_tiebreaks(
     if local_google_client._fetch_mode == "local":
         assert local_google_client._ensure_fast_flights() is False
         assert "playwright is required" in local_google_client._fast_flights_error
+        assert "Install Playwright" in local_google_client.configuration_hint()
     else:
         assert local_google_client._ensure_fast_flights() is True
 
@@ -1880,6 +2161,56 @@ def test_google_flights_client_remaining_edge_paths_cover_runtime_and_return_log
             adults=1,
             max_stops_per_leg=1,
         )
+
+    client._get_flights_fn = lambda **kwargs: (_ for _ in ()).throw(
+        RuntimeError("Before you continue to Google Flights")
+    )
+    with pytest.raises(ProviderBlockedError, match="consent or challenge page") as blocked_exc:
+        client._fetch_flights(
+            source="OTP",
+            destination="MGA",
+            date_iso="2026-03-10",
+            currency="RON",
+            adults=1,
+            max_stops_per_leg=1,
+            manual_search_url="https://www.google.com/travel/flights",
+        )
+    assert blocked_exc.value.manual_search_url == "https://www.google.com/travel/flights"
+
+    fallback_client = GoogleFlightsLocalClient(fetch_mode="common")
+    monkeypatch.setattr("src.providers.google_flights.ALLOW_PLAYWRIGHT_PROVIDERS", True)
+    monkeypatch.setattr(fallback_client, "_ensure_fast_flights", lambda: True)
+
+    def fake_fetch_mode_ready(fetch_mode: str) -> bool:
+        if fetch_mode == "local":
+            fallback_client._fast_flights_error = "playwright missing"
+            return False
+        return True
+
+    monkeypatch.setattr(fallback_client, "_fetch_mode_ready", fake_fetch_mode_ready)
+    monkeypatch.setattr(
+        fallback_client,
+        "_fetch_flights_for_mode",
+        lambda **kwargs: (_ for _ in ()).throw(
+            ProviderBlockedError(
+                "Google Flights returned a consent or challenge page instead of fares.",
+                manual_search_url="https://www.google.com/travel/flights",
+            )
+        ),
+    )
+    with pytest.raises(
+        ProviderBlockedError, match="Browser-backed fallback unavailable"
+    ) as fallback_exc:
+        fallback_client._fetch_flights(
+            source="OTP",
+            destination="MGA",
+            date_iso="2026-03-10",
+            currency="RON",
+            adults=1,
+            max_stops_per_leg=1,
+            manual_search_url="https://www.google.com/travel/flights",
+        )
+    assert fallback_exc.value.manual_search_url == "https://www.google.com/travel/flights"
 
     client._get_flights_fn = lambda **kwargs: (_ for _ in ()).throw(AssertionError("assertion"))
     with pytest.raises(RuntimeError, match="Google Flights request failed: assertion"):
