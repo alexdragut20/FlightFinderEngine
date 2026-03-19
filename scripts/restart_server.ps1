@@ -57,8 +57,9 @@ $StdOutLog = Join-Path $LogsDir "server.out"
 $StdErrLog = Join-Path $LogsDir "server.err"
 $AllowPlaywrightValue = if ($AllowPlaywright) { "1" } else { "0" }
 $GoogleFlightsFetchModeValue = if ($AllowPlaywright) { "local" } else { "common" }
+$KayakPlaywrightAssistedValue = if ($AllowPlaywright) { "1" } else { "0" }
 $SkyscannerPlaywrightFallbackValue = if ($AllowPlaywright) { "1" } else { "0" }
-$SkyscannerPlaywrightAssistedValue = if ($AllowPlaywright -and $AssistSkyscanner) { "1" } else { "0" }
+$SkyscannerPlaywrightAssistedValue = if ($AllowPlaywright) { "1" } else { "0" }
 
 function Write-Section {
     param([string]$Title)
@@ -244,6 +245,7 @@ Write-Host "Host: $BindHost"
 Write-Host "Port: $Port"
 Write-Host "ALLOW_PLAYWRIGHT_PROVIDERS=$AllowPlaywrightValue"
 Write-Host "GOOGLE_FLIGHTS_FETCH_MODE=$GoogleFlightsFetchModeValue"
+Write-Host "KAYAK_SCRAPE_PLAYWRIGHT_ASSISTED=$KayakPlaywrightAssistedValue"
 Write-Host "SKYSCANNER_SCRAPE_PLAYWRIGHT_FALLBACK=$SkyscannerPlaywrightFallbackValue"
 Write-Host "SKYSCANNER_PLAYWRIGHT_ASSISTED=$SkyscannerPlaywrightAssistedValue"
 Write-Host "Logs: $StdOutLog and $StdErrLog"
@@ -285,6 +287,7 @@ $previousHost = Set-InheritedEnvironmentValue -Name "HOST" -Value $BindHost
 $previousPort = Set-InheritedEnvironmentValue -Name "PORT" -Value ([string]$Port)
 $previousPlaywright = Set-InheritedEnvironmentValue -Name "ALLOW_PLAYWRIGHT_PROVIDERS" -Value $AllowPlaywrightValue
 $previousGoogleFlightsFetchMode = Set-InheritedEnvironmentValue -Name "GOOGLE_FLIGHTS_FETCH_MODE" -Value $GoogleFlightsFetchModeValue
+$previousKayakPlaywrightAssisted = Set-InheritedEnvironmentValue -Name "KAYAK_SCRAPE_PLAYWRIGHT_ASSISTED" -Value $KayakPlaywrightAssistedValue
 $previousSkyscannerPlaywrightFallback = Set-InheritedEnvironmentValue -Name "SKYSCANNER_SCRAPE_PLAYWRIGHT_FALLBACK" -Value $SkyscannerPlaywrightFallbackValue
 $previousSkyscannerPlaywrightAssisted = Set-InheritedEnvironmentValue -Name "SKYSCANNER_PLAYWRIGHT_ASSISTED" -Value $SkyscannerPlaywrightAssistedValue
 try {
@@ -314,6 +317,7 @@ try {
     Restore-InheritedEnvironmentValue -Name "PORT" -PreviousValue $previousPort
     Restore-InheritedEnvironmentValue -Name "ALLOW_PLAYWRIGHT_PROVIDERS" -PreviousValue $previousPlaywright
     Restore-InheritedEnvironmentValue -Name "GOOGLE_FLIGHTS_FETCH_MODE" -PreviousValue $previousGoogleFlightsFetchMode
+    Restore-InheritedEnvironmentValue -Name "KAYAK_SCRAPE_PLAYWRIGHT_ASSISTED" -PreviousValue $previousKayakPlaywrightAssisted
     Restore-InheritedEnvironmentValue -Name "SKYSCANNER_SCRAPE_PLAYWRIGHT_FALLBACK" -PreviousValue $previousSkyscannerPlaywrightFallback
     Restore-InheritedEnvironmentValue -Name "SKYSCANNER_PLAYWRIGHT_ASSISTED" -PreviousValue $previousSkyscannerPlaywrightAssisted
 }

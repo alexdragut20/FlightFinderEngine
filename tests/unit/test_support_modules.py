@@ -153,7 +153,7 @@ def test_skyscanner_playwright_fallback_defaults_on_when_playwright_is_allowed(
     try:
         assert reloaded.ALLOW_PLAYWRIGHT_PROVIDERS is True
         assert reloaded.SKYSCANNER_SCRAPE_PLAYWRIGHT_FALLBACK is True
-        assert reloaded.SKYSCANNER_PLAYWRIGHT_ASSISTED is False
+        assert reloaded.SKYSCANNER_PLAYWRIGHT_ASSISTED is True
     finally:
         monkeypatch.delenv("ALLOW_PLAYWRIGHT_PROVIDERS", raising=False)
         monkeypatch.delenv("SKYSCANNER_SCRAPE_PLAYWRIGHT_FALLBACK", raising=False)

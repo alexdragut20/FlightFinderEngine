@@ -36,6 +36,57 @@ SUPPORTED_PROVIDER_IDS = (
     "serpapi",
 )
 _FREE_PROVIDER_IDS = {"kiwi", "kayak", "momondo", "googleflights", "skyscanner"}
+
+
+def _detect_playwright_browser_channel() -> str:
+    """Return a preferred local browser channel for Playwright-backed providers."""
+    channel_candidates = (
+        (
+            "msedge",
+            (
+                os.path.join(
+                    os.getenv("ProgramFiles(x86)") or "",
+                    "Microsoft",
+                    "Edge",
+                    "Application",
+                    "msedge.exe",
+                ),
+                os.path.join(
+                    os.getenv("ProgramFiles") or "",
+                    "Microsoft",
+                    "Edge",
+                    "Application",
+                    "msedge.exe",
+                ),
+            ),
+        ),
+        (
+            "chrome",
+            (
+                os.path.join(
+                    os.getenv("ProgramFiles") or "",
+                    "Google",
+                    "Chrome",
+                    "Application",
+                    "chrome.exe",
+                ),
+                os.path.join(
+                    os.getenv("ProgramFiles(x86)") or "",
+                    "Google",
+                    "Chrome",
+                    "Application",
+                    "chrome.exe",
+                ),
+            ),
+        ),
+    )
+    for channel, paths in channel_candidates:
+        for candidate in paths:
+            if candidate and os.path.exists(candidate):
+                return channel
+    return ""
+
+
 try:
     _default_search_timeout_env = int(os.getenv("DEFAULT_SEARCH_TIMEOUT_SECONDS", "1500"))
 except ValueError:
@@ -109,6 +160,48 @@ try:
 except ValueError:
     _kayak_poll_rounds_env = 2
 KAYAK_SCRAPE_POLL_ROUNDS = max(1, min(6, _kayak_poll_rounds_env))
+_kayak_playwright_assisted_default = "1" if ALLOW_PLAYWRIGHT_PROVIDERS else "0"
+_playwright_browser_channel_default = (
+    _detect_playwright_browser_channel() if ALLOW_PLAYWRIGHT_PROVIDERS else ""
+)
+KAYAK_SCRAPE_PLAYWRIGHT_ASSISTED = ALLOW_PLAYWRIGHT_PROVIDERS and (
+    str(
+        os.getenv(
+            "KAYAK_SCRAPE_PLAYWRIGHT_ASSISTED",
+            _kayak_playwright_assisted_default,
+        )
+    )
+    .strip()
+    .lower()
+    not in {"0", "false", "off", "no"}
+)
+KAYAK_PLAYWRIGHT_BROWSER_CHANNEL = (
+    str(
+        os.getenv(
+            "KAYAK_PLAYWRIGHT_BROWSER_CHANNEL",
+            _playwright_browser_channel_default,
+        )
+        or ""
+    ).strip()
+    or None
+)
+KAYAK_PLAYWRIGHT_PROFILE_ROOT = str(
+    os.getenv("KAYAK_PLAYWRIGHT_PROFILE_ROOT", "") or ""
+).strip() or os.path.join(
+    os.getenv("LOCALAPPDATA") or os.path.expanduser("~"),
+    "FlightFinderEngine",
+    "playwright",
+)
+try:
+    _kayak_playwright_assist_timeout_seconds = int(
+        os.getenv("KAYAK_PLAYWRIGHT_ASSIST_TIMEOUT_SECONDS", "120")
+    )
+except ValueError:
+    _kayak_playwright_assist_timeout_seconds = 120
+KAYAK_PLAYWRIGHT_ASSIST_TIMEOUT_SECONDS = max(
+    15,
+    min(600, _kayak_playwright_assist_timeout_seconds),
+)
 try:
     _skyscanner_retry_env = int(os.getenv("SKYSCANNER_SCRAPE_HTTP_RETRIES", "2"))
 except ValueError:
@@ -126,12 +219,27 @@ SKYSCANNER_SCRAPE_PLAYWRIGHT_FALLBACK = ALLOW_PLAYWRIGHT_PROVIDERS and (
     .lower()
     not in {"0", "false", "off", "no"}
 )
+_skyscanner_playwright_assisted_default = "1" if ALLOW_PLAYWRIGHT_PROVIDERS else "0"
 SKYSCANNER_PLAYWRIGHT_ASSISTED = ALLOW_PLAYWRIGHT_PROVIDERS and (
-    str(os.getenv("SKYSCANNER_PLAYWRIGHT_ASSISTED", "0")).strip().lower()
+    str(
+        os.getenv(
+            "SKYSCANNER_PLAYWRIGHT_ASSISTED",
+            _skyscanner_playwright_assisted_default,
+        )
+    )
+    .strip()
+    .lower()
     not in {"0", "false", "off", "no"}
 )
 SKYSCANNER_PLAYWRIGHT_BROWSER_CHANNEL = (
-    str(os.getenv("SKYSCANNER_PLAYWRIGHT_BROWSER_CHANNEL", "") or "").strip() or None
+    str(
+        os.getenv(
+            "SKYSCANNER_PLAYWRIGHT_BROWSER_CHANNEL",
+            _playwright_browser_channel_default,
+        )
+        or ""
+    ).strip()
+    or None
 )
 SKYSCANNER_PLAYWRIGHT_PROFILE_DIR = str(
     os.getenv("SKYSCANNER_PLAYWRIGHT_PROFILE_DIR", "") or ""

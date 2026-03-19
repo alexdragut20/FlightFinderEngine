@@ -51,7 +51,13 @@ class GoogleFlightsLocalClient:
             fetch_mode: Fetch strategy to use for the provider request.
         """
         normalized_fetch_mode = (
-            str(fetch_mode or os.getenv("GOOGLE_FLIGHTS_FETCH_MODE") or "common").strip().lower()
+            str(
+                fetch_mode
+                or os.getenv("GOOGLE_FLIGHTS_FETCH_MODE")
+                or ("local" if ALLOW_PLAYWRIGHT_PROVIDERS else "common")
+            )
+            .strip()
+            .lower()
         )
         if normalized_fetch_mode not in {"common", "local"}:
             normalized_fetch_mode = "common"

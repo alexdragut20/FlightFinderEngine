@@ -1,16 +1,23 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import threading
 import time
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
 import requests
 
 from ..config import (
+    ALLOW_PLAYWRIGHT_PROVIDERS,
+    KAYAK_PLAYWRIGHT_ASSIST_TIMEOUT_SECONDS,
+    KAYAK_PLAYWRIGHT_BROWSER_CHANNEL,
+    KAYAK_PLAYWRIGHT_PROFILE_ROOT,
     KAYAK_SCRAPE_HOST,
+    KAYAK_SCRAPE_PLAYWRIGHT_ASSISTED,
     KAYAK_SCRAPE_POLL_ROUNDS,
     KAYAK_SCRAPE_SCHEME,
     MOMONDO_SCRAPE_HOST,
@@ -56,13 +63,29 @@ class KayakScrapeClient:
         "unusual traffic",
         "bot protection",
         "cf-chl",
+        "what is a bot",
+        "only useful for humans",
     )
-    _BLOCK_URL_MARKERS = ("/captcha", "captcha-v2", "px-captcha", "/challenge", "cf-chl")
+    _BLOCK_URL_MARKERS = (
+        "/captcha",
+        "captcha-v2",
+        "px-captcha",
+        "/challenge",
+        "cf-chl",
+        "/help/bots",
+    )
+    _BROWSER_ASSIST_LOCK = threading.RLock()
+    _BROWSER_ASSIST_COOKIES: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    _PLAYWRIGHT_FETCH_GATE = threading.BoundedSemaphore(2)
 
     def __init__(
         self,
         host: str | None = None,
         poll_rounds: int | None = None,
+        playwright_assisted: bool | None = None,
+        playwright_assist_timeout_seconds: int | None = None,
+        playwright_profile_root: str | None = None,
+        playwright_browser_channel: str | None = None,
     ) -> None:
         """Initialize the KayakScrapeClient.
 
@@ -80,6 +103,27 @@ class KayakScrapeClient:
                 6,
                 int(poll_rounds) if poll_rounds is not None else KAYAK_SCRAPE_POLL_ROUNDS,
             ),
+        )
+        self._playwright_assisted = (
+            bool(playwright_assisted)
+            if playwright_assisted is not None
+            else KAYAK_SCRAPE_PLAYWRIGHT_ASSISTED
+        )
+        self._playwright_assist_timeout_seconds = max(
+            15,
+            int(
+                playwright_assist_timeout_seconds
+                if playwright_assist_timeout_seconds is not None
+                else KAYAK_PLAYWRIGHT_ASSIST_TIMEOUT_SECONDS
+            ),
+        )
+        self._playwright_profile_root = (
+            str(playwright_profile_root or KAYAK_PLAYWRIGHT_PROFILE_ROOT).strip()
+            or KAYAK_PLAYWRIGHT_PROFILE_ROOT
+        )
+        self._playwright_browser_channel = (
+            str(playwright_browser_channel or KAYAK_PLAYWRIGHT_BROWSER_CHANNEL or "").strip()
+            or None
         )
         self._local = threading.local()
 
@@ -114,7 +158,277 @@ class KayakScrapeClient:
                 }
             )
             self._local.session = session
-        return self._local.session
+        session = self._local.session
+        self._apply_shared_browser_cookies(session)
+        return session
+
+    def _browser_cookie_key(self) -> tuple[str, str]:
+        """Return the shared cookie-store key for the provider host."""
+        return (self.provider_id, self._host)
+
+    def _apply_shared_browser_cookies(self, session: requests.Session) -> None:
+        """Apply any persisted browser-verified cookies to the requests session."""
+        with self._BROWSER_ASSIST_LOCK:
+            cookies = [
+                dict(cookie)
+                for cookie in self._BROWSER_ASSIST_COOKIES.get(self._browser_cookie_key(), [])
+            ]
+        for cookie in cookies:
+            name = str(cookie.get("name") or "").strip()
+            value = str(cookie.get("value") or "")
+            if not name:
+                continue
+            session.cookies.set(
+                name,
+                value,
+                domain=str(cookie.get("domain") or "").strip() or None,
+                path=str(cookie.get("path") or "/").strip() or "/",
+            )
+
+    def _store_shared_browser_cookies(self, cookies: list[dict[str, Any]]) -> None:
+        """Persist browser-verified cookies for reuse across search requests."""
+        normalized_cookies = [
+            dict(cookie) for cookie in cookies if str(cookie.get("name") or "").strip()
+        ]
+        if not normalized_cookies:
+            return
+        with self._BROWSER_ASSIST_LOCK:
+            self._BROWSER_ASSIST_COOKIES[self._browser_cookie_key()] = normalized_cookies
+
+    @staticmethod
+    def _has_bootstrap_markup(html: str) -> bool:
+        """Return whether the HTML contains the bootstrap payload needed for parsing."""
+        lowered = str(html or "").lower()
+        return "jsondata_r9datastorage" in lowered and "formtoken" in lowered
+
+    def _playwright_profile_dir(self) -> Path:
+        """Return the persistent Playwright profile directory for this provider."""
+        return (
+            Path(self._playwright_profile_root).expanduser()
+            / f"{self.provider_id}-{self._host.replace('.', '-')}"
+        )
+
+    def _fetch_search_page_playwright_assisted(
+        self,
+        page_url: str,
+    ) -> tuple[str, str]:
+        """Open a visible browser session so a human can clear anti-bot checks once."""
+        if not (ALLOW_PLAYWRIGHT_PROVIDERS and self._playwright_assisted):
+            raise self._blocked_error(manual_search_url=page_url)
+
+        try:
+            from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+            from playwright.sync_api import sync_playwright
+        except Exception as exc:
+            raise ProviderNoResultError(
+                f"{self.display_name} browser-assisted mode is unavailable. "
+                "Install with `python3 -m pip install playwright` then "
+                "`python3 -m playwright install chromium`."
+            ) from exc
+
+        profile_dir = self._playwright_profile_dir()
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        launch_kwargs: dict[str, Any] = {
+            "headless": False,
+            "locale": "en-US",
+            "user_agent": str(self._session().headers.get("User-Agent") or ""),
+        }
+        if self._playwright_browser_channel:
+            launch_kwargs["channel"] = self._playwright_browser_channel
+
+        with self._BROWSER_ASSIST_LOCK:
+            with sync_playwright() as playwright:
+                context = playwright.chromium.launch_persistent_context(
+                    str(profile_dir),
+                    **launch_kwargs,
+                )
+                try:
+                    page = context.pages[0] if context.pages else context.new_page()
+                    with contextlib.suppress(Exception):
+                        page.bring_to_front()
+                    try:
+                        page.goto(page_url, wait_until="domcontentloaded", timeout=45000)
+                    except PlaywrightTimeoutError as exc:
+                        raise RuntimeError(
+                            f"{self.display_name} browser-assisted navigation timed out."
+                        ) from exc
+
+                    deadline = time.time() + self._playwright_assist_timeout_seconds
+                    last_html = ""
+                    last_url = str(page.url or page_url)
+                    while time.time() < deadline:
+                        with contextlib.suppress(PlaywrightTimeoutError):
+                            page.wait_for_load_state("networkidle", timeout=1500)
+                        page.wait_for_timeout(1000)
+                        last_url = str(page.url or page_url)
+                        last_html = str(page.content() or "")
+                        if self._is_blocked_page(last_html, last_url, 200):
+                            continue
+                        if self._has_bootstrap_markup(last_html):
+                            self._store_shared_browser_cookies(context.cookies())
+                            self._apply_shared_browser_cookies(self._session())
+                            return last_html, last_url
+
+                    if self._is_blocked_page(last_html, last_url, 200):
+                        raise ProviderBlockedError(
+                            f"{self.display_name} browser-assisted mode needs you to complete "
+                            "the visible verification window, then rerun the search.",
+                            manual_search_url=page_url,
+                        )
+                    if last_html.strip():
+                        raise RuntimeError(
+                            f"{self.display_name} browser-assisted mode loaded HTML without "
+                            "Kayak bootstrap data."
+                        )
+                    raise RuntimeError(
+                        f"{self.display_name} browser-assisted mode returned empty HTML."
+                    )
+                finally:
+                    with contextlib.suppress(Exception):
+                        context.close()
+
+    def _resolve_poll_payload(
+        self,
+        payload: dict[str, Any],
+        *,
+        status_code: int,
+        manual_search_url: str | None,
+        allow_partial: bool = False,
+    ) -> dict[str, Any] | None:
+        """Normalize a provider poll payload into a usable search response."""
+        detail = ""
+        if status_code >= 400:
+            detail = self._extract_error_detail(payload) or f"HTTP {status_code}"
+            lowered = detail.lower()
+            if any(code.lower() in lowered for code in self._NO_RESULT_CODES):
+                raise ProviderNoResultError(detail)
+            if self._is_blocked_detail(detail, status_code):
+                raise self._blocked_error(manual_search_url=manual_search_url, detail=detail)
+            raise RuntimeError(detail)
+
+        errors = payload.get("errors")
+        if isinstance(errors, list) and errors:
+            detail = self._extract_error_detail(payload) or str(errors[0])
+            lowered = detail.lower()
+            if any(code.lower() in lowered for code in self._NO_RESULT_CODES):
+                raise ProviderNoResultError(detail)
+            if self._is_blocked_detail(detail, status_code):
+                raise self._blocked_error(manual_search_url=manual_search_url, detail=detail)
+            raise RuntimeError(detail)
+
+        normalized_status = str(payload.get("status") or "").strip().lower()
+        if self._core_results(payload) and normalized_status in {"first-phase", "complete"}:
+            return payload
+        if allow_partial and self._core_results(payload):
+            return payload
+        return None
+
+    def _search_payload_playwright_backed(
+        self,
+        page_url: str,
+    ) -> dict[str, Any]:
+        """Load the search page in Playwright and capture poll payloads from the browser."""
+        if not ALLOW_PLAYWRIGHT_PROVIDERS:
+            raise self._blocked_error(manual_search_url=page_url)
+
+        try:
+            from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+            from playwright.sync_api import sync_playwright
+        except Exception as exc:
+            raise ProviderNoResultError(
+                f"{self.display_name} Playwright fallback is unavailable. "
+                "Install with `python3 -m pip install playwright` then "
+                "`python3 -m playwright install chromium`."
+            ) from exc
+
+        acquired = self._PLAYWRIGHT_FETCH_GATE.acquire(timeout=20)
+        if not acquired:
+            raise ProviderNoResultError(
+                f"{self.display_name} Playwright fallback is busy; skipped to protect system resources."
+            )
+
+        try:
+            with sync_playwright() as playwright:
+                launch_kwargs: dict[str, Any] = {"headless": True}
+                if self._playwright_browser_channel:
+                    launch_kwargs["channel"] = self._playwright_browser_channel
+                browser = playwright.chromium.launch(**launch_kwargs)
+                try:
+                    context = browser.new_context(locale="en-US")
+                    try:
+                        poll_payloads: list[tuple[int, dict[str, Any]]] = []
+                        page = context.new_page()
+
+                        def on_response(response: Any) -> None:
+                            if "/i/api/search/dynamic/flights/poll" not in str(response.url or ""):
+                                return
+                            try:
+                                body_text = str(response.text() or "")
+                            except Exception:
+                                return
+                            try:
+                                payload = json.loads(body_text)
+                            except ValueError:
+                                return
+                            if isinstance(payload, dict):
+                                poll_payloads.append((int(response.status or 0), payload))
+
+                        page.on("response", on_response)
+                        try:
+                            page.goto(page_url, wait_until="domcontentloaded", timeout=45000)
+                        except PlaywrightTimeoutError as exc:
+                            raise RuntimeError(
+                                f"{self.display_name} Playwright navigation timed out."
+                            ) from exc
+
+                        deadline = time.time() + self._playwright_assist_timeout_seconds
+                        last_html = ""
+                        last_url = str(page.url or page_url)
+                        while time.time() < deadline:
+                            with contextlib.suppress(PlaywrightTimeoutError):
+                                page.wait_for_load_state("networkidle", timeout=1500)
+                            page.wait_for_timeout(1000)
+                            last_url = str(page.url or page_url)
+                            last_html = str(page.content() or "")
+                            if self._is_blocked_page(last_html, last_url, 200):
+                                raise self._blocked_error(manual_search_url=page_url)
+                            for status_code, payload in reversed(poll_payloads):
+                                resolved = self._resolve_poll_payload(
+                                    payload,
+                                    status_code=status_code,
+                                    manual_search_url=page_url,
+                                )
+                                if resolved is not None:
+                                    self._store_shared_browser_cookies(context.cookies())
+                                    self._apply_shared_browser_cookies(self._session())
+                                    return resolved
+
+                        if poll_payloads:
+                            status_code, payload = poll_payloads[-1]
+                            resolved = self._resolve_poll_payload(
+                                payload,
+                                status_code=status_code,
+                                manual_search_url=page_url,
+                                allow_partial=True,
+                            )
+                            if resolved is not None:
+                                self._store_shared_browser_cookies(context.cookies())
+                                self._apply_shared_browser_cookies(self._session())
+                                return resolved
+                        if self._is_blocked_page(last_html, last_url, 200):
+                            raise self._blocked_error(manual_search_url=page_url)
+                        raise RuntimeError(
+                            f"{self.display_name} Playwright fallback loaded the page "
+                            "but never captured usable poll payloads."
+                        )
+                    finally:
+                        with contextlib.suppress(Exception):
+                            context.close()
+                finally:
+                    with contextlib.suppress(Exception):
+                        browser.close()
+        finally:
+            self._PLAYWRIGHT_FETCH_GATE.release()
 
     def _search_path_prefix(self) -> str:
         """Return the path prefix used by the search results page.
@@ -438,16 +752,47 @@ class KayakScrapeClient:
             page_url,
             timeout=45,
         )
+        page_html = str(page_response.text or "")
         final_page_url = str(page_response.url or page_url)
-        if self._is_blocked_page(page_response.text, final_page_url, page_response.status_code):
+        if self._is_blocked_page(page_html, final_page_url, page_response.status_code):
             detail = (
                 f"HTTP {page_response.status_code}" if page_response.status_code >= 400 else None
             )
-            raise self._blocked_error(manual_search_url=final_page_url, detail=detail)
-        page_response.raise_for_status()
+            if ALLOW_PLAYWRIGHT_PROVIDERS and self._playwright_browser_channel:
+                try:
+                    return self._search_payload_playwright_backed(page_url)
+                except ProviderBlockedError:
+                    if self._playwright_assisted:
+                        page_html, final_page_url = self._fetch_search_page_playwright_assisted(
+                            page_url
+                        )
+                    else:
+                        raise
+            elif ALLOW_PLAYWRIGHT_PROVIDERS and self._playwright_assisted:
+                page_html, final_page_url = self._fetch_search_page_playwright_assisted(page_url)
+            else:
+                raise self._blocked_error(manual_search_url=final_page_url, detail=detail)
+        else:
+            page_response.raise_for_status()
+            if (
+                ALLOW_PLAYWRIGHT_PROVIDERS
+                and self._playwright_assisted
+                and not self._has_bootstrap_markup(page_html)
+            ):
+                if self._playwright_browser_channel:
+                    try:
+                        return self._search_payload_playwright_backed(page_url)
+                    except ProviderBlockedError:
+                        page_html, final_page_url = self._fetch_search_page_playwright_assisted(
+                            page_url
+                        )
+                else:
+                    page_html, final_page_url = self._fetch_search_page_playwright_assisted(
+                        page_url
+                    )
+
         csrf_token, _bootstrap = self._extract_bootstrap(
-            page_response.text,
-            manual_search_url=final_page_url,
+            page_html, manual_search_url=final_page_url
         )
 
         passenger_count = max(1, int(adults or 1))
@@ -467,11 +812,16 @@ class KayakScrapeClient:
             },
         }
 
-        latest = self._post_poll(
-            referer_url=final_page_url,
-            csrf_token=csrf_token,
-            payload=search_payload,
-        )
+        try:
+            latest = self._post_poll(
+                referer_url=final_page_url,
+                csrf_token=csrf_token,
+                payload=search_payload,
+            )
+        except ProviderBlockedError:
+            if ALLOW_PLAYWRIGHT_PROVIDERS and self._playwright_browser_channel:
+                return self._search_payload_playwright_backed(page_url)
+            raise
         search_id = str(latest.get("searchId") or "").strip()
         for _ in range(self._poll_rounds):
             core_results = self._core_results(latest)
@@ -483,11 +833,16 @@ class KayakScrapeClient:
             search_payload["userSearchParams"]["searchId"] = search_id
             search_payload["searchMetaData"]["skipResultsInSecondPhase"] = False
             time.sleep(0.6)
-            latest = self._post_poll(
-                referer_url=final_page_url,
-                csrf_token=csrf_token,
-                payload=search_payload,
-            )
+            try:
+                latest = self._post_poll(
+                    referer_url=final_page_url,
+                    csrf_token=csrf_token,
+                    payload=search_payload,
+                )
+            except ProviderBlockedError:
+                if ALLOW_PLAYWRIGHT_PROVIDERS and self._playwright_browser_channel:
+                    return self._search_payload_playwright_backed(page_url)
+                raise
             search_id = str(latest.get("searchId") or search_id).strip()
         return latest
 
@@ -1204,6 +1559,10 @@ class MomondoScrapeClient(KayakScrapeClient):
         self,
         host: str | None = None,
         poll_rounds: int | None = None,
+        playwright_assisted: bool | None = None,
+        playwright_assist_timeout_seconds: int | None = None,
+        playwright_profile_root: str | None = None,
+        playwright_browser_channel: str | None = None,
     ) -> None:
         """Initialize the MomondoScrapeClient.
 
@@ -1214,6 +1573,10 @@ class MomondoScrapeClient(KayakScrapeClient):
         super().__init__(
             host=host if host is not None else MOMONDO_SCRAPE_HOST,
             poll_rounds=poll_rounds,
+            playwright_assisted=playwright_assisted,
+            playwright_assist_timeout_seconds=playwright_assist_timeout_seconds,
+            playwright_profile_root=playwright_profile_root,
+            playwright_browser_channel=playwright_browser_channel,
         )
 
     def _search_path_prefix(self) -> str:
