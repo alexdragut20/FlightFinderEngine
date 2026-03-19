@@ -16,6 +16,7 @@ from ._cache import per_instance_lru_cache
 CandidateResult = dict[str, Any]
 CandidateFetcher = Callable[[Any, str], CandidateResult | None]
 CandidateComparator = Callable[[CandidateResult, CandidateResult | None], bool]
+_PROVIDER_CALL_SKIPPED = object()
 
 
 class MultiProviderClient:
@@ -81,6 +82,8 @@ class MultiProviderClient:
         self._budget_used_by_provider: dict[str, int] = {}
         self._provider_paused_until: dict[str, float] = {}
         self._provider_issue_state: dict[str, dict[str, Any]] = {}
+        self._provider_request_locks: dict[str, threading.Lock] = {}
+        self._provider_next_allowed_at: dict[str, float] = {}
         self._stats_listener: Callable[[dict[str, Any]], None] | None = None
         self._stats_listener_min_interval_seconds = 0.75
         self._stats_listener_last_sent_at = 0.0
@@ -324,6 +327,93 @@ class MultiProviderClient:
             )
 
     @staticmethod
+    def _provider_serialized_requests(provider: Any) -> bool:
+        """Return whether requests to the provider should be serialized."""
+        return bool(getattr(provider, "serialized_requests", False))
+
+    @staticmethod
+    def _provider_request_interval_seconds(provider: Any) -> float:
+        """Return the minimum delay to keep between provider requests."""
+        try:
+            value = float(getattr(provider, "request_interval_seconds", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        return max(0.0, value)
+
+    def _provider_request_lock(self, provider_id: str) -> threading.Lock:
+        """Return the per-provider request lock, creating it on demand."""
+        normalized_provider_id = str(provider_id or "").strip().lower()
+        with self._stats_lock:
+            lock = self._provider_request_locks.get(normalized_provider_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._provider_request_locks[normalized_provider_id] = lock
+            return lock
+
+    def _provider_next_allowed_at_seconds(self, provider_id: str) -> float:
+        """Return the earliest timestamp when the provider can be queried again."""
+        normalized_provider_id = str(provider_id or "").strip().lower()
+        with self._stats_lock:
+            return float(self._provider_next_allowed_at.get(normalized_provider_id, 0.0) or 0.0)
+
+    def _set_provider_next_allowed_at_seconds(
+        self, provider_id: str, next_allowed_at: float
+    ) -> None:
+        """Persist the next provider request timestamp."""
+        normalized_provider_id = str(provider_id or "").strip().lower()
+        with self._stats_lock:
+            self._provider_next_allowed_at[normalized_provider_id] = max(
+                float(self._provider_next_allowed_at.get(normalized_provider_id, 0.0) or 0.0),
+                float(next_allowed_at or 0.0),
+            )
+
+    def _execute_provider_call(
+        self,
+        *,
+        provider: Any,
+        provider_id: str,
+        skipped_cooldown_bucket: str,
+        skipped_budget_bucket: str,
+        calls_bucket: str,
+        call: Callable[[], Any],
+    ) -> Any:
+        """Run a provider call with cooldown, budget, and optional serialization guards."""
+        if not self._provider_serialized_requests(provider):
+            if self._provider_pause_remaining_seconds(provider_id) > 0:
+                self._bump(skipped_cooldown_bucket, provider_id)
+                return _PROVIDER_CALL_SKIPPED
+            if not self._consume_budget(provider_id):
+                self._bump(skipped_budget_bucket, provider_id)
+                return _PROVIDER_CALL_SKIPPED
+            self._bump(calls_bucket, provider_id)
+            return call()
+
+        provider_lock = self._provider_request_lock(provider_id)
+        with provider_lock:
+            if self._provider_pause_remaining_seconds(provider_id) > 0:
+                self._bump(skipped_cooldown_bucket, provider_id)
+                return _PROVIDER_CALL_SKIPPED
+            if not self._consume_budget(provider_id):
+                self._bump(skipped_budget_bucket, provider_id)
+                return _PROVIDER_CALL_SKIPPED
+            wait_seconds = max(
+                0.0,
+                self._provider_next_allowed_at_seconds(provider_id) - time.time(),
+            )
+            if wait_seconds > 0.0:
+                time.sleep(wait_seconds)
+            self._bump(calls_bucket, provider_id)
+            try:
+                return call()
+            finally:
+                interval_seconds = self._provider_request_interval_seconds(provider)
+                if interval_seconds > 0.0:
+                    self._set_provider_next_allowed_at_seconds(
+                        provider_id,
+                        time.time() + interval_seconds,
+                    )
+
+    @staticmethod
     def _looks_like_blocked_error_text(text: str) -> bool:
         """Return whether error text looks like anti-bot blocking."""
         lowered = str(text or "").lower()
@@ -496,24 +586,24 @@ class MultiProviderClient:
             provider_id = str(getattr(provider, "provider_id", "unknown"))
             if not bool(getattr(provider, "supports_calendar", True)):
                 continue
-            if self._provider_pause_remaining_seconds(provider_id) > 0:
-                self._bump("calendar_skipped_cooldown", provider_id)
-                continue
-            if not self._consume_budget(provider_id):
-                self._bump("calendar_skipped_budget", provider_id)
-                continue
-            self._bump("calendar_calls", provider_id)
             try:
-                prices = provider.get_calendar_prices(
-                    source=source,
-                    destination=destination,
-                    date_start_iso=date_start_iso,
-                    date_end_iso=date_end_iso,
-                    currency=currency,
-                    max_stops_per_leg=max_stops_per_leg,
-                    adults=adults,
-                    hand_bags=hand_bags,
-                    hold_bags=hold_bags,
+                prices = self._execute_provider_call(
+                    provider=provider,
+                    provider_id=provider_id,
+                    skipped_cooldown_bucket="calendar_skipped_cooldown",
+                    skipped_budget_bucket="calendar_skipped_budget",
+                    calls_bucket="calendar_calls",
+                    call=lambda provider=provider: provider.get_calendar_prices(
+                        source=source,
+                        destination=destination,
+                        date_start_iso=date_start_iso,
+                        date_end_iso=date_end_iso,
+                        currency=currency,
+                        max_stops_per_leg=max_stops_per_leg,
+                        adults=adults,
+                        hand_bags=hand_bags,
+                        hold_bags=hold_bags,
+                    ),
                 )
             except ProviderBlockedError as exc:
                 self._register_provider_block(provider_id, exc)
@@ -534,6 +624,8 @@ class MultiProviderClient:
                     continue
                 self._register_provider_exception(provider_id, exc)
                 self._bump("calendar_errors", provider_id)
+                continue
+            if prices is _PROVIDER_CALL_SKIPPED:
                 continue
             self._clear_provider_issue(provider_id)
 
@@ -649,15 +741,17 @@ class MultiProviderClient:
         best_provider = ""
         for provider in self._providers_for_selection(provider_ids):
             provider_id = str(getattr(provider, "provider_id", "unknown"))
-            if self._provider_pause_remaining_seconds(provider_id) > 0:
-                self._bump(skipped_cooldown_bucket, provider_id)
-                continue
-            if not self._consume_budget(provider_id):
-                self._bump(skipped_budget_bucket, provider_id)
-                continue
-            self._bump(calls_bucket, provider_id)
             try:
-                candidate = fetch_candidate(provider, provider_id)
+                candidate = self._execute_provider_call(
+                    provider=provider,
+                    provider_id=provider_id,
+                    skipped_cooldown_bucket=skipped_cooldown_bucket,
+                    skipped_budget_bucket=skipped_budget_bucket,
+                    calls_bucket=calls_bucket,
+                    call=lambda provider=provider, provider_id=provider_id: fetch_candidate(
+                        provider, provider_id
+                    ),
+                )
             except ProviderBlockedError as exc:
                 self._register_provider_block(provider_id, exc)
                 self._bump(blocked_bucket, provider_id)
@@ -677,6 +771,8 @@ class MultiProviderClient:
                     continue
                 self._register_provider_exception(provider_id, exc)
                 self._bump(errors_bucket, provider_id)
+                continue
+            if candidate is _PROVIDER_CALL_SKIPPED:
                 continue
             self._clear_provider_issue(provider_id)
             if not candidate:

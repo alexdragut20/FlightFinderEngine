@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 import requests
 
@@ -2062,3 +2066,64 @@ def test_multi_provider_health_snapshot_reports_selected_no_result_errors_and_li
         min_interval_seconds=0.0,
     )
     client._notify_stats_listener(force=True)
+
+
+def test_multi_provider_client_serializes_marked_provider_requests() -> None:
+    state = {"active": 0, "max_active": 0}
+    first_entered = threading.Event()
+    release_first = threading.Event()
+
+    class _SerializedProvider:
+        provider_id = "kayak"
+        supports_calendar = False
+        serialized_requests = True
+        request_interval_seconds = 0.0
+
+        def get_best_oneway(self, **kwargs: object) -> dict[str, object] | None:
+            state["active"] += 1
+            state["max_active"] = max(state["max_active"], state["active"])
+            departure_iso = str(kwargs.get("departure_iso") or "")
+            try:
+                if departure_iso == "2026-03-10":
+                    first_entered.set()
+                    release_first.wait(timeout=2.0)
+                return {"price": 100, "stops": 0, "duration_seconds": 1000}
+            finally:
+                state["active"] -= 1
+
+        def get_best_return(self, **kwargs: object) -> dict[str, object] | None:
+            return None
+
+    client = MultiProviderClient([_SerializedProvider()])
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(
+            client.get_best_oneway,
+            "OTP",
+            "MGA",
+            "2026-03-10",
+            "RON",
+            2,
+            1,
+            0,
+            0,
+        )
+        assert first_entered.wait(timeout=1.0)
+        second = executor.submit(
+            client.get_best_oneway,
+            "OTP",
+            "MGA",
+            "2026-03-11",
+            "RON",
+            2,
+            1,
+            0,
+            0,
+        )
+        time.sleep(0.1)
+        assert state["max_active"] == 1
+        release_first.set()
+        assert first.result(timeout=2.0) is not None
+        assert second.result(timeout=2.0) is not None
+
+    assert state["max_active"] == 1

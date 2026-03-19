@@ -30,6 +30,8 @@ class GoogleFlightsLocalClient:
     credential_env: tuple[str, ...] = ()
     docs_url = "https://www.google.com/travel/flights"
     default_enabled = True
+    serialized_requests = True
+    request_interval_seconds = 1.0
 
     @staticmethod
     def _local_mode_setup_hint() -> str:

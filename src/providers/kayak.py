@@ -45,6 +45,8 @@ class KayakScrapeClient:
     requires_credentials = False
     credential_env: tuple[str, ...] = ()
     docs_url = "https://www.kayak.com/flights/"
+    serialized_requests = True
+    request_interval_seconds = 2.5
     _NO_RESULT_CODES = {"NO_RESULTS", "NO_RESULTS_FOUND", "NO_RESULTS_AVAILABLE"}
     _BLOCK_MARKERS = (
         "captcha",
@@ -326,6 +328,9 @@ class KayakScrapeClient:
     def _search_payload_playwright_backed(
         self,
         page_url: str,
+        *,
+        headless: bool = True,
+        interactive: bool = False,
     ) -> dict[str, Any]:
         """Load the search page in Playwright and capture poll payloads from the browser."""
         if not ALLOW_PLAYWRIGHT_PROVIDERS:
@@ -349,15 +354,28 @@ class KayakScrapeClient:
 
         try:
             with sync_playwright() as playwright:
-                launch_kwargs: dict[str, Any] = {"headless": True}
+                profile_dir = self._playwright_profile_dir()
+                profile_dir.mkdir(parents=True, exist_ok=True)
+                launch_kwargs: dict[str, Any] = {
+                    "headless": headless,
+                    "locale": "en-US",
+                    "user_agent": str(self._session().headers.get("User-Agent") or ""),
+                }
                 if self._playwright_browser_channel:
                     launch_kwargs["channel"] = self._playwright_browser_channel
-                browser = playwright.chromium.launch(**launch_kwargs)
-                try:
-                    context = browser.new_context(locale="en-US")
+                with self._BROWSER_ASSIST_LOCK:
+                    context = playwright.chromium.launch_persistent_context(
+                        str(profile_dir),
+                        **launch_kwargs,
+                    )
                     try:
                         poll_payloads: list[tuple[int, dict[str, Any]]] = []
+                        last_processed_count = 0
+                        last_blocked_error: ProviderBlockedError | None = None
                         page = context.new_page()
+                        if not headless:
+                            with contextlib.suppress(Exception):
+                                page.bring_to_front()
 
                         def on_response(response: Any) -> None:
                             if "/i/api/search/dynamic/flights/poll" not in str(response.url or ""):
@@ -390,31 +408,54 @@ class KayakScrapeClient:
                             page.wait_for_timeout(1000)
                             last_url = str(page.url or page_url)
                             last_html = str(page.content() or "")
-                            if self._is_blocked_page(last_html, last_url, 200):
-                                raise self._blocked_error(manual_search_url=page_url)
-                            for status_code, payload in reversed(poll_payloads):
-                                resolved = self._resolve_poll_payload(
-                                    payload,
-                                    status_code=status_code,
-                                    manual_search_url=page_url,
-                                )
+                            is_blocked_page = self._is_blocked_page(last_html, last_url, 200)
+                            new_payloads = poll_payloads[last_processed_count:]
+                            last_processed_count = len(poll_payloads)
+                            for status_code, payload in new_payloads:
+                                try:
+                                    resolved = self._resolve_poll_payload(
+                                        payload,
+                                        status_code=status_code,
+                                        manual_search_url=page_url,
+                                    )
+                                except ProviderBlockedError as exc:
+                                    last_blocked_error = exc
+                                    if interactive:
+                                        continue
+                                    raise
                                 if resolved is not None:
                                     self._store_shared_browser_cookies(context.cookies())
                                     self._apply_shared_browser_cookies(self._session())
                                     return resolved
+                            if is_blocked_page and not interactive:
+                                raise last_blocked_error or self._blocked_error(
+                                    manual_search_url=page_url
+                                )
 
                         if poll_payloads:
                             status_code, payload = poll_payloads[-1]
-                            resolved = self._resolve_poll_payload(
-                                payload,
-                                status_code=status_code,
+                            try:
+                                resolved = self._resolve_poll_payload(
+                                    payload,
+                                    status_code=status_code,
+                                    manual_search_url=page_url,
+                                    allow_partial=True,
+                                )
+                            except ProviderBlockedError as exc:
+                                last_blocked_error = exc
+                            else:
+                                if resolved is not None:
+                                    self._store_shared_browser_cookies(context.cookies())
+                                    self._apply_shared_browser_cookies(self._session())
+                                    return resolved
+                        if interactive:
+                            raise ProviderBlockedError(
+                                f"{self.display_name} browser-assisted mode needs you to complete "
+                                "the visible verification window, then rerun the search.",
                                 manual_search_url=page_url,
-                                allow_partial=True,
                             )
-                            if resolved is not None:
-                                self._store_shared_browser_cookies(context.cookies())
-                                self._apply_shared_browser_cookies(self._session())
-                                return resolved
+                        if last_blocked_error is not None:
+                            raise last_blocked_error
                         if self._is_blocked_page(last_html, last_url, 200):
                             raise self._blocked_error(manual_search_url=page_url)
                         raise RuntimeError(
@@ -424,11 +465,19 @@ class KayakScrapeClient:
                     finally:
                         with contextlib.suppress(Exception):
                             context.close()
-                finally:
-                    with contextlib.suppress(Exception):
-                        browser.close()
         finally:
             self._PLAYWRIGHT_FETCH_GATE.release()
+
+    def _search_payload_playwright_assisted(
+        self,
+        page_url: str,
+    ) -> dict[str, Any]:
+        """Open a visible persistent browser session and wait for the user to clear verification."""
+        return self._search_payload_playwright_backed(
+            page_url,
+            headless=False,
+            interactive=True,
+        )
 
     def _search_path_prefix(self) -> str:
         """Return the path prefix used by the search results page.
@@ -763,9 +812,7 @@ class KayakScrapeClient:
                     return self._search_payload_playwright_backed(page_url)
                 except ProviderBlockedError:
                     if self._playwright_assisted:
-                        page_html, final_page_url = self._fetch_search_page_playwright_assisted(
-                            page_url
-                        )
+                        return self._search_payload_playwright_assisted(page_url)
                     else:
                         raise
             elif ALLOW_PLAYWRIGHT_PROVIDERS and self._playwright_assisted:
@@ -783,9 +830,7 @@ class KayakScrapeClient:
                     try:
                         return self._search_payload_playwright_backed(page_url)
                     except ProviderBlockedError:
-                        page_html, final_page_url = self._fetch_search_page_playwright_assisted(
-                            page_url
-                        )
+                        return self._search_payload_playwright_assisted(page_url)
                 else:
                     page_html, final_page_url = self._fetch_search_page_playwright_assisted(
                         page_url
@@ -820,7 +865,12 @@ class KayakScrapeClient:
             )
         except ProviderBlockedError:
             if ALLOW_PLAYWRIGHT_PROVIDERS and self._playwright_browser_channel:
-                return self._search_payload_playwright_backed(page_url)
+                try:
+                    return self._search_payload_playwright_backed(page_url)
+                except ProviderBlockedError:
+                    if self._playwright_assisted:
+                        return self._search_payload_playwright_assisted(page_url)
+                    raise
             raise
         search_id = str(latest.get("searchId") or "").strip()
         for _ in range(self._poll_rounds):
@@ -841,7 +891,12 @@ class KayakScrapeClient:
                 )
             except ProviderBlockedError:
                 if ALLOW_PLAYWRIGHT_PROVIDERS and self._playwright_browser_channel:
-                    return self._search_payload_playwright_backed(page_url)
+                    try:
+                        return self._search_payload_playwright_backed(page_url)
+                    except ProviderBlockedError:
+                        if self._playwright_assisted:
+                            return self._search_payload_playwright_assisted(page_url)
+                        raise
                 raise
             search_id = str(latest.get("searchId") or search_id).strip()
         return latest

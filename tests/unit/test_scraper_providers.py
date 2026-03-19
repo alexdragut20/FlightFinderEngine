@@ -584,6 +584,80 @@ class KayakAndMomondoScraperTests(unittest.TestCase):
             ],
         )
 
+    def test_kayak_assisted_playwright_fallback_runs_after_headless_block(self) -> None:
+        client = KayakScrapeClient(
+            host="www.kayak.com",
+            playwright_browser_channel="msedge",
+            playwright_assisted=True,
+        )
+
+        class _Response:
+            def __init__(self, text: str, url: str, status_code: int) -> None:
+                self.text = text
+                self.url = url
+                self.status_code = status_code
+
+            def raise_for_status(self) -> None:
+                return None
+
+        page_html = (
+            '<script id="jsonData_R9DataStorage">'
+            '{"serverData":{"global":{"formtoken":"csrf-token"}}}'
+            "</script>"
+        )
+        session = requests.Session()
+        session.get = lambda url, timeout=45: _Response(  # type: ignore[method-assign]
+            page_html,
+            url,
+            200,
+        )
+        client._local.session = session
+        client._post_poll = lambda **kwargs: (_ for _ in ()).throw(  # type: ignore[assignment]
+            kayak_provider_module.ProviderBlockedError(
+                "blocked by bot protection",
+                manual_search_url=kwargs.get("referer_url"),
+            )
+        )
+        client._search_payload_playwright_backed = lambda url: (_ for _ in ()).throw(  # type: ignore[assignment]
+            kayak_provider_module.ProviderBlockedError(
+                "still blocked in headless browser",
+                manual_search_url=url,
+            )
+        )
+        client._search_payload_playwright_assisted = lambda url: {  # type: ignore[assignment]
+            "status": "complete",
+            "searchId": "assisted-search",
+            "results": [{"type": "core", "assisted_url": url}],
+        }
+        previous_allow_playwright = kayak_provider_module.ALLOW_PLAYWRIGHT_PROVIDERS
+        kayak_provider_module.ALLOW_PLAYWRIGHT_PROVIDERS = True
+        try:
+            payload = client._search_payload(
+                source="OTP",
+                destination="FCO",
+                outbound_iso="2026-04-18",
+                inbound_iso="2026-04-25",
+                currency="RON",
+                adults=1,
+            )
+        finally:
+            kayak_provider_module.ALLOW_PLAYWRIGHT_PROVIDERS = previous_allow_playwright
+
+        self.assertEqual(payload["status"], "complete")
+        self.assertEqual(payload["searchId"], "assisted-search")
+        self.assertEqual(
+            payload["results"],
+            [
+                {
+                    "type": "core",
+                    "assisted_url": (
+                        "https://www.kayak.com/flights/OTP-FCO/2026-04-18/2026-04-25"
+                        "?sort=price_a&adults=1&currency=RON"
+                    ),
+                }
+            ],
+        )
+
     def test_kayak_get_best_return_parses_full_itinerary(self) -> None:
         client = KayakScrapeClient(host="www.kayak.com")
         client._search_payload = lambda **kwargs: self._sample_payload()  # type: ignore[assignment]
