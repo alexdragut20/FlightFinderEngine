@@ -692,7 +692,7 @@ function resetProgressDisplay() {
     providerHealthGridEl.innerHTML = "";
   }
   if (providerHealthNoteEl) {
-    providerHealthNoteEl.textContent = "Selected / no result / error counts update live.";
+    providerHealthNoteEl.textContent = "Selected / blocked / no result / error counts update live.";
   }
 }
 
@@ -728,7 +728,7 @@ function renderProviderHealth(snapshot) {
   const auditNames = auditDestinations
     .map((entry) => String(entry?.destination || "").trim().toUpperCase())
     .filter(Boolean);
-  let note = "Selected / no result / error counts update live.";
+  let note = "Selected / blocked / no result / error counts update live.";
   if (budget.max_total_calls != null) {
     note += ` Paid-provider budget ${budget.used_total_calls || 0}/${budget.max_total_calls}.`;
   }
@@ -763,18 +763,48 @@ function renderProviderHealth(snapshot) {
     counts.className = "provider-health-counts";
     counts.textContent =
       `selected ${stats.selected || 0} | ` +
+      `blocked ${stats.blocked || 0} | ` +
       `no result ${stats.no_result || 0} | ` +
       `error ${stats.errors || 0}`;
 
     const detail = document.createElement("p");
     detail.className = "provider-health-detail";
-    detail.textContent =
-      `calls ${stats.calls || 0} | ` +
-      `calendar ${stats.calendar_selected || 0} | ` +
-      `one-way ${stats.oneway_selected || 0} | ` +
-      `return ${stats.return_selected || 0}`;
+    const detailParts = [
+      `calls ${stats.calls || 0}`,
+      `calendar ${stats.calendar_selected || 0}`,
+      `one-way ${stats.oneway_selected || 0}`,
+      `return ${stats.return_selected || 0}`,
+    ];
+    if (stats.skipped_cooldown) {
+      detailParts.push(`cooldown skips ${stats.skipped_cooldown}`);
+    }
+    if (stats.cooldown_seconds) {
+      detailParts.push(`retry ~${stats.cooldown_seconds}s`);
+    }
+    detail.textContent = detailParts.join(" | ");
 
     card.append(header, counts, detail);
+
+    const issueMessage = String(stats.last_issue_message || "").trim();
+    if (issueMessage && ["blocked", "error"].includes(String(stats.status || ""))) {
+      const issue = document.createElement("p");
+      issue.className = "provider-health-issue";
+      issue.textContent = issueMessage;
+      card.appendChild(issue);
+    }
+
+    const manualSearchUrl = String(stats.manual_search_url || "").trim();
+    if (manualSearchUrl) {
+      const link = document.createElement("a");
+      link.className = "provider-health-link";
+      link.href = manualSearchUrl;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.textContent =
+        String(stats.status || "") === "blocked" ? "Open search manually" : "Open provider search";
+      card.appendChild(link);
+    }
+
     providerHealthGridEl.appendChild(card);
   }
 }

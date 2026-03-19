@@ -15,7 +15,7 @@ from ..config import (
     KAYAK_SCRAPE_SCHEME,
     MOMONDO_SCRAPE_HOST,
 )
-from ..exceptions import ProviderNoResultError
+from ..exceptions import ProviderBlockedError, ProviderNoResultError
 from ..utils import (
     absolute_kayak_url,
     convert_currency_amount,
@@ -39,6 +39,25 @@ class KayakScrapeClient:
     credential_env: tuple[str, ...] = ()
     docs_url = "https://www.kayak.com/flights/"
     _NO_RESULT_CODES = {"NO_RESULTS", "NO_RESULTS_FOUND", "NO_RESULTS_AVAILABLE"}
+    _BLOCK_MARKERS = (
+        "captcha",
+        "captcha-v2",
+        "px-captcha",
+        "perimeterx",
+        "verify you are human",
+        "verify you are a human",
+        "security challenge",
+        "security check",
+        "access denied",
+        "attention required",
+        "are you a robot",
+        "automated access",
+        "just a moment",
+        "unusual traffic",
+        "bot protection",
+        "cf-chl",
+    )
+    _BLOCK_URL_MARKERS = ("/captcha", "captcha-v2", "px-captcha", "/challenge", "cf-chl")
 
     def __init__(
         self,
@@ -182,7 +201,49 @@ class KayakScrapeClient:
                 return code
         return str(first).strip()
 
-    def _extract_bootstrap(self, html: str) -> tuple[str, dict[str, Any]]:
+    @classmethod
+    def _is_blocked_page(
+        cls,
+        html: str,
+        final_url: str | None = None,
+        status_code: int | None = None,
+    ) -> bool:
+        """Return whether the HTML response indicates anti-bot blocking."""
+        if status_code in {403, 429, 451, 503}:
+            return True
+        lowered_url = str(final_url or "").lower()
+        if any(marker in lowered_url for marker in cls._BLOCK_URL_MARKERS):
+            return True
+        lowered_html = str(html or "").lower()
+        return any(marker in lowered_html for marker in cls._BLOCK_MARKERS)
+
+    @classmethod
+    def _is_blocked_detail(cls, detail: str, status_code: int | None = None) -> bool:
+        """Return whether an error detail looks like bot protection."""
+        if status_code in {403, 429, 451, 503}:
+            return True
+        lowered = str(detail or "").lower()
+        return any(marker in lowered for marker in cls._BLOCK_MARKERS)
+
+    def _blocked_error(
+        self,
+        *,
+        manual_search_url: str | None,
+        detail: str | None = None,
+    ) -> ProviderBlockedError:
+        """Build a normalized anti-bot exception for the provider."""
+        base_message = f"{self.display_name} blocked automated scraping (captcha/anti-bot challenge)."
+        detail_text = str(detail or "").strip()
+        if detail_text:
+            base_message = f"{base_message} Detail: {detail_text}."
+        return ProviderBlockedError(base_message, manual_search_url=manual_search_url)
+
+    def _extract_bootstrap(
+        self,
+        html: str,
+        *,
+        manual_search_url: str | None = None,
+    ) -> tuple[str, dict[str, Any]]:
         """Extract bootstrap data from the provider page.
 
         Args:
@@ -197,6 +258,8 @@ class KayakScrapeClient:
             re.IGNORECASE | re.DOTALL,
         )
         if not match:
+            if self._is_blocked_page(html, manual_search_url):
+                raise self._blocked_error(manual_search_url=manual_search_url)
             raise RuntimeError("Kayak bootstrap data missing (jsonData_R9DataStorage not found)")
         try:
             bootstrap = json.loads(match.group(1))
@@ -207,6 +270,8 @@ class KayakScrapeClient:
             ((bootstrap.get("serverData") or {}).get("global") or {}).get("formtoken") or ""
         ).strip()
         if not formtoken:
+            if self._is_blocked_page(html, manual_search_url):
+                raise self._blocked_error(manual_search_url=manual_search_url)
             raise RuntimeError("Kayak formtoken is missing")
         return formtoken, bootstrap
 
@@ -243,6 +308,7 @@ class KayakScrapeClient:
             headers=headers,
             timeout=45,
         )
+        response_text = str(response.text or "")
         body = self._safe_json_from_response(response)
         if response.status_code >= 400:
             detail = self._extract_error_detail(body) or f"HTTP {response.status_code}"
@@ -257,6 +323,11 @@ class KayakScrapeClient:
             lowered = detail.lower()
             if any(code.lower() in lowered for code in self._NO_RESULT_CODES):
                 raise ProviderNoResultError(detail)
+            if self._is_blocked_page(response_text, referer_url, response.status_code) or self._is_blocked_detail(
+                detail,
+                response.status_code,
+            ):
+                raise self._blocked_error(manual_search_url=referer_url, detail=detail)
             raise RuntimeError(detail)
 
         errors = body.get("errors")
@@ -273,6 +344,11 @@ class KayakScrapeClient:
             lowered = detail.lower()
             if any(code.lower() in lowered for code in self._NO_RESULT_CODES):
                 raise ProviderNoResultError(detail)
+            if self._is_blocked_page(response_text, referer_url, response.status_code) or self._is_blocked_detail(
+                detail,
+                response.status_code,
+            ):
+                raise self._blocked_error(manual_search_url=referer_url, detail=detail)
             raise RuntimeError(detail)
         _capture_provider_response(
             self.provider_id,
@@ -356,8 +432,15 @@ class KayakScrapeClient:
             page_url,
             timeout=45,
         )
+        final_page_url = str(page_response.url or page_url)
+        if self._is_blocked_page(page_response.text, final_page_url, page_response.status_code):
+            detail = f"HTTP {page_response.status_code}" if page_response.status_code >= 400 else None
+            raise self._blocked_error(manual_search_url=final_page_url, detail=detail)
         page_response.raise_for_status()
-        csrf_token, _bootstrap = self._extract_bootstrap(page_response.text)
+        csrf_token, _bootstrap = self._extract_bootstrap(
+            page_response.text,
+            manual_search_url=final_page_url,
+        )
 
         passenger_count = max(1, int(adults or 1))
         passengers = ["ADT"] * passenger_count
@@ -377,7 +460,7 @@ class KayakScrapeClient:
         }
 
         latest = self._post_poll(
-            referer_url=page_response.url,
+            referer_url=final_page_url,
             csrf_token=csrf_token,
             payload=search_payload,
         )
@@ -393,7 +476,7 @@ class KayakScrapeClient:
             search_payload["searchMetaData"]["skipResultsInSecondPhase"] = False
             time.sleep(0.6)
             latest = self._post_poll(
-                referer_url=page_response.url,
+                referer_url=final_page_url,
                 csrf_token=csrf_token,
                 payload=search_payload,
             )

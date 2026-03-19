@@ -5,7 +5,7 @@ import re
 from typing import Any
 
 from ..config import ALLOW_PLAYWRIGHT_PROVIDERS
-from ..exceptions import ProviderNoResultError
+from ..exceptions import ProviderBlockedError, ProviderNoResultError
 from ..utils import (
     build_comparison_links,
     parse_duration_text_seconds,
@@ -273,6 +273,29 @@ class GoogleFlightsLocalClient:
             int(candidate.get("duration_seconds") or PRICE_SENTINEL),
         )
 
+    @staticmethod
+    def _manual_search_url(
+        *,
+        source: str,
+        destination: str,
+        outbound_iso: str,
+        inbound_iso: str | None,
+        currency: str,
+        adults: int,
+        max_stops_per_leg: int,
+    ) -> str | None:
+        """Build the Google Flights manual search URL for the current query."""
+        comparison_links = build_comparison_links(
+            source,
+            destination,
+            outbound_iso,
+            inbound_iso or outbound_iso,
+            adults=adults,
+            max_stops_per_leg=max_stops_per_leg,
+            currency=currency,
+        )
+        return str(comparison_links.get("google_flights") or "").strip() or None
+
     def _fetch_flights(
         self,
         *,
@@ -282,6 +305,7 @@ class GoogleFlightsLocalClient:
         currency: str,
         adults: int,
         max_stops_per_leg: int,
+        manual_search_url: str | None = None,
     ) -> list[Any]:
         """Fetch flight options from the provider backend.
 
@@ -325,6 +349,7 @@ class GoogleFlightsLocalClient:
                     adults=adults,
                     max_stops_per_leg=max_stops_per_leg,
                     fetch_mode=normalized_mode,
+                    manual_search_url=manual_search_url,
                 )
             except ProviderNoResultError as exc:
                 last_error = exc
@@ -346,6 +371,7 @@ class GoogleFlightsLocalClient:
         adults: int,
         max_stops_per_leg: int,
         fetch_mode: str,
+        manual_search_url: str | None = None,
     ) -> list[Any]:
         """Fetch flight options for a specific Google Flights fetch mode.
 
@@ -382,13 +408,14 @@ class GoogleFlightsLocalClient:
         except RuntimeError as exc:
             message = str(exc)
             lowered = message.lower()
-            if "no flights found" in lowered or "before you continue" in lowered:
+            if "before you continue" in lowered or "consent page" in lowered:
+                raise ProviderBlockedError(
+                    "Google Flights returned a consent or challenge page instead of fares.",
+                    manual_search_url=manual_search_url,
+                ) from exc
+            if "no flights found" in lowered:
                 raise ProviderNoResultError(
                     "Google Flights returned no offers for this query."
-                ) from exc
-            if "consent page" in lowered:
-                raise ProviderNoResultError(
-                    "Google Flights returned a consent page instead of fares."
                 ) from exc
             raise
         except AssertionError as exc:
@@ -462,16 +489,15 @@ class GoogleFlightsLocalClient:
             return None
         source_code = source.upper()
         destination_code = destination.upper()
-        comparison_links = build_comparison_links(
-            source_code,
-            destination_code,
-            departure_iso,
-            departure_iso,
+        booking_url = self._manual_search_url(
+            source=source_code,
+            destination=destination_code,
+            outbound_iso=departure_iso,
+            inbound_iso=None,
+            currency=currency,
             adults=adults,
             max_stops_per_leg=max_stops_per_leg,
-            currency=currency,
         )
-        booking_url = comparison_links.get("google_flights")
         flights = self._fetch_flights(
             source=source_code,
             destination=destination_code,
@@ -479,6 +505,7 @@ class GoogleFlightsLocalClient:
             currency=currency,
             adults=adults,
             max_stops_per_leg=max_stops_per_leg,
+            manual_search_url=booking_url,
         )
         best: dict[str, Any] | None = None
         for flight in flights:
@@ -530,41 +557,47 @@ class GoogleFlightsLocalClient:
         """
         if not self.is_configured():
             return None
-        outbound = self.get_best_oneway(
-            source=source,
-            destination=destination,
-            departure_iso=outbound_iso,
+        booking_url = self._manual_search_url(
+            source=source.upper(),
+            destination=destination.upper(),
+            outbound_iso=outbound_iso,
+            inbound_iso=inbound_iso,
             currency=currency,
-            max_stops_per_leg=max_stops_per_leg,
             adults=adults,
-            hand_bags=hand_bags,
-            hold_bags=hold_bags,
-            max_connection_layover_seconds=max_connection_layover_seconds,
-        )
-        inbound = self.get_best_oneway(
-            source=destination,
-            destination=source,
-            departure_iso=inbound_iso,
-            currency=currency,
             max_stops_per_leg=max_stops_per_leg,
-            adults=adults,
-            hand_bags=hand_bags,
-            hold_bags=hold_bags,
-            max_connection_layover_seconds=max_connection_layover_seconds,
         )
+        try:
+            outbound = self.get_best_oneway(
+                source=source,
+                destination=destination,
+                departure_iso=outbound_iso,
+                currency=currency,
+                max_stops_per_leg=max_stops_per_leg,
+                adults=adults,
+                hand_bags=hand_bags,
+                hold_bags=hold_bags,
+                max_connection_layover_seconds=max_connection_layover_seconds,
+            )
+            inbound = self.get_best_oneway(
+                source=destination,
+                destination=source,
+                departure_iso=inbound_iso,
+                currency=currency,
+                max_stops_per_leg=max_stops_per_leg,
+                adults=adults,
+                hand_bags=hand_bags,
+                hold_bags=hold_bags,
+                max_connection_layover_seconds=max_connection_layover_seconds,
+            )
+        except ProviderBlockedError as exc:
+            raise ProviderBlockedError(
+                str(exc),
+                manual_search_url=booking_url or exc.manual_search_url,
+                cooldown_seconds=exc.cooldown_seconds,
+            ) from exc
         if not outbound or not inbound:
             return None
         total_price = int(outbound["price"]) + int(inbound["price"])
-        comparison_links = build_comparison_links(
-            source,
-            destination,
-            outbound_iso,
-            inbound_iso,
-            adults=adults,
-            max_stops_per_leg=max_stops_per_leg,
-            currency=currency,
-        )
-        booking_url = comparison_links.get("google_flights")
         outbound_duration_seconds = outbound.get("duration_seconds")
         inbound_duration_seconds = inbound.get("duration_seconds")
         total_duration_seconds = (

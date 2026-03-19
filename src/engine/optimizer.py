@@ -6962,9 +6962,23 @@ class SplitTripOptimizer:
                 "budget": dict(provider_stats.get("budget") or {}),
             }
         )
+        provider_health_entries = provider_health.get("providers") or {}
         if progress is not None:
             progress.set_runtime_data("provider_health", provider_health)
         provider_error_messages: list[str] = []
+        for provider_id, entry in provider_health_entries.items():
+            blocked_count = int((entry or {}).get("blocked") or 0)
+            if blocked_count <= 0:
+                continue
+            blocked_message = (
+                f"Provider {provider_id} hit anti-bot protection on {blocked_count} live checks."
+            )
+            cooldown_seconds = int((entry or {}).get("cooldown_seconds") or 0)
+            if cooldown_seconds > 0:
+                blocked_message += f" Retry in ~{cooldown_seconds}s."
+            if str((entry or {}).get("manual_search_url") or "").strip():
+                blocked_message += " Manual provider search is available from provider health."
+            provider_error_messages.append(blocked_message)
         for bucket in ("calendar_errors", "oneway_errors", "return_errors"):
             errors = provider_stats.get(bucket) or {}
             for provider_id, count in errors.items():
@@ -6990,10 +7004,19 @@ class SplitTripOptimizer:
             for provider_id, count in skipped.items():
                 if int(count) <= 0:
                     continue
-                provider_error_messages.append(
-                    f"Provider {provider_id} temporarily paused after runtime errors; "
-                    f"skipped {count} {bucket.replace('_', ' ')} checks."
+                issue_type = str(
+                    (provider_health_entries.get(provider_id) or {}).get("last_issue_type") or ""
                 )
+                if issue_type == "blocked":
+                    provider_error_messages.append(
+                        f"Provider {provider_id} temporarily paused after bot protection; "
+                        f"skipped {count} {bucket.replace('_', ' ')} checks."
+                    )
+                else:
+                    provider_error_messages.append(
+                        f"Provider {provider_id} temporarily paused after runtime errors; "
+                        f"skipped {count} {bucket.replace('_', ' ')} checks."
+                    )
         for bucket in ("calendar_no_result", "oneway_no_result", "return_no_result"):
             no_results = provider_stats.get(bucket) or {}
             for provider_id, count in no_results.items():

@@ -23,7 +23,7 @@ from ..config import (
     SKYSCANNER_SCRAPE_PLAYWRIGHT_FALLBACK,
     SKYSCANNER_WAF_COOLDOWN_SECONDS,
 )
-from ..exceptions import ProviderNoResultError
+from ..exceptions import ProviderBlockedError, ProviderNoResultError
 from ..utils import date_only, parse_money_amount_int
 from ._cache import per_instance_lru_cache
 
@@ -428,9 +428,11 @@ class SkyscannerScrapeClient:
         """
         provider_cooldown = self._provider_cooldown_remaining_seconds()
         if provider_cooldown > 0:
-            raise ProviderNoResultError(
+            raise ProviderBlockedError(
                 "Skyscanner temporarily paused after anti-bot blocking "
-                f"(retry in ~{provider_cooldown}s)."
+                f"(retry in ~{provider_cooldown}s).",
+                manual_search_url=url,
+                cooldown_seconds=provider_cooldown,
             )
 
         blocked_detected = False
@@ -468,12 +470,15 @@ class SkyscannerScrapeClient:
                 try:
                     html, final_url = self._fetch_search_html_playwright(host_url)
                 except ProviderNoResultError as exc:
-                    message = str(exc or "").lower()
-                    if any(
-                        token in message
-                        for token in ("blocked", "captcha", "anti-bot", "challenge")
-                    ):
+                    if isinstance(exc, ProviderBlockedError):
                         blocked_detected = True
+                    else:
+                        message = str(exc or "").lower()
+                        if any(
+                            token in message
+                            for token in ("blocked", "captcha", "anti-bot", "challenge")
+                        ):
+                            blocked_detected = True
                     errors.append(f"{host} Playwright skipped: {exc}")
                     continue
                 except Exception as exc:
@@ -489,8 +494,10 @@ class SkyscannerScrapeClient:
 
         if blocked_detected:
             self._set_provider_cooldown(SKYSCANNER_WAF_COOLDOWN_SECONDS)
-            raise ProviderNoResultError(
-                "Skyscanner blocked automated scraping (captcha/anti-bot challenge)."
+            raise ProviderBlockedError(
+                "Skyscanner blocked automated scraping (captcha/anti-bot challenge).",
+                manual_search_url=url,
+                cooldown_seconds=SKYSCANNER_WAF_COOLDOWN_SECONDS,
             )
         summary = "; ".join(errors[:3]) if errors else "unknown fetch failure"
         raise RuntimeError(f"Skyscanner scrape failed: {summary}")

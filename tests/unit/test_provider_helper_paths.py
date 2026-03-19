@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 import requests
 
-from src.exceptions import ProviderNoResultError
+from src.exceptions import ProviderBlockedError, ProviderNoResultError
 from src.providers import google_flights as google_flights_module
 from src.providers.amadeus import AmadeusClient
 from src.providers.google_flights import GoogleFlightsLocalClient
@@ -435,9 +435,15 @@ def test_kayak_helper_paths_cover_bootstrap_polling_and_static_helpers(monkeypat
     assert KayakScrapeClient._booking_price_per_person_flag({"priceMode": "perPassenger"}) is True
     assert KayakScrapeClient._booking_price_per_person_flag({"priceMode": "total"}) is False
     assert KayakScrapeClient._booking_price_per_person_flag({"nested": {"perPerson": True}}) is True
+    assert client._is_blocked_page("Verify you are human", "https://www.kayak.com", 200) is True
 
     with pytest.raises(RuntimeError, match="missing"):
         client._extract_bootstrap("<html></html>")
+    with pytest.raises(ProviderBlockedError, match="blocked automated scraping"):
+        client._extract_bootstrap(
+            "<html><body>Verify you are human</body></html>",
+            manual_search_url="https://www.kayak.com/flights/OTP-MGA/2026-03-10",
+        )
     with pytest.raises(RuntimeError, match="parse failed"):
         client._extract_bootstrap('<script id="jsonData_R9DataStorage">{bad}</script>')
     with pytest.raises(RuntimeError, match="formtoken is missing"):
@@ -470,6 +476,21 @@ def test_kayak_helper_paths_cover_bootstrap_polling_and_static_helpers(monkeypat
     monkeypatch.setattr(client, "_post_poll", lambda **kwargs: next(polls))
     payload = client._search_payload("OTP", "MGA", "2026-03-10", None, "RON", 2)
     assert payload["status"] == "complete"
+
+    blocked_session = _FakeSession(
+        get_responses=[
+            _FakeResponse(
+                {},
+                text="<html><body>Verify you are human</body></html>",
+                status_code=403,
+                url="https://www.kayak.com/captcha",
+            )
+        ]
+    )
+    monkeypatch.setattr(client, "_session", lambda: blocked_session)
+    with pytest.raises(ProviderBlockedError, match="blocked automated scraping") as blocked_exc:
+        client._search_payload("OTP", "MGA", "2026-03-10", None, "RON", 2)
+    assert blocked_exc.value.manual_search_url == "https://www.kayak.com/captcha"
 
     result = {
         "bookingOptions": [{"displayPrice": {"price": "100", "currency": "USD"}}],
@@ -526,6 +547,20 @@ def test_kayak_helper_paths_cover_bootstrap_polling_and_static_helpers(monkeypat
     with pytest.raises(ProviderNoResultError):
         client._post_poll("https://www.kayak.com", "csrf", {"legs": []})
 
+    blocked_session = _FakeSession(
+        post_responses=[
+            _FakeResponse(
+                {"errors": [{"code": "CAPTCHA_REQUIRED", "description": "Verify you are human"}]},
+                status_code=429,
+                text='{"errors":[{"code":"CAPTCHA_REQUIRED","description":"Verify you are human"}]}',
+            )
+        ]
+    )
+    monkeypatch.setattr(client, "_session", lambda: blocked_session)
+    with pytest.raises(ProviderBlockedError, match="blocked automated scraping") as blocked_poll:
+        client._post_poll("https://www.kayak.com/flights/OTP-MGA/2026-03-10", "csrf", {"legs": []})
+    assert blocked_poll.value.manual_search_url == "https://www.kayak.com/flights/OTP-MGA/2026-03-10"
+
 
 def test_skyscanner_helper_paths_cover_regex_and_runtime_errors(monkeypatch) -> None:
     client = SkyscannerScrapeClient(
@@ -579,6 +614,36 @@ def test_skyscanner_helper_paths_cover_regex_and_runtime_errors(monkeypatch) -> 
     )
     with pytest.raises(ProviderNoResultError):
         client.get_best_oneway("OTP", "MGA", "2026-03-10", "RON", 1, 1, 0, 0)
+
+    cooldown_client = SkyscannerScrapeClient(
+        host="www.skyscanner.com",
+        host_candidates=["www.skyscanner.net"],
+        http_retries=1,
+        playwright_fallback=False,
+    )
+    monkeypatch.setattr(cooldown_client, "_provider_cooldown_remaining_seconds", lambda: 11)
+    with pytest.raises(ProviderBlockedError, match="retry in ~11s") as cooldown_exc:
+        cooldown_client._fetch_search_html(
+            "https://www.skyscanner.com/transport/flights/otp/mga/20260310"
+        )
+    assert cooldown_exc.value.manual_search_url == "https://www.skyscanner.com/transport/flights/otp/mga/20260310"
+    assert cooldown_exc.value.cooldown_seconds == 11
+
+    monkeypatch.setattr(cooldown_client, "_provider_cooldown_remaining_seconds", lambda: 0)
+    monkeypatch.setattr(
+        cooldown_client,
+        "_http_fetch_search_html",
+        lambda url, attempt_idx=0: (
+            "<html><body>Verify you are human</body></html>",
+            url,
+            200,
+        ),
+    )
+    with pytest.raises(ProviderBlockedError, match="blocked automated scraping") as blocked_exc:
+        cooldown_client._fetch_search_html(
+            "https://www.skyscanner.com/transport/flights/otp/mga/20260310"
+        )
+    assert blocked_exc.value.manual_search_url == "https://www.skyscanner.com/transport/flights/otp/mga/20260310"
 
     monkeypatch.setattr(
         client,
@@ -1172,7 +1237,11 @@ def test_kayak_client_remaining_edge_paths_cover_search_payload_and_filtering(mo
         get_responses=[_FakeResponse({}, text="<html></html>", url="https://www.kayak.com/flights")]
     )
     monkeypatch.setattr(search_client, "_session", lambda: search_session)
-    monkeypatch.setattr(search_client, "_extract_bootstrap", lambda _html: ("csrf", {}))
+    monkeypatch.setattr(
+        search_client,
+        "_extract_bootstrap",
+        lambda _html, manual_search_url=None: ("csrf", {}),
+    )
     monkeypatch.setattr(search_client, "_post_poll", lambda **_kwargs: {"status": "pending"})
     assert search_client._search_payload(
         source="OTP",
@@ -1989,6 +2058,21 @@ def test_google_flights_client_remaining_edge_paths_cover_runtime_and_return_log
             adults=1,
             max_stops_per_leg=1,
         )
+
+    client._get_flights_fn = lambda **kwargs: (_ for _ in ()).throw(
+        RuntimeError("Before you continue to Google Flights")
+    )
+    with pytest.raises(ProviderBlockedError, match="consent or challenge page") as blocked_exc:
+        client._fetch_flights(
+            source="OTP",
+            destination="MGA",
+            date_iso="2026-03-10",
+            currency="RON",
+            adults=1,
+            max_stops_per_leg=1,
+            manual_search_url="https://www.google.com/travel/flights",
+        )
+    assert blocked_exc.value.manual_search_url == "https://www.google.com/travel/flights"
 
     client._get_flights_fn = lambda **kwargs: (_ for _ in ()).throw(AssertionError("assertion"))
     with pytest.raises(RuntimeError, match="Google Flights request failed: assertion"):

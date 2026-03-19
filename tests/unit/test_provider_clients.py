@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import requests
 
-from src.exceptions import ProviderNoResultError
+from src.exceptions import ProviderBlockedError, ProviderNoResultError
 from src.providers.amadeus import AmadeusClient
 from src.providers.kiwi import KiwiClient
 from src.providers.multi import MultiProviderClient
@@ -683,10 +683,24 @@ def test_multi_provider_client_internal_selection_pause_and_tiebreak_paths(monke
     )
     broken = _Provider("serpapi", error=OSError(24, "Too many open files"))
     no_result = _Provider("googleflights", error=ProviderNoResultError("no result"))
+    blocked = _Provider(
+        "kayak",
+        error=ProviderBlockedError(
+            "Kayak blocked automated scraping (captcha/anti-bot challenge).",
+            manual_search_url="https://www.kayak.com/flights/OTP-MGA/2026-03-10",
+            cooldown_seconds=120,
+        ),
+    )
     client = MultiProviderClient(
-        [fast, slow, broken, no_result],
+        [fast, slow, broken, no_result, blocked],
         max_total_calls=3,
-        max_calls_by_provider={"kiwi": 2, "amadeus": 1, "serpapi": 1, "googleflights": 1},
+        max_calls_by_provider={
+            "kiwi": 2,
+            "amadeus": 1,
+            "serpapi": 1,
+            "googleflights": 1,
+            "kayak": 1,
+        },
     )
 
     now = {"value": 1000.0}
@@ -697,7 +711,7 @@ def test_multi_provider_client_internal_selection_pause_and_tiebreak_paths(monke
         lambda *_args, **kwargs: logged.append(str(kwargs.get("provider_id") or "")),
     )
 
-    assert client.active_provider_ids == ["kiwi", "amadeus", "serpapi", "googleflights"]
+    assert client.active_provider_ids == ["kiwi", "amadeus", "serpapi", "googleflights", "kayak"]
     assert [
         provider.provider_id for provider in client._providers_for_selection(("kiwi", "amadeus"))
     ] == [
@@ -715,7 +729,9 @@ def test_multi_provider_client_internal_selection_pause_and_tiebreak_paths(monke
     assert second is not None
     assert second["provider"] == "kiwi"
     assert "serpapi" in logged
+    assert "kayak" in logged
     assert client._provider_pause_remaining_seconds("serpapi") > 0
+    assert client._provider_pause_remaining_seconds("kayak") > 0
 
     now["value"] += 1
     assert (
@@ -728,13 +744,15 @@ def test_multi_provider_client_internal_selection_pause_and_tiebreak_paths(monke
             1,
             0,
             0,
-            provider_ids=("serpapi", "googleflights"),
+            provider_ids=("serpapi", "googleflights", "kayak"),
         )
         is None
     )
     stats = client.stats_snapshot()
     assert stats["oneway_errors"]["serpapi"] == 1
     assert stats["oneway_no_result"]["googleflights"] == 1
+    assert stats["oneway_blocked"]["kayak"] == 1
+    assert stats["oneway_skipped_cooldown"]["kayak"] == 1
 
 
 def test_multi_provider_client_remaining_calendar_budget_and_helper_paths(
@@ -1987,6 +2005,7 @@ def test_multi_provider_health_snapshot_reports_selected_no_result_errors_and_li
             _StubProvider("kiwi"),
             _StubProvider("kayak"),
             _StubProvider("momondo"),
+            _StubProvider("googleflights"),
         ]
     )
     snapshots: list[dict[str, object]] = []
@@ -1999,6 +2018,15 @@ def test_multi_provider_health_snapshot_reports_selected_no_result_errors_and_li
     client._bump("calendar_calls", "momondo", 1)
     client._bump("calendar_errors", "momondo", 1)
     client._bump("calendar_skipped_budget", "momondo", 1)
+    client._register_provider_block(
+        "googleflights",
+        ProviderBlockedError(
+            "Google Flights returned a consent or challenge page instead of fares.",
+            manual_search_url="https://www.google.com/travel/flights",
+            cooldown_seconds=45,
+        ),
+    )
+    client._bump("oneway_blocked", "googleflights", 2)
 
     snapshot = client.health_snapshot()
 
@@ -2010,6 +2038,10 @@ def test_multi_provider_health_snapshot_reports_selected_no_result_errors_and_li
     assert snapshot["providers"]["momondo"]["status"] == "error"
     assert snapshot["providers"]["momondo"]["errors"] == 1
     assert snapshot["providers"]["momondo"]["skipped_budget"] == 1
+    assert snapshot["providers"]["googleflights"]["status"] == "blocked"
+    assert snapshot["providers"]["googleflights"]["blocked"] == 2
+    assert snapshot["providers"]["googleflights"]["manual_search_url"] == "https://www.google.com/travel/flights"
+    assert snapshot["providers"]["googleflights"]["cooldown_seconds"] > 0
     assert snapshots
     assert snapshots[-1]["providers"]["kiwi"]["selected"] == 3
 

@@ -634,6 +634,11 @@ input[type="checkbox"] {
   background: #f5fcf8;
 }
 
+.provider-health-card[data-status="blocked"] {
+  border-color: #efcf9d;
+  background: #fff8ee;
+}
+
 .provider-health-card[data-status="error"] {
   border-color: #f2cccc;
   background: #fff8f8;
@@ -679,6 +684,30 @@ input[type="checkbox"] {
 
 .provider-health-detail {
   color: #5c7184;
+}
+
+.provider-health-issue {
+  margin: 6px 0 0;
+  font-size: 0.72rem;
+  line-height: 1.35;
+  color: #7b4d1f;
+}
+
+.provider-health-card[data-status="error"] .provider-health-issue {
+  color: #8b3f3f;
+}
+
+.provider-health-link {
+  display: inline-flex;
+  margin-top: 6px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: #8b5a16;
+  text-decoration: none;
+}
+
+.provider-health-link:hover {
+  text-decoration: underline;
 }
 
 .progress-log {
