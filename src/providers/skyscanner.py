@@ -7,16 +7,21 @@ import math
 import re
 import threading
 import time
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 import requests
 
 from ..config import (
+    SKYSCANNER_PLAYWRIGHT_ASSIST_TIMEOUT_SECONDS,
+    SKYSCANNER_PLAYWRIGHT_ASSISTED,
     SKYSCANNER_PLAYWRIGHT_ACQUIRE_TIMEOUT_SECONDS,
+    SKYSCANNER_PLAYWRIGHT_BROWSER_CHANNEL,
     SKYSCANNER_PLAYWRIGHT_ERROR_COOLDOWN_SECONDS,
     SKYSCANNER_PLAYWRIGHT_HOST_ATTEMPTS,
     SKYSCANNER_PLAYWRIGHT_MAX_CONCURRENCY,
+    SKYSCANNER_PLAYWRIGHT_PROFILE_DIR,
     SKYSCANNER_SCRAPE_HOST,
     SKYSCANNER_SCRAPE_HOSTS,
     SKYSCANNER_SCRAPE_HTTP_RETRIES,
@@ -81,6 +86,7 @@ class SkyscannerScrapeClient:
         host_candidates: list[str] | tuple[str, ...] | None = None,
         http_retries: int | None = None,
         playwright_fallback: bool | None = None,
+        playwright_assisted: bool | None = None,
     ) -> None:
         """Initialize the SkyscannerScrapeClient.
 
@@ -109,6 +115,11 @@ class SkyscannerScrapeClient:
             bool(playwright_fallback)
             if playwright_fallback is not None
             else SKYSCANNER_SCRAPE_PLAYWRIGHT_FALLBACK
+        )
+        self._playwright_assisted = (
+            bool(playwright_assisted)
+            if playwright_assisted is not None
+            else SKYSCANNER_PLAYWRIGHT_ASSISTED
         )
         self._local = threading.local()
 
@@ -417,6 +428,75 @@ class SkyscannerScrapeClient:
         finally:
             self._PLAYWRIGHT_GATE.release()
 
+    def _fetch_search_html_playwright_assisted(self, url: str) -> tuple[str, str]:
+        """Open a visible persistent browser window so the user can complete verification."""
+        try:
+            from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+        except Exception as exc:
+            raise ProviderNoResultError(
+                "Skyscanner browser-assisted mode is unavailable. Install with "
+                "`python3 -m pip install playwright` then "
+                "`python3 -m playwright install chromium`."
+            ) from exc
+
+        profile_dir = Path(SKYSCANNER_PLAYWRIGHT_PROFILE_DIR).expanduser()
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        launch_kwargs: dict[str, Any] = {
+            "headless": False,
+            "locale": "en-US",
+            "user_agent": self._USER_AGENTS[0],
+        }
+        if SKYSCANNER_PLAYWRIGHT_BROWSER_CHANNEL:
+            launch_kwargs["channel"] = SKYSCANNER_PLAYWRIGHT_BROWSER_CHANNEL
+
+        playwright, _ = self._get_or_start_playwright_runtime()
+        context = playwright.chromium.launch_persistent_context(
+            str(profile_dir),
+            **launch_kwargs,
+        )
+        try:
+            page = context.pages[0] if context.pages else context.new_page()
+            with contextlib.suppress(Exception):
+                page.bring_to_front()
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            except PlaywrightTimeoutError as exc:
+                raise RuntimeError(
+                    "Skyscanner browser-assisted navigation timed out."
+                ) from exc
+
+            deadline = time.time() + SKYSCANNER_PLAYWRIGHT_ASSIST_TIMEOUT_SECONDS
+            last_html = ""
+            last_url = str(page.url or url)
+            while time.time() < deadline:
+                with contextlib.suppress(PlaywrightTimeoutError):
+                    page.wait_for_load_state("networkidle", timeout=1500)
+                page.wait_for_timeout(1000)
+                last_url = str(page.url or url)
+                last_html = str(page.content() or "")
+                if (
+                    not self._is_bot_blocked_response(last_html, last_url, 200)
+                    and self._response_has_parsable_fares(last_html)
+                ):
+                    return last_html, last_url
+
+            if self._is_bot_blocked_response(last_html, last_url, 200):
+                raise ProviderBlockedError(
+                    "Skyscanner browser-assisted mode needs you to complete the visible "
+                    "verification window, then rerun the search.",
+                    manual_search_url=url,
+                )
+            if last_html.strip():
+                raise ProviderNoResultError(
+                    "Skyscanner browser-assisted mode loaded HTML without parsable fares."
+                )
+            raise ProviderNoResultError(
+                "Skyscanner browser-assisted mode returned empty HTML."
+            )
+        finally:
+            with contextlib.suppress(Exception):
+                context.close()
+
     def _fetch_search_html(self, url: str) -> tuple[str, str]:
         """Fetch the search page using the best available strategy.
 
@@ -437,6 +517,7 @@ class SkyscannerScrapeClient:
 
         blocked_detected = False
         fareless_html_detected = False
+        last_blocked_error: ProviderBlockedError | None = None
         errors: list[str] = []
         hosts = self._hosts_to_try()
         for host in hosts:
@@ -453,6 +534,11 @@ class SkyscannerScrapeClient:
 
                 if self._is_bot_blocked_response(html, final_url, status_code):
                     blocked_detected = True
+                    last_blocked_error = ProviderBlockedError(
+                        "Skyscanner blocked automated scraping (captcha/anti-bot challenge).",
+                        manual_search_url=url,
+                        cooldown_seconds=SKYSCANNER_WAF_COOLDOWN_SECONDS,
+                    )
                     errors.append(f"{host} blocked with status {status_code}")
                     break
 
@@ -477,6 +563,7 @@ class SkyscannerScrapeClient:
                 except ProviderNoResultError as exc:
                     if isinstance(exc, ProviderBlockedError):
                         blocked_detected = True
+                        last_blocked_error = exc
                     else:
                         message = str(exc or "").lower()
                         if any(
@@ -490,7 +577,50 @@ class SkyscannerScrapeClient:
                     errors.append(f"{host} Playwright error: {exc}")
                     continue
                 if self._is_bot_blocked_response(html, final_url, 200):
+                    if self._playwright_assisted:
+                        try:
+                            html, final_url = self._fetch_search_html_playwright_assisted(host_url)
+                        except ProviderNoResultError as exc:
+                            if isinstance(exc, ProviderBlockedError):
+                                blocked_detected = True
+                                last_blocked_error = exc
+                            else:
+                                message = str(exc or "").lower()
+                                if any(
+                                    token in message
+                                    for token in ("blocked", "captcha", "anti-bot", "challenge")
+                                ):
+                                    blocked_detected = True
+                            errors.append(f"{host} Playwright assisted skipped: {exc}")
+                            continue
+                        except Exception as exc:
+                            errors.append(f"{host} Playwright assisted error: {exc}")
+                            continue
+                        if self._is_bot_blocked_response(html, final_url, 200):
+                            blocked_detected = True
+                            last_blocked_error = ProviderBlockedError(
+                                "Skyscanner blocked automated scraping (captcha/anti-bot challenge).",
+                                manual_search_url=url,
+                                cooldown_seconds=SKYSCANNER_WAF_COOLDOWN_SECONDS,
+                            )
+                            errors.append(f"{host} Playwright assisted still blocked")
+                            continue
+                        if html.strip():
+                            if self._response_has_parsable_fares(html):
+                                return html, final_url
+                            fareless_html_detected = True
+                            errors.append(
+                                f"{host} Playwright assisted returned HTML without fare data"
+                            )
+                            continue
+                        errors.append(f"{host} Playwright assisted empty HTML response")
+                        continue
                     blocked_detected = True
+                    last_blocked_error = ProviderBlockedError(
+                        "Skyscanner blocked automated scraping (captcha/anti-bot challenge).",
+                        manual_search_url=url,
+                        cooldown_seconds=SKYSCANNER_WAF_COOLDOWN_SECONDS,
+                    )
                     errors.append(f"{host} Playwright blocked with challenge page")
                     continue
                 if html.strip():
@@ -502,11 +632,25 @@ class SkyscannerScrapeClient:
                 errors.append(f"{host} Playwright empty HTML response")
 
         if blocked_detected:
-            self._set_provider_cooldown(SKYSCANNER_WAF_COOLDOWN_SECONDS)
+            blocked_message = str(last_blocked_error or "").strip()
+            if not blocked_message:
+                blocked_message = "Skyscanner blocked automated scraping (captcha/anti-bot challenge)."
+                if self._playwright_fallback and not self._playwright_assisted:
+                    blocked_message += (
+                        " Enable browser-assisted Playwright mode to complete the verification locally."
+                    )
+            cooldown_seconds = int(
+                (last_blocked_error.cooldown_seconds if last_blocked_error else None)
+                or SKYSCANNER_WAF_COOLDOWN_SECONDS
+            )
+            manual_search_url = (
+                (last_blocked_error.manual_search_url if last_blocked_error else None) or url
+            )
+            self._set_provider_cooldown(cooldown_seconds)
             raise ProviderBlockedError(
-                "Skyscanner blocked automated scraping (captcha/anti-bot challenge).",
-                manual_search_url=url,
-                cooldown_seconds=SKYSCANNER_WAF_COOLDOWN_SECONDS,
+                blocked_message,
+                manual_search_url=manual_search_url,
+                cooldown_seconds=cooldown_seconds,
             )
         if fareless_html_detected:
             raise ProviderNoResultError(

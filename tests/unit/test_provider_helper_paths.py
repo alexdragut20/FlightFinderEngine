@@ -740,6 +740,51 @@ def test_skyscanner_playwright_runtime_paths_cover_gate_cooldown_and_shutdown(
     assert playwright.stopped is True
 
 
+def test_skyscanner_playwright_assisted_paths_cover_manual_browser_fallback(monkeypatch) -> None:
+    client = SkyscannerScrapeClient(
+        host="www.skyscanner.com",
+        host_candidates=["www.skyscanner.net"],
+        http_retries=1,
+        playwright_fallback=True,
+        playwright_assisted=True,
+    )
+    monkeypatch.setattr(client, "_provider_cooldown_remaining_seconds", lambda: 0)
+    monkeypatch.setattr(
+        client,
+        "_http_fetch_search_html",
+        lambda url, attempt_idx=0: ("server error", url, 500),
+    )
+    monkeypatch.setattr(
+        client,
+        "_fetch_search_html_playwright",
+        lambda url: ("captcha blocked", url),
+    )
+    monkeypatch.setattr(
+        client,
+        "_fetch_search_html_playwright_assisted",
+        lambda url: ('{"providerName":"OTA","rawPrice":210}', "https://www.skyscanner.com/final"),
+    )
+    html, final_url = client._fetch_search_html("https://www.skyscanner.com/path")
+    assert '"rawPrice":210' in html
+    assert final_url == "https://www.skyscanner.com/final"
+
+    monkeypatch.setattr(
+        client,
+        "_fetch_search_html_playwright_assisted",
+        lambda url: (_ for _ in ()).throw(
+            ProviderBlockedError(
+                "Skyscanner browser-assisted mode needs you to complete the visible verification window, then rerun the search.",
+                manual_search_url=url,
+            )
+        ),
+    )
+    with pytest.raises(
+        ProviderBlockedError,
+        match="browser-assisted mode needs you to complete the visible verification window",
+    ):
+        client._fetch_search_html("https://www.skyscanner.com/path")
+
+
 def test_kayak_helper_paths_cover_session_poll_errors_and_result_selection(monkeypatch) -> None:
     client = KayakScrapeClient(host="WWW.KAYAK.COM", poll_rounds=0)
     assert client._host == "www.kayak.com"

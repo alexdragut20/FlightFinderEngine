@@ -124,6 +124,22 @@ SKYSCANNER_SCRAPE_PLAYWRIGHT_FALLBACK = ALLOW_PLAYWRIGHT_PROVIDERS and (
     ).strip().lower()
     not in {"0", "false", "off", "no"}
 )
+SKYSCANNER_PLAYWRIGHT_ASSISTED = ALLOW_PLAYWRIGHT_PROVIDERS and (
+    str(os.getenv("SKYSCANNER_PLAYWRIGHT_ASSISTED", "0")).strip().lower()
+    not in {"0", "false", "off", "no"}
+)
+SKYSCANNER_PLAYWRIGHT_BROWSER_CHANNEL = (
+    str(os.getenv("SKYSCANNER_PLAYWRIGHT_BROWSER_CHANNEL", "") or "").strip() or None
+)
+SKYSCANNER_PLAYWRIGHT_PROFILE_DIR = (
+    str(os.getenv("SKYSCANNER_PLAYWRIGHT_PROFILE_DIR", "") or "").strip()
+    or os.path.join(
+        os.getenv("LOCALAPPDATA") or os.path.expanduser("~"),
+        "FlightFinderEngine",
+        "playwright",
+        "skyscanner",
+    )
+)
 try:
     _skyscanner_playwright_max_concurrency = int(
         os.getenv("SKYSCANNER_PLAYWRIGHT_MAX_CONCURRENCY", "1")
@@ -147,6 +163,16 @@ except ValueError:
 SKYSCANNER_PLAYWRIGHT_ACQUIRE_TIMEOUT_SECONDS = max(
     1.0,
     min(30.0, _skyscanner_playwright_acquire_timeout_seconds),
+)
+try:
+    _skyscanner_playwright_assist_timeout_seconds = int(
+        os.getenv("SKYSCANNER_PLAYWRIGHT_ASSIST_TIMEOUT_SECONDS", "90")
+    )
+except ValueError:
+    _skyscanner_playwright_assist_timeout_seconds = 90
+SKYSCANNER_PLAYWRIGHT_ASSIST_TIMEOUT_SECONDS = max(
+    15,
+    min(300, _skyscanner_playwright_assist_timeout_seconds),
 )
 try:
     _skyscanner_waf_cooldown_seconds = int(os.getenv("SKYSCANNER_WAF_COOLDOWN_SECONDS", "900"))

@@ -16,6 +16,10 @@ Host interface to bind for the local web server.
 .PARAMETER AllowPlaywright
 Enables Playwright-backed providers for the restarted server process.
 
+.PARAMETER AssistSkyscanner
+Allows Skyscanner to open a visible local browser window so you can complete
+anti-bot verification in the normal browsing flow when needed.
+
 .PARAMETER Foreground
 Runs the server in the current PowerShell session instead of the background.
 
@@ -37,6 +41,7 @@ param(
     [Alias("Host")]
     [string]$BindHost = "127.0.0.1",
     [switch]$AllowPlaywright,
+    [switch]$AssistSkyscanner,
     [switch]$Foreground,
     [switch]$NoKillPlaywright
 )
@@ -53,6 +58,7 @@ $StdErrLog = Join-Path $LogsDir "server.err"
 $AllowPlaywrightValue = if ($AllowPlaywright) { "1" } else { "0" }
 $GoogleFlightsFetchModeValue = if ($AllowPlaywright) { "local" } else { "common" }
 $SkyscannerPlaywrightFallbackValue = if ($AllowPlaywright) { "1" } else { "0" }
+$SkyscannerPlaywrightAssistedValue = if ($AllowPlaywright -and $AssistSkyscanner) { "1" } else { "0" }
 
 function Write-Section {
     param([string]$Title)
@@ -239,6 +245,7 @@ Write-Host "Port: $Port"
 Write-Host "ALLOW_PLAYWRIGHT_PROVIDERS=$AllowPlaywrightValue"
 Write-Host "GOOGLE_FLIGHTS_FETCH_MODE=$GoogleFlightsFetchModeValue"
 Write-Host "SKYSCANNER_SCRAPE_PLAYWRIGHT_FALLBACK=$SkyscannerPlaywrightFallbackValue"
+Write-Host "SKYSCANNER_PLAYWRIGHT_ASSISTED=$SkyscannerPlaywrightAssistedValue"
 Write-Host "Logs: $StdOutLog and $StdErrLog"
 Write-Host "PID file: $PidFile"
 
@@ -279,6 +286,7 @@ $previousPort = Set-InheritedEnvironmentValue -Name "PORT" -Value ([string]$Port
 $previousPlaywright = Set-InheritedEnvironmentValue -Name "ALLOW_PLAYWRIGHT_PROVIDERS" -Value $AllowPlaywrightValue
 $previousGoogleFlightsFetchMode = Set-InheritedEnvironmentValue -Name "GOOGLE_FLIGHTS_FETCH_MODE" -Value $GoogleFlightsFetchModeValue
 $previousSkyscannerPlaywrightFallback = Set-InheritedEnvironmentValue -Name "SKYSCANNER_SCRAPE_PLAYWRIGHT_FALLBACK" -Value $SkyscannerPlaywrightFallbackValue
+$previousSkyscannerPlaywrightAssisted = Set-InheritedEnvironmentValue -Name "SKYSCANNER_PLAYWRIGHT_ASSISTED" -Value $SkyscannerPlaywrightAssistedValue
 try {
     if ($Foreground) {
         Write-Host "Foreground mode (Ctrl+C to stop)."
@@ -307,6 +315,7 @@ try {
     Restore-InheritedEnvironmentValue -Name "ALLOW_PLAYWRIGHT_PROVIDERS" -PreviousValue $previousPlaywright
     Restore-InheritedEnvironmentValue -Name "GOOGLE_FLIGHTS_FETCH_MODE" -PreviousValue $previousGoogleFlightsFetchMode
     Restore-InheritedEnvironmentValue -Name "SKYSCANNER_SCRAPE_PLAYWRIGHT_FALLBACK" -PreviousValue $previousSkyscannerPlaywrightFallback
+    Restore-InheritedEnvironmentValue -Name "SKYSCANNER_PLAYWRIGHT_ASSISTED" -PreviousValue $previousSkyscannerPlaywrightAssisted
 }
 
 if (Wait-ForServerReady -TargetHost $BindHost -TargetPort $Port -TimeoutSeconds 12) {
