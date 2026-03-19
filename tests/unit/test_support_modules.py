@@ -137,6 +137,22 @@ def test_reload_config_handles_invalid_env_values(monkeypatch) -> None:
         importlib.reload(config_module)
 
 
+def test_skyscanner_playwright_fallback_defaults_on_when_playwright_is_allowed(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("ALLOW_PLAYWRIGHT_PROVIDERS", "yes")
+    monkeypatch.delenv("SKYSCANNER_SCRAPE_PLAYWRIGHT_FALLBACK", raising=False)
+
+    reloaded = importlib.reload(config_module)
+    try:
+        assert reloaded.ALLOW_PLAYWRIGHT_PROVIDERS is True
+        assert reloaded.SKYSCANNER_SCRAPE_PLAYWRIGHT_FALLBACK is True
+    finally:
+        monkeypatch.delenv("ALLOW_PLAYWRIGHT_PROVIDERS", raising=False)
+        monkeypatch.delenv("SKYSCANNER_SCRAPE_PLAYWRIGHT_FALLBACK", raising=False)
+        importlib.reload(config_module)
+
+
 def test_resolve_project_root_prefers_env_var(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("FLIGHT_LAYOVER_LAB_ROOT", str(tmp_path))
 

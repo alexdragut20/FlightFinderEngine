@@ -436,6 +436,7 @@ class SkyscannerScrapeClient:
             )
 
         blocked_detected = False
+        fareless_html_detected = False
         errors: list[str] = []
         hosts = self._hosts_to_try()
         for host in hosts:
@@ -460,7 +461,11 @@ class SkyscannerScrapeClient:
                     break
 
                 if html.strip():
-                    return html, final_url
+                    if self._response_has_parsable_fares(html):
+                        return html, final_url
+                    fareless_html_detected = True
+                    errors.append(f"{host} returned HTML without fare data")
+                    continue
                 errors.append(f"{host} empty HTML response")
 
         if self._playwright_fallback:
@@ -489,7 +494,11 @@ class SkyscannerScrapeClient:
                     errors.append(f"{host} Playwright blocked with challenge page")
                     continue
                 if html.strip():
-                    return html, final_url
+                    if self._response_has_parsable_fares(html):
+                        return html, final_url
+                    fareless_html_detected = True
+                    errors.append(f"{host} Playwright returned HTML without fare data")
+                    continue
                 errors.append(f"{host} Playwright empty HTML response")
 
         if blocked_detected:
@@ -499,8 +508,17 @@ class SkyscannerScrapeClient:
                 manual_search_url=url,
                 cooldown_seconds=SKYSCANNER_WAF_COOLDOWN_SECONDS,
             )
+        if fareless_html_detected:
+            raise ProviderNoResultError(
+                "Skyscanner returned HTML without fare data after trying available fetch paths."
+            )
         summary = "; ".join(errors[:3]) if errors else "unknown fetch failure"
         raise RuntimeError(f"Skyscanner scrape failed: {summary}")
+
+    @staticmethod
+    def _response_has_parsable_fares(html: str) -> bool:
+        """Return whether the fetched HTML already contains fare data we can parse."""
+        return SkyscannerScrapeClient._extract_best_price(html) is not None
 
     @staticmethod
     def _extract_best_price(html: str) -> int | None:

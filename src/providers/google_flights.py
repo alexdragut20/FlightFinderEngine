@@ -31,6 +31,16 @@ class GoogleFlightsLocalClient:
     docs_url = "https://www.google.com/travel/flights"
     default_enabled = True
 
+    @staticmethod
+    def _local_mode_setup_hint() -> str:
+        """Return setup guidance for the Playwright-backed Google Flights path."""
+        return (
+            "Install Playwright (`python3 -m pip install playwright` and "
+            "`python3 -m playwright install chromium`) and restart with "
+            "`ALLOW_PLAYWRIGHT_PROVIDERS=1` or "
+            "`scripts/restart_server.ps1 -AllowPlaywright` to use Google Flights local mode."
+        )
+
     def __init__(
         self,
         fetch_mode: str | None = None,
@@ -154,6 +164,8 @@ class GoogleFlightsLocalClient:
         """
         if self._ensure_fast_flights():
             return None
+        if "playwright is required" in str(self._fast_flights_error or "").lower():
+            return self._local_mode_setup_hint()
         return "Install fast-flights to enable Google Flights."
 
     @staticmethod
@@ -332,6 +344,7 @@ class GoogleFlightsLocalClient:
             candidate_modes.append("common")
 
         last_error: Exception | None = None
+        unavailable_modes: dict[str, str] = {}
         seen_modes: set[str] = set()
         for fetch_mode in candidate_modes:
             normalized_mode = str(fetch_mode or "common").strip().lower()
@@ -339,6 +352,9 @@ class GoogleFlightsLocalClient:
                 continue
             seen_modes.add(normalized_mode)
             if not self._fetch_mode_ready(normalized_mode):
+                reason = str(self._fast_flights_error or "").strip()
+                if reason:
+                    unavailable_modes[normalized_mode] = reason
                 continue
             try:
                 return self._fetch_flights_for_mode(
@@ -358,7 +374,21 @@ class GoogleFlightsLocalClient:
                 last_error = exc
                 continue
         if last_error is not None:
+            if unavailable_modes and isinstance(last_error, ProviderBlockedError):
+                skipped_summary = "; ".join(
+                    f"{mode}: {reason}" for mode, reason in unavailable_modes.items()
+                )
+                raise ProviderBlockedError(
+                    f"{last_error} Browser-backed fallback unavailable ({skipped_summary}).",
+                    manual_search_url=last_error.manual_search_url,
+                    cooldown_seconds=last_error.cooldown_seconds,
+                ) from last_error
             raise last_error
+        if unavailable_modes:
+            skipped_summary = "; ".join(
+                f"{mode}: {reason}" for mode, reason in unavailable_modes.items()
+            )
+            raise RuntimeError(f"Google Flights provider is not ready. {skipped_summary}")
         raise ProviderNoResultError("Google Flights returned no offers for this query.")
 
     def _fetch_flights_for_mode(

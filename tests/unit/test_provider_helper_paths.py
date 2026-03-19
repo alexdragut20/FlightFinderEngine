@@ -615,6 +615,34 @@ def test_skyscanner_helper_paths_cover_regex_and_runtime_errors(monkeypatch) -> 
     with pytest.raises(ProviderNoResultError):
         client.get_best_oneway("OTP", "MGA", "2026-03-10", "RON", 1, 1, 0, 0)
 
+    placeholder_client = SkyscannerScrapeClient(
+        host="www.skyscanner.com",
+        host_candidates=["www.skyscanner.net"],
+        http_retries=1,
+        playwright_fallback=False,
+    )
+    http_attempts: list[str] = []
+
+    def fake_placeholder_then_valid(
+        url: str,
+        attempt_idx: int = 0,
+    ) -> tuple[str, str, int]:
+        http_attempts.append(url)
+        if len(http_attempts) == 1:
+            return "<html><body><div id='__next'>Loading fares...</div></body></html>", url, 200
+        return '{"providerName":"OTA","rawPrice":222}', url, 200
+
+    monkeypatch.setattr(
+        placeholder_client,
+        "_http_fetch_search_html",
+        fake_placeholder_then_valid,
+    )
+    html, final_url = placeholder_client._fetch_search_html(
+        "https://www.skyscanner.com/transport/flights/otp/mga/20260310"
+    )
+    assert '"rawPrice":222' in html
+    assert final_url.startswith("https://www.skyscanner.net/")
+
     cooldown_client = SkyscannerScrapeClient(
         host="www.skyscanner.com",
         host_candidates=["www.skyscanner.net"],
@@ -1587,6 +1615,19 @@ def test_skyscanner_client_remaining_edge_paths_cover_offer_parsing_and_selectio
     monkeypatch.setattr(
         client,
         "_http_fetch_search_html",
+        lambda url, attempt_idx=0: ("<html><body><div id='__next'>Loading</div></body></html>", url, 200),
+    )
+    monkeypatch.setattr(
+        client,
+        "_fetch_search_html_playwright",
+        lambda url: ("<html><body><div id='__next'>Loading</div></body></html>", url),
+    )
+    with pytest.raises(ProviderNoResultError, match="without fare data"):
+        client._fetch_search_html("https://www.skyscanner.com/path")
+
+    monkeypatch.setattr(
+        client,
+        "_http_fetch_search_html",
         lambda url, attempt_idx=0: ("captcha blocked", url, 403),
     )
     monkeypatch.setattr(
@@ -1783,6 +1824,7 @@ def test_google_and_amadeus_helper_paths_cover_runtime_caching_and_tiebreaks(
     if local_google_client._fetch_mode == "local":
         assert local_google_client._ensure_fast_flights() is False
         assert "playwright is required" in local_google_client._fast_flights_error
+        assert "Install Playwright" in local_google_client.configuration_hint()
     else:
         assert local_google_client._ensure_fast_flights() is True
 
@@ -2073,6 +2115,39 @@ def test_google_flights_client_remaining_edge_paths_cover_runtime_and_return_log
             manual_search_url="https://www.google.com/travel/flights",
         )
     assert blocked_exc.value.manual_search_url == "https://www.google.com/travel/flights"
+
+    fallback_client = GoogleFlightsLocalClient(fetch_mode="common")
+    monkeypatch.setattr("src.providers.google_flights.ALLOW_PLAYWRIGHT_PROVIDERS", True)
+    monkeypatch.setattr(fallback_client, "_ensure_fast_flights", lambda: True)
+
+    def fake_fetch_mode_ready(fetch_mode: str) -> bool:
+        if fetch_mode == "local":
+            fallback_client._fast_flights_error = "playwright missing"
+            return False
+        return True
+
+    monkeypatch.setattr(fallback_client, "_fetch_mode_ready", fake_fetch_mode_ready)
+    monkeypatch.setattr(
+        fallback_client,
+        "_fetch_flights_for_mode",
+        lambda **kwargs: (_ for _ in ()).throw(
+            ProviderBlockedError(
+                "Google Flights returned a consent or challenge page instead of fares.",
+                manual_search_url="https://www.google.com/travel/flights",
+            )
+        ),
+    )
+    with pytest.raises(ProviderBlockedError, match="Browser-backed fallback unavailable") as fallback_exc:
+        fallback_client._fetch_flights(
+            source="OTP",
+            destination="MGA",
+            date_iso="2026-03-10",
+            currency="RON",
+            adults=1,
+            max_stops_per_leg=1,
+            manual_search_url="https://www.google.com/travel/flights",
+        )
+    assert fallback_exc.value.manual_search_url == "https://www.google.com/travel/flights"
 
     client._get_flights_fn = lambda **kwargs: (_ for _ in ()).throw(AssertionError("assertion"))
     with pytest.raises(RuntimeError, match="Google Flights request failed: assertion"):

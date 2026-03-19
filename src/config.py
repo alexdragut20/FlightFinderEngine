@@ -114,8 +114,14 @@ try:
 except ValueError:
     _skyscanner_retry_env = 2
 SKYSCANNER_SCRAPE_HTTP_RETRIES = max(1, min(6, _skyscanner_retry_env))
+_skyscanner_playwright_fallback_default = "1" if ALLOW_PLAYWRIGHT_PROVIDERS else "0"
 SKYSCANNER_SCRAPE_PLAYWRIGHT_FALLBACK = ALLOW_PLAYWRIGHT_PROVIDERS and (
-    str(os.getenv("SKYSCANNER_SCRAPE_PLAYWRIGHT_FALLBACK", "0")).strip().lower()
+    str(
+        os.getenv(
+            "SKYSCANNER_SCRAPE_PLAYWRIGHT_FALLBACK",
+            _skyscanner_playwright_fallback_default,
+        )
+    ).strip().lower()
     not in {"0", "false", "off", "no"}
 )
 try:
