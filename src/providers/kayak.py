@@ -88,10 +88,22 @@ class KayakScrapeClient:
                         "Chrome/122.0.0.0 Safari/537.36"
                     ),
                     "Accept-Language": "en-US,en;q=0.9",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Cache-Control": "no-cache",
+                    "Pragma": "no-cache",
+                    "Upgrade-Insecure-Requests": "1",
                 }
             )
             self._local.session = session
         return self._local.session
+
+    def _search_path_prefix(self) -> str:
+        """Return the path prefix used by the search results page.
+
+        Returns:
+            str: Search page path prefix.
+        """
+        return "/flights"
 
     def _search_page_url(
         self,
@@ -117,10 +129,11 @@ class KayakScrapeClient:
         """
         source_code = str(source or "").strip().upper()
         destination_code = str(destination or "").strip().upper()
+        path_prefix = self._search_path_prefix().rstrip("/")
         if inbound_iso:
-            path = f"/flights/{source_code}-{destination_code}/{outbound_iso}/{inbound_iso}"
+            path = f"{path_prefix}/{source_code}-{destination_code}/{outbound_iso}/{inbound_iso}"
         else:
-            path = f"/flights/{source_code}-{destination_code}/{outbound_iso}"
+            path = f"{path_prefix}/{source_code}-{destination_code}/{outbound_iso}"
         params = {
             "sort": "price_a",
             "adults": max(1, int(adults or 1)),
@@ -216,9 +229,13 @@ class KayakScrapeClient:
         endpoint = f"{KAYAK_SCRAPE_SCHEME}://{self._host}/i/api/search/dynamic/flights/poll"
         headers = {
             "Content-Type": "application/json",
+            "Accept": "application/json, text/plain, */*",
             "x-requested-with": "XMLHttpRequest",
             "x-csrf": csrf_token,
             "referer": referer_url,
+            "origin": f"{KAYAK_SCRAPE_SCHEME}://{self._host}",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
         }
         response = self._session().post(
             endpoint,
@@ -240,7 +257,6 @@ class KayakScrapeClient:
             lowered = detail.lower()
             if any(code.lower() in lowered for code in self._NO_RESULT_CODES):
                 raise ProviderNoResultError(detail)
-            response.raise_for_status()
             raise RuntimeError(detail)
 
         errors = body.get("errors")
@@ -1108,3 +1124,11 @@ class MomondoScrapeClient(KayakScrapeClient):
             host=host if host is not None else MOMONDO_SCRAPE_HOST,
             poll_rounds=poll_rounds,
         )
+
+    def _search_path_prefix(self) -> str:
+        """Return the Momondo path prefix used by the search results page.
+
+        Returns:
+            str: Search page path prefix.
+        """
+        return "/flight-search"

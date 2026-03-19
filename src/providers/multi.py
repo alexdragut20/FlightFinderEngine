@@ -77,6 +77,10 @@ class MultiProviderClient:
         self._budget_total_used = 0
         self._budget_used_by_provider: dict[str, int] = {}
         self._provider_paused_until: dict[str, float] = {}
+        self._stats_listener: Callable[[dict[str, Any]], None] | None = None
+        self._stats_listener_min_interval_seconds = 0.75
+        self._stats_listener_last_sent_at = 0.0
+        self._stats_listener_lock = threading.Lock()
 
     @property
     def active_provider_ids(self) -> list[str]:
@@ -100,6 +104,26 @@ class MultiProviderClient:
         with self._stats_lock:
             target = self._stats.setdefault(bucket, {})
             target[provider_id] = target.get(provider_id, 0) + amount
+        self._notify_stats_listener()
+
+    def set_stats_listener(
+        self,
+        listener: Callable[[dict[str, Any]], None] | None,
+        *,
+        min_interval_seconds: float = 0.75,
+    ) -> None:
+        """Register a listener for throttled provider-health snapshots.
+
+        Args:
+            listener: Callback receiving aggregated provider-health payloads.
+            min_interval_seconds: Minimum interval between callback updates.
+        """
+        with self._stats_listener_lock:
+            self._stats_listener = listener
+            self._stats_listener_min_interval_seconds = max(0.0, float(min_interval_seconds))
+            self._stats_listener_last_sent_at = 0.0
+        if listener is not None:
+            self._notify_stats_listener(force=True)
 
     def stats_snapshot(self) -> dict[str, Any]:
         """Return a snapshot of provider selection and budget counters.
@@ -116,6 +140,106 @@ class MultiProviderClient:
                 "used_calls_by_provider": dict(self._budget_used_by_provider),
             }
             return snapshot
+
+    def health_snapshot(self) -> dict[str, Any]:
+        """Return aggregated provider health counters suitable for the UI.
+
+        Returns:
+            dict[str, Any]: Aggregated provider-health counters.
+        """
+        stats = self.stats_snapshot()
+        providers: dict[str, dict[str, Any]] = {}
+        for provider_id in self.active_provider_ids:
+            calls = sum(
+                int((stats.get(bucket) or {}).get(provider_id, 0))
+                for bucket in ("calendar_calls", "oneway_calls", "return_calls")
+            )
+            selected = sum(
+                int((stats.get(bucket) or {}).get(provider_id, 0))
+                for bucket in ("calendar_selected", "oneway_selected", "return_selected")
+            )
+            no_result = sum(
+                int((stats.get(bucket) or {}).get(provider_id, 0))
+                for bucket in ("calendar_no_result", "oneway_no_result", "return_no_result")
+            )
+            errors = sum(
+                int((stats.get(bucket) or {}).get(provider_id, 0))
+                for bucket in ("calendar_errors", "oneway_errors", "return_errors")
+            )
+            skipped_budget = sum(
+                int((stats.get(bucket) or {}).get(provider_id, 0))
+                for bucket in (
+                    "calendar_skipped_budget",
+                    "oneway_skipped_budget",
+                    "return_skipped_budget",
+                )
+            )
+            skipped_cooldown = sum(
+                int((stats.get(bucket) or {}).get(provider_id, 0))
+                for bucket in (
+                    "calendar_skipped_cooldown",
+                    "oneway_skipped_cooldown",
+                    "return_skipped_cooldown",
+                )
+            )
+            if selected > 0:
+                status = "selected"
+            elif errors > 0:
+                status = "error"
+            elif no_result > 0:
+                status = "no_result"
+            elif calls > 0:
+                status = "active"
+            else:
+                status = "idle"
+            providers[provider_id] = {
+                "provider_id": provider_id,
+                "status": status,
+                "calls": calls,
+                "selected": selected,
+                "no_result": no_result,
+                "errors": errors,
+                "skipped_budget": skipped_budget,
+                "skipped_cooldown": skipped_cooldown,
+                "calendar_calls": int((stats.get("calendar_calls") or {}).get(provider_id, 0)),
+                "calendar_selected": int(
+                    (stats.get("calendar_selected") or {}).get(provider_id, 0)
+                ),
+                "oneway_calls": int((stats.get("oneway_calls") or {}).get(provider_id, 0)),
+                "oneway_selected": int((stats.get("oneway_selected") or {}).get(provider_id, 0)),
+                "return_calls": int((stats.get("return_calls") or {}).get(provider_id, 0)),
+                "return_selected": int((stats.get("return_selected") or {}).get(provider_id, 0)),
+            }
+        return {
+            "providers": providers,
+            "budget": stats.get("budget") or {},
+            "updated_at": time.time(),
+        }
+
+    def _notify_stats_listener(self, *, force: bool = False) -> None:
+        """Send a throttled provider-health snapshot to the listener.
+
+        Args:
+            force: When True, bypass throttle interval checks.
+        """
+        listener: Callable[[dict[str, Any]], None] | None
+        with self._stats_listener_lock:
+            listener = self._stats_listener
+            if listener is None:
+                return
+            now = time.time()
+            if (
+                not force
+                and self._stats_listener_min_interval_seconds > 0.0
+                and (now - self._stats_listener_last_sent_at)
+                < self._stats_listener_min_interval_seconds
+            ):
+                return
+            self._stats_listener_last_sent_at = now
+        try:
+            listener(self.health_snapshot())
+        except Exception:
+            return
 
     def _consume_budget(self, provider_id: str) -> bool:
         """Consume a provider budget slot if one is available.
@@ -295,6 +419,7 @@ class MultiProviderClient:
 
         for provider_id in set(source_by_date.values()):
             self._bump("calendar_selected", provider_id)
+        self._notify_stats_listener(force=True)
         return merged
 
     @staticmethod
@@ -417,6 +542,7 @@ class MultiProviderClient:
                 best_provider = candidate["provider"]
         if best_provider:
             self._bump(selected_bucket, best_provider)
+        self._notify_stats_listener(force=True)
         return best
 
     @per_instance_lru_cache(maxsize=32768)

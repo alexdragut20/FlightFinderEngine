@@ -49,6 +49,12 @@ class _FakeSession:
         return self.post_responses.pop(0)
 
 
+class _StubProvider:
+    def __init__(self, provider_id: str, *, supports_calendar: bool = True) -> None:
+        self.provider_id = provider_id
+        self.supports_calendar = supports_calendar
+
+
 def _kiwi_segment(
     source: str,
     destination: str,
@@ -1973,3 +1979,51 @@ def test_multi_provider_client_remaining_edge_paths_cover_calendar_filters_and_t
     assert best_oneway["provider"] == "momondo"
     assert best_return is not None
     assert best_return["provider"] == "momondo"
+
+
+def test_multi_provider_health_snapshot_reports_selected_no_result_errors_and_listener() -> None:
+    client = MultiProviderClient(
+        providers=[
+            _StubProvider("kiwi"),
+            _StubProvider("kayak"),
+            _StubProvider("momondo"),
+        ]
+    )
+    snapshots: list[dict[str, object]] = []
+    client.set_stats_listener(lambda snapshot: snapshots.append(snapshot), min_interval_seconds=0.0)
+    client._bump("calendar_selected", "kiwi", 2)
+    client._bump("oneway_calls", "kiwi", 3)
+    client._bump("oneway_selected", "kiwi", 1)
+    client._bump("return_calls", "kayak", 2)
+    client._bump("return_no_result", "kayak", 2)
+    client._bump("calendar_calls", "momondo", 1)
+    client._bump("calendar_errors", "momondo", 1)
+    client._bump("calendar_skipped_budget", "momondo", 1)
+
+    snapshot = client.health_snapshot()
+
+    assert snapshot["providers"]["kiwi"]["status"] == "selected"
+    assert snapshot["providers"]["kiwi"]["selected"] == 3
+    assert snapshot["providers"]["kiwi"]["calls"] == 3
+    assert snapshot["providers"]["kayak"]["status"] == "no_result"
+    assert snapshot["providers"]["kayak"]["no_result"] == 2
+    assert snapshot["providers"]["momondo"]["status"] == "error"
+    assert snapshot["providers"]["momondo"]["errors"] == 1
+    assert snapshot["providers"]["momondo"]["skipped_budget"] == 1
+    assert snapshots
+    assert snapshots[-1]["providers"]["kiwi"]["selected"] == 3
+
+    throttled_snapshots: list[dict[str, object]] = []
+    client.set_stats_listener(
+        lambda snapshot: throttled_snapshots.append(snapshot),
+        min_interval_seconds=999.0,
+    )
+    first_count = len(throttled_snapshots)
+    client._notify_stats_listener()
+    assert len(throttled_snapshots) == first_count
+
+    client.set_stats_listener(
+        lambda _snapshot: (_ for _ in ()).throw(RuntimeError("listener boom")),
+        min_interval_seconds=0.0,
+    )
+    client._notify_stats_listener(force=True)

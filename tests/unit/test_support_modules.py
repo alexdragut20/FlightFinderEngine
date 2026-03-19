@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import importlib
 import runpy
+import sys
 import warnings
 from datetime import date
 from pathlib import Path
+
+import pytest
 
 from src import app as app_module
 from src import config as config_module
@@ -46,15 +49,37 @@ def test_package_entrypoints_delegate_to_run_server(monkeypatch) -> None:
     calls: list[str] = []
     monkeypatch.setattr(
         "src.services.http_server.run_server",
-        lambda: calls.append("run"),
+        lambda host=None, port=None: calls.append("run"),
     )
 
     runpy.run_module("src.__main__", run_name="__main__")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
-        runpy.run_module("src.app", run_name="__main__")
+        original_argv = sys.argv[:]
+        try:
+            sys.argv = ["flightfinder-engine"]
+            with pytest.raises(SystemExit) as exc:
+                runpy.run_module("src.app", run_name="__main__")
+        finally:
+            sys.argv = original_argv
+    assert exc.value.code == 0
 
     assert calls == ["run", "run"]
+
+    cli_calls: list[tuple[str | None, int | None]] = []
+    monkeypatch.setattr(
+        app_module,
+        "run_server",
+        lambda host=None, port=None: cli_calls.append((host, port)),
+    )
+
+    assert app_module.main(["--host", "127.0.0.2", "--port", "8010"]) == 0
+    assert cli_calls == [("127.0.0.2", 8010)]
+
+    with pytest.raises(SystemExit) as exc:
+        app_module.main(["--help"])
+    assert exc.value.code == 0
+    assert cli_calls == [("127.0.0.2", 8010)]
 
 
 def test_reload_config_handles_invalid_env_values(monkeypatch) -> None:

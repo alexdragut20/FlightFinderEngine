@@ -10,7 +10,7 @@
       href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700;800&family=Space+Grotesk:wght@500;700&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/styles.css?v=20260315-1" />
+    <link rel="stylesheet" href="/styles.css?v=20260317-2" />
   </head>
   <body>
     <main class="page">
@@ -300,6 +300,15 @@
           <div class="progress-bar">
             <div id="progress-bar-fill" class="progress-bar-fill"></div>
           </div>
+          <section id="provider-health-panel" class="provider-health-panel" hidden>
+            <div class="provider-health-head">
+              <p class="provider-health-title">Provider health</p>
+              <p id="provider-health-note" class="provider-health-note">
+                Selected / no result / error counts update live.
+              </p>
+            </div>
+            <div id="provider-health-grid" class="provider-health-grid"></div>
+          </section>
           <div id="progress-log" class="progress-log"></div>
         </div>
         <div id="summary" class="summary"></div>
@@ -340,6 +349,6 @@
       </div>
     </template>
 
-    <script src="/app.js?v=20260315-1" defer></script>
+    <script src="/app.js?v=20260317-2" defer></script>
   </body>
 </html>

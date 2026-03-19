@@ -12,7 +12,11 @@ from ..utils import (
     parse_google_flights_text_datetime,
     parse_money_amount_int,
 )
-from ..utils.constants import PRICE_SENTINEL
+from ..utils.constants import (
+    GOOGLE_FLIGHTS_CONSENT_MARKER,
+    GOOGLE_FLIGHTS_IMPERSONATE_PROFILE,
+    PRICE_SENTINEL,
+)
 from ._cache import per_instance_lru_cache
 
 
@@ -61,10 +65,29 @@ class GoogleFlightsLocalClient:
             return self._fast_flights_available
         self._fast_flights_loaded = True
         try:
+            import fast_flights.core as fast_flights_core
             from fast_flights import FlightData as FF_FlightData
             from fast_flights import Passengers as FF_Passengers
             from fast_flights import get_flights as ff_get_flights
+            from primp import Client as PrimpClient
 
+            def _patched_fetch(params: dict[str, Any]) -> Any:
+                client = PrimpClient(
+                    impersonate=GOOGLE_FLIGHTS_IMPERSONATE_PROFILE,
+                    verify=False,
+                    headers={"Accept-Language": "en-US,en;q=0.9"},
+                )
+                response = client.get("https://www.google.com/travel/flights", params=params)
+                response_text = str(
+                    getattr(response, "text_markdown", None) or getattr(response, "text", "") or ""
+                )
+                if response.status_code != 200:
+                    raise AssertionError(f"{response.status_code} Result: {response_text}")
+                if GOOGLE_FLIGHTS_CONSENT_MARKER in response_text:
+                    raise RuntimeError("Google Flights returned a consent page instead of fares.")
+                return response
+
+            fast_flights_core.fetch = _patched_fetch
             self._FlightData = FF_FlightData
             self._Passengers = FF_Passengers
             self._get_flights_fn = ff_get_flights
@@ -84,6 +107,36 @@ class GoogleFlightsLocalClient:
                     f"`python3 -m playwright install chromium`): {exc}"
                 )
         return self._fast_flights_available
+
+    def _fetch_mode_ready(self, fetch_mode: str) -> bool:
+        """Return whether the requested fetch mode is ready for use.
+
+        Args:
+            fetch_mode: Fetch strategy to use for the provider request.
+
+        Returns:
+            bool: True when the requested mode is ready; otherwise, False.
+        """
+        if not self._ensure_fast_flights():
+            return False
+        normalized_mode = str(fetch_mode or "common").strip().lower()
+        if normalized_mode != "local":
+            return True
+        if not ALLOW_PLAYWRIGHT_PROVIDERS:
+            self._fast_flights_error = (
+                "Google Flights local mode requires ALLOW_PLAYWRIGHT_PROVIDERS=1."
+            )
+            return False
+        try:
+            import playwright.async_api  # noqa: F401
+        except Exception as exc:
+            self._fast_flights_error = (
+                "playwright is required for local Google Flights mode "
+                f"(install with `python3 -m pip install playwright` and "
+                f"`python3 -m playwright install chromium`): {exc}"
+            )
+            return False
+        return True
 
     def is_configured(self) -> bool:
         """Return whether the client is configured for use.
@@ -248,6 +301,66 @@ class GoogleFlightsLocalClient:
                 "Google Flights provider is not ready. "
                 + (self._fast_flights_error or "fast-flights is unavailable.")
             )
+        candidate_modes = [self._fetch_mode]
+        if self._fetch_mode == "common" and ALLOW_PLAYWRIGHT_PROVIDERS:
+            candidate_modes.append("local")
+        elif self._fetch_mode == "local":
+            candidate_modes.append("common")
+
+        last_error: Exception | None = None
+        seen_modes: set[str] = set()
+        for fetch_mode in candidate_modes:
+            normalized_mode = str(fetch_mode or "common").strip().lower()
+            if normalized_mode in seen_modes:
+                continue
+            seen_modes.add(normalized_mode)
+            if not self._fetch_mode_ready(normalized_mode):
+                continue
+            try:
+                return self._fetch_flights_for_mode(
+                    source=source,
+                    destination=destination,
+                    date_iso=date_iso,
+                    currency=currency,
+                    adults=adults,
+                    max_stops_per_leg=max_stops_per_leg,
+                    fetch_mode=normalized_mode,
+                )
+            except ProviderNoResultError as exc:
+                last_error = exc
+                continue
+            except RuntimeError as exc:
+                last_error = exc
+                continue
+        if last_error is not None:
+            raise last_error
+        raise ProviderNoResultError("Google Flights returned no offers for this query.")
+
+    def _fetch_flights_for_mode(
+        self,
+        *,
+        source: str,
+        destination: str,
+        date_iso: str,
+        currency: str,
+        adults: int,
+        max_stops_per_leg: int,
+        fetch_mode: str,
+    ) -> list[Any]:
+        """Fetch flight options for a specific Google Flights fetch mode.
+
+        Args:
+            source: Origin airport code for the request.
+            destination: Destination airport code for the request.
+            date_iso: Travel date in ISO 8601 format.
+            currency: Currency code for pricing output.
+            adults: Number of adult travelers.
+            max_stops_per_leg: Max stops per leg.
+            fetch_mode: Fetch strategy to use for the provider request.
+
+        Returns:
+            list[Any]: Flight options returned by the provider backend.
+        """
         flight_data = [
             self._FlightData(
                 date=date_iso,
@@ -263,7 +376,7 @@ class GoogleFlightsLocalClient:
                 trip="one-way",
                 passengers=passengers,
                 seat="economy",
-                fetch_mode=self._fetch_mode,
+                fetch_mode=fetch_mode,
                 max_stops=max(0, int(max_stops_per_leg)),
             )
         except RuntimeError as exc:
@@ -272,6 +385,10 @@ class GoogleFlightsLocalClient:
             if "no flights found" in lowered or "before you continue" in lowered:
                 raise ProviderNoResultError(
                     "Google Flights returned no offers for this query."
+                ) from exc
+            if "consent page" in lowered:
+                raise ProviderNoResultError(
+                    "Google Flights returned a consent page instead of fares."
                 ) from exc
             raise
         except AssertionError as exc:

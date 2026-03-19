@@ -39,7 +39,7 @@ Repository = "https://github.com/alexdragut20/FlightFinderEngine"
 Issues = "https://github.com/alexdragut20/FlightFinderEngine/issues"
 
 [project.scripts]
-flightfinder-engine = "src.app:run_server"
+flightfinder-engine = "src.app:main"
 
 [project.optional-dependencies]
 dev = [

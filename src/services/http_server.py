@@ -240,22 +240,27 @@ class AppHandler(SimpleHTTPRequestHandler):
         self._send_json(HTTPStatus.OK, result)
 
 
-def run_server() -> None:
-    """Start the local FlightFinder web server."""
-    host = os.getenv("HOST", DEFAULT_SERVER_HOST)
-    port = int(os.getenv("PORT", str(DEFAULT_SERVER_PORT)))
+def run_server(host: str | None = None, port: int | None = None) -> None:
+    """Start the local FlightFinder web server.
+
+    Args:
+        host: Host interface to bind. When omitted, the `HOST` environment variable is used.
+        port: TCP port to bind. When omitted, the `PORT` environment variable is used.
+    """
+    resolved_host = host or os.getenv("HOST", DEFAULT_SERVER_HOST)
+    resolved_port = int(port if port is not None else os.getenv("PORT", str(DEFAULT_SERVER_PORT)))
     log_event(
         logging.INFO,
         "server_starting",
-        host=host,
-        port=port,
+        host=resolved_host,
+        port=resolved_port,
         allow_playwright_providers=ALLOW_PLAYWRIGHT_PROVIDERS,
         skyscanner_playwright_fallback=SKYSCANNER_SCRAPE_PLAYWRIGHT_FALLBACK,
         default_search_timeout_seconds=DEFAULT_SEARCH_TIMEOUT_SECONDS,
         default_io_workers=DEFAULT_IO_WORKERS,
     )
-    server = ThreadingHTTPServer((host, port), AppHandler)
-    print(SERVER_READY_URL_TEMPLATE.format(host=host, port=port))
+    server = ThreadingHTTPServer((resolved_host, resolved_port), AppHandler)
+    print(SERVER_READY_URL_TEMPLATE.format(host=resolved_host, port=resolved_port))
     try:
         server.serve_forever()
     except KeyboardInterrupt:

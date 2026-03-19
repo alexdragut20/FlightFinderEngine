@@ -11,9 +11,10 @@ import pytest
 import requests
 
 from src.exceptions import ProviderNoResultError
+from src.providers import google_flights as google_flights_module
 from src.providers.amadeus import AmadeusClient
 from src.providers.google_flights import GoogleFlightsLocalClient
-from src.providers.kayak import KayakScrapeClient
+from src.providers.kayak import KayakScrapeClient, MomondoScrapeClient
 from src.providers.serpapi import SerpApiGoogleFlightsClient
 from src.providers.skyscanner import SkyscannerScrapeClient
 from src.services.progress import SearchProgressTracker
@@ -199,6 +200,112 @@ def test_google_flights_helper_paths_cover_error_and_candidate_filters(monkeypat
             max_stops_per_leg=1,
         )
 
+    monkeypatch.setattr(client, "_ensure_fast_flights", lambda: False)
+    assert client._fetch_mode_ready("common") is False
+
+    local_gate_client = GoogleFlightsLocalClient(fetch_mode="local")
+    monkeypatch.setattr(local_gate_client, "_ensure_fast_flights", lambda: True)
+    monkeypatch.setattr(google_flights_module, "ALLOW_PLAYWRIGHT_PROVIDERS", False)
+    assert local_gate_client._fetch_mode_ready("local") is False
+    assert "ALLOW_PLAYWRIGHT_PROVIDERS=1" in local_gate_client._fast_flights_error
+
+    playwright_client = GoogleFlightsLocalClient(fetch_mode="local")
+    monkeypatch.setattr(playwright_client, "_ensure_fast_flights", lambda: True)
+    monkeypatch.setattr(google_flights_module, "ALLOW_PLAYWRIGHT_PROVIDERS", True)
+    original_import = builtins.__import__
+
+    def fake_import(name: str, *args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        if name == "playwright.async_api":
+            raise ImportError("playwright missing")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    assert playwright_client._fetch_mode_ready("local") is False
+    assert "playwright is required" in playwright_client._fast_flights_error
+
+    ready_local_client = GoogleFlightsLocalClient(fetch_mode="local")
+    monkeypatch.setattr(ready_local_client, "_ensure_fast_flights", lambda: True)
+
+    def fake_import_success(name: str, *args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        if name == "playwright.async_api":
+            return object()
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import_success)
+    assert ready_local_client._fetch_mode_ready("local") is True
+
+    fallback_client = GoogleFlightsLocalClient(fetch_mode="common")
+    monkeypatch.setattr(fallback_client, "_ensure_fast_flights", lambda: True)
+    monkeypatch.setattr(google_flights_module, "ALLOW_PLAYWRIGHT_PROVIDERS", True)
+    tried_modes: list[str] = []
+    monkeypatch.setattr(
+        fallback_client,
+        "_fetch_mode_ready",
+        lambda fetch_mode: fetch_mode == "common",
+    )
+    monkeypatch.setattr(
+        fallback_client,
+        "_fetch_flights_for_mode",
+        lambda **kwargs: tried_modes.append(str(kwargs["fetch_mode"]))
+        or [SimpleNamespace(price=100, stops=0, duration="2h", name="Carrier")],
+    )
+    assert (
+        len(
+            fallback_client._fetch_flights(
+                source="OTP",
+                destination="BKK",
+                date_iso="2026-04-25",
+                currency="RON",
+                adults=1,
+                max_stops_per_leg=1,
+            )
+        )
+        == 1
+    )
+    assert tried_modes == ["common"]
+
+    local_fallback_client = GoogleFlightsLocalClient(fetch_mode="local")
+    monkeypatch.setattr(local_fallback_client, "_ensure_fast_flights", lambda: True)
+    local_tried_modes: list[str] = []
+    monkeypatch.setattr(
+        local_fallback_client,
+        "_fetch_mode_ready",
+        lambda fetch_mode: fetch_mode == "common",
+    )
+    monkeypatch.setattr(
+        local_fallback_client,
+        "_fetch_flights_for_mode",
+        lambda **kwargs: local_tried_modes.append(str(kwargs["fetch_mode"]))
+        or [SimpleNamespace(price=100, stops=0, duration="2h", name="Carrier")],
+    )
+    assert (
+        len(
+            local_fallback_client._fetch_flights(
+                source="OTP",
+                destination="BKK",
+                date_iso="2026-04-25",
+                currency="RON",
+                adults=1,
+                max_stops_per_leg=1,
+            )
+        )
+        == 1
+    )
+    assert local_tried_modes == ["common"]
+
+    no_mode_client = GoogleFlightsLocalClient(fetch_mode="common")
+    monkeypatch.setattr(no_mode_client, "_ensure_fast_flights", lambda: True)
+    monkeypatch.setattr(no_mode_client, "_fetch_mode_ready", lambda _mode: False)
+    with pytest.raises(ProviderNoResultError):
+        no_mode_client._fetch_flights(
+            source="OTP",
+            destination="BKK",
+            date_iso="2026-04-25",
+            currency="RON",
+            adults=1,
+            max_stops_per_leg=1,
+        )
+
     monkeypatch.setattr(client, "is_configured", lambda: False)
     assert (
         client.get_best_return(
@@ -309,7 +416,9 @@ def test_serpapi_helper_paths_cover_payload_parsing_and_errors(monkeypatch) -> N
 
 def test_kayak_helper_paths_cover_bootstrap_polling_and_static_helpers(monkeypatch) -> None:
     client = KayakScrapeClient(host="www.kayak.com", poll_rounds=2)
+    momondo = MomondoScrapeClient(host="www.momondo.com", poll_rounds=2)
     assert "www.kayak.com" in client._search_page_url("otp", "mga", "2026-03-10", None, "eur", 2)
+    assert "/flight-search/" in momondo._search_page_url("otp", "mga", "2026-03-10", None, "eur", 2)
     assert len(client._build_legs_payload("otp", "mga", "2026-03-10", "2026-03-24")) == 2
     assert KayakScrapeClient._safe_json_from_response(_FakeResponse(ValueError("bad"))) == {}
     assert (

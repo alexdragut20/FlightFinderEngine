@@ -17,6 +17,9 @@ const progressPanelEl = document.getElementById("progress-panel");
 const progressMetaEl = document.getElementById("progress-meta");
 const progressPhaseEl = document.getElementById("progress-phase");
 const progressBarFillEl = document.getElementById("progress-bar-fill");
+const providerHealthPanelEl = document.getElementById("provider-health-panel");
+const providerHealthGridEl = document.getElementById("provider-health-grid");
+const providerHealthNoteEl = document.getElementById("provider-health-note");
 const progressLogEl = document.getElementById("progress-log");
 
 const cardTemplate = document.getElementById("result-card-template");
@@ -682,6 +685,98 @@ function resetProgressDisplay() {
     progressLogEl.innerHTML = "";
     delete progressLogEl.dataset.renderedCount;
   }
+  if (providerHealthPanelEl) {
+    providerHealthPanelEl.hidden = true;
+  }
+  if (providerHealthGridEl) {
+    providerHealthGridEl.innerHTML = "";
+  }
+  if (providerHealthNoteEl) {
+    providerHealthNoteEl.textContent = "Selected / no result / error counts update live.";
+  }
+}
+
+function providerMetaById(providerId) {
+  const normalized = String(providerId || "").trim().toLowerCase();
+  return (
+    providerCatalog.find((provider) => String(provider.id || "").toLowerCase() === normalized) || null
+  );
+}
+
+function renderProviderHealth(snapshot) {
+  if (!providerHealthPanelEl || !providerHealthGridEl) return;
+  const health = snapshot?.provider_health || snapshot?.runtime_data?.provider_health || {};
+  const audit = snapshot?.coverage_audit || snapshot?.runtime_data?.coverage_audit || {};
+  const providers = health?.providers || {};
+  const providerIds = providerCatalog.length
+    ? providerCatalog
+      .map((provider) => String(provider.id || "").toLowerCase())
+      .filter((providerId) => providers[providerId])
+    : Object.keys(providers);
+
+  if (!providerIds.length) {
+    providerHealthPanelEl.hidden = true;
+    providerHealthGridEl.innerHTML = "";
+    return;
+  }
+
+  providerHealthPanelEl.hidden = false;
+  providerHealthGridEl.innerHTML = "";
+
+  const budget = health?.budget || {};
+  const auditDestinations = Array.isArray(audit?.destinations) ? audit.destinations : [];
+  const auditNames = auditDestinations
+    .map((entry) => String(entry?.destination || "").trim().toUpperCase())
+    .filter(Boolean);
+  let note = "Selected / no result / error counts update live.";
+  if (budget.max_total_calls != null) {
+    note += ` Paid-provider budget ${budget.used_total_calls || 0}/${budget.max_total_calls}.`;
+  }
+  if (auditNames.length) {
+    note += ` Coverage audit: ${auditNames.join(", ")}.`;
+  }
+  if (providerHealthNoteEl) {
+    providerHealthNoteEl.textContent = note;
+  }
+
+  for (const providerId of providerIds) {
+    const stats = providers[providerId] || {};
+    const providerMeta = providerMetaById(providerId);
+    const card = document.createElement("article");
+    card.className = "provider-health-card";
+    card.dataset.status = String(stats.status || "idle");
+
+    const header = document.createElement("div");
+    header.className = "provider-health-card-head";
+
+    const name = document.createElement("strong");
+    name.className = "provider-health-name";
+    name.textContent = providerMeta?.name || providerId;
+
+    const status = document.createElement("span");
+    status.className = "provider-health-status";
+    status.textContent = String(stats.status || "idle").replace(/_/g, " ");
+
+    header.append(name, status);
+
+    const counts = document.createElement("p");
+    counts.className = "provider-health-counts";
+    counts.textContent =
+      `selected ${stats.selected || 0} | ` +
+      `no result ${stats.no_result || 0} | ` +
+      `error ${stats.errors || 0}`;
+
+    const detail = document.createElement("p");
+    detail.className = "provider-health-detail";
+    detail.textContent =
+      `calls ${stats.calls || 0} | ` +
+      `calendar ${stats.calendar_selected || 0} | ` +
+      `one-way ${stats.oneway_selected || 0} | ` +
+      `return ${stats.return_selected || 0}`;
+
+    card.append(header, counts, detail);
+    providerHealthGridEl.appendChild(card);
+  }
 }
 
 function appendProgressLogRow(event) {
@@ -754,6 +849,7 @@ function renderProgress(snapshot) {
   if (progressBarFillEl) {
     progressBarFillEl.style.width = `${percent}%`;
   }
+  renderProviderHealth(snapshot);
   renderProgressLog({
     events: snapshot.events,
     startIndex: snapshot.events_start_index,
