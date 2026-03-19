@@ -232,7 +232,9 @@ class KayakScrapeClient:
         detail: str | None = None,
     ) -> ProviderBlockedError:
         """Build a normalized anti-bot exception for the provider."""
-        base_message = f"{self.display_name} blocked automated scraping (captcha/anti-bot challenge)."
+        base_message = (
+            f"{self.display_name} blocked automated scraping (captcha/anti-bot challenge)."
+        )
         detail_text = str(detail or "").strip()
         if detail_text:
             base_message = f"{base_message} Detail: {detail_text}."
@@ -323,7 +325,9 @@ class KayakScrapeClient:
             lowered = detail.lower()
             if any(code.lower() in lowered for code in self._NO_RESULT_CODES):
                 raise ProviderNoResultError(detail)
-            if self._is_blocked_page(response_text, referer_url, response.status_code) or self._is_blocked_detail(
+            if self._is_blocked_page(
+                response_text, referer_url, response.status_code
+            ) or self._is_blocked_detail(
                 detail,
                 response.status_code,
             ):
@@ -344,7 +348,9 @@ class KayakScrapeClient:
             lowered = detail.lower()
             if any(code.lower() in lowered for code in self._NO_RESULT_CODES):
                 raise ProviderNoResultError(detail)
-            if self._is_blocked_page(response_text, referer_url, response.status_code) or self._is_blocked_detail(
+            if self._is_blocked_page(
+                response_text, referer_url, response.status_code
+            ) or self._is_blocked_detail(
                 detail,
                 response.status_code,
             ):
@@ -434,7 +440,9 @@ class KayakScrapeClient:
         )
         final_page_url = str(page_response.url or page_url)
         if self._is_blocked_page(page_response.text, final_page_url, page_response.status_code):
-            detail = f"HTTP {page_response.status_code}" if page_response.status_code >= 400 else None
+            detail = (
+                f"HTTP {page_response.status_code}" if page_response.status_code >= 400 else None
+            )
             raise self._blocked_error(manual_search_url=final_page_url, detail=detail)
         page_response.raise_for_status()
         csrf_token, _bootstrap = self._extract_bootstrap(

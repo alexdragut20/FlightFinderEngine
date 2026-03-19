@@ -22,4 +22,6 @@ class ProviderBlockedError(ProviderNoResultError):
             normalized_cooldown = int(cooldown_seconds) if cooldown_seconds is not None else None
         except (TypeError, ValueError):
             normalized_cooldown = None
-        self.cooldown_seconds = max(0, normalized_cooldown) if normalized_cooldown is not None else None
+        self.cooldown_seconds = (
+            max(0, normalized_cooldown) if normalized_cooldown is not None else None
+        )

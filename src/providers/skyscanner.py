@@ -14,9 +14,9 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 import requests
 
 from ..config import (
+    SKYSCANNER_PLAYWRIGHT_ACQUIRE_TIMEOUT_SECONDS,
     SKYSCANNER_PLAYWRIGHT_ASSIST_TIMEOUT_SECONDS,
     SKYSCANNER_PLAYWRIGHT_ASSISTED,
-    SKYSCANNER_PLAYWRIGHT_ACQUIRE_TIMEOUT_SECONDS,
     SKYSCANNER_PLAYWRIGHT_BROWSER_CHANNEL,
     SKYSCANNER_PLAYWRIGHT_ERROR_COOLDOWN_SECONDS,
     SKYSCANNER_PLAYWRIGHT_HOST_ATTEMPTS,
@@ -461,9 +461,7 @@ class SkyscannerScrapeClient:
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=45000)
             except PlaywrightTimeoutError as exc:
-                raise RuntimeError(
-                    "Skyscanner browser-assisted navigation timed out."
-                ) from exc
+                raise RuntimeError("Skyscanner browser-assisted navigation timed out.") from exc
 
             deadline = time.time() + SKYSCANNER_PLAYWRIGHT_ASSIST_TIMEOUT_SECONDS
             last_html = ""
@@ -474,10 +472,9 @@ class SkyscannerScrapeClient:
                 page.wait_for_timeout(1000)
                 last_url = str(page.url or url)
                 last_html = str(page.content() or "")
-                if (
-                    not self._is_bot_blocked_response(last_html, last_url, 200)
-                    and self._response_has_parsable_fares(last_html)
-                ):
+                if not self._is_bot_blocked_response(
+                    last_html, last_url, 200
+                ) and self._response_has_parsable_fares(last_html):
                     return last_html, last_url
 
             if self._is_bot_blocked_response(last_html, last_url, 200):
@@ -490,9 +487,7 @@ class SkyscannerScrapeClient:
                 raise ProviderNoResultError(
                     "Skyscanner browser-assisted mode loaded HTML without parsable fares."
                 )
-            raise ProviderNoResultError(
-                "Skyscanner browser-assisted mode returned empty HTML."
-            )
+            raise ProviderNoResultError("Skyscanner browser-assisted mode returned empty HTML.")
         finally:
             with contextlib.suppress(Exception):
                 context.close()
@@ -634,18 +629,18 @@ class SkyscannerScrapeClient:
         if blocked_detected:
             blocked_message = str(last_blocked_error or "").strip()
             if not blocked_message:
-                blocked_message = "Skyscanner blocked automated scraping (captcha/anti-bot challenge)."
+                blocked_message = (
+                    "Skyscanner blocked automated scraping (captcha/anti-bot challenge)."
+                )
                 if self._playwright_fallback and not self._playwright_assisted:
-                    blocked_message += (
-                        " Enable browser-assisted Playwright mode to complete the verification locally."
-                    )
+                    blocked_message += " Enable browser-assisted Playwright mode to complete the verification locally."
             cooldown_seconds = int(
                 (last_blocked_error.cooldown_seconds if last_blocked_error else None)
                 or SKYSCANNER_WAF_COOLDOWN_SECONDS
             )
             manual_search_url = (
-                (last_blocked_error.manual_search_url if last_blocked_error else None) or url
-            )
+                last_blocked_error.manual_search_url if last_blocked_error else None
+            ) or url
             self._set_provider_cooldown(cooldown_seconds)
             raise ProviderBlockedError(
                 blocked_message,

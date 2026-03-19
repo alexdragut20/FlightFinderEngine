@@ -246,8 +246,10 @@ def test_google_flights_helper_paths_cover_error_and_candidate_filters(monkeypat
     monkeypatch.setattr(
         fallback_client,
         "_fetch_flights_for_mode",
-        lambda **kwargs: tried_modes.append(str(kwargs["fetch_mode"]))
-        or [SimpleNamespace(price=100, stops=0, duration="2h", name="Carrier")],
+        lambda **kwargs: (
+            tried_modes.append(str(kwargs["fetch_mode"]))
+            or [SimpleNamespace(price=100, stops=0, duration="2h", name="Carrier")]
+        ),
     )
     assert (
         len(
@@ -275,8 +277,10 @@ def test_google_flights_helper_paths_cover_error_and_candidate_filters(monkeypat
     monkeypatch.setattr(
         local_fallback_client,
         "_fetch_flights_for_mode",
-        lambda **kwargs: local_tried_modes.append(str(kwargs["fetch_mode"]))
-        or [SimpleNamespace(price=100, stops=0, duration="2h", name="Carrier")],
+        lambda **kwargs: (
+            local_tried_modes.append(str(kwargs["fetch_mode"]))
+            or [SimpleNamespace(price=100, stops=0, duration="2h", name="Carrier")]
+        ),
     )
     assert (
         len(
@@ -559,7 +563,9 @@ def test_kayak_helper_paths_cover_bootstrap_polling_and_static_helpers(monkeypat
     monkeypatch.setattr(client, "_session", lambda: blocked_session)
     with pytest.raises(ProviderBlockedError, match="blocked automated scraping") as blocked_poll:
         client._post_poll("https://www.kayak.com/flights/OTP-MGA/2026-03-10", "csrf", {"legs": []})
-    assert blocked_poll.value.manual_search_url == "https://www.kayak.com/flights/OTP-MGA/2026-03-10"
+    assert (
+        blocked_poll.value.manual_search_url == "https://www.kayak.com/flights/OTP-MGA/2026-03-10"
+    )
 
 
 def test_skyscanner_helper_paths_cover_regex_and_runtime_errors(monkeypatch) -> None:
@@ -654,7 +660,10 @@ def test_skyscanner_helper_paths_cover_regex_and_runtime_errors(monkeypatch) -> 
         cooldown_client._fetch_search_html(
             "https://www.skyscanner.com/transport/flights/otp/mga/20260310"
         )
-    assert cooldown_exc.value.manual_search_url == "https://www.skyscanner.com/transport/flights/otp/mga/20260310"
+    assert (
+        cooldown_exc.value.manual_search_url
+        == "https://www.skyscanner.com/transport/flights/otp/mga/20260310"
+    )
     assert cooldown_exc.value.cooldown_seconds == 11
 
     monkeypatch.setattr(cooldown_client, "_provider_cooldown_remaining_seconds", lambda: 0)
@@ -671,7 +680,10 @@ def test_skyscanner_helper_paths_cover_regex_and_runtime_errors(monkeypatch) -> 
         cooldown_client._fetch_search_html(
             "https://www.skyscanner.com/transport/flights/otp/mga/20260310"
         )
-    assert blocked_exc.value.manual_search_url == "https://www.skyscanner.com/transport/flights/otp/mga/20260310"
+    assert (
+        blocked_exc.value.manual_search_url
+        == "https://www.skyscanner.com/transport/flights/otp/mga/20260310"
+    )
 
     monkeypatch.setattr(
         client,
@@ -1660,7 +1672,11 @@ def test_skyscanner_client_remaining_edge_paths_cover_offer_parsing_and_selectio
     monkeypatch.setattr(
         client,
         "_http_fetch_search_html",
-        lambda url, attempt_idx=0: ("<html><body><div id='__next'>Loading</div></body></html>", url, 200),
+        lambda url, attempt_idx=0: (
+            "<html><body><div id='__next'>Loading</div></body></html>",
+            url,
+            200,
+        ),
     )
     monkeypatch.setattr(
         client,
@@ -2182,7 +2198,9 @@ def test_google_flights_client_remaining_edge_paths_cover_runtime_and_return_log
             )
         ),
     )
-    with pytest.raises(ProviderBlockedError, match="Browser-backed fallback unavailable") as fallback_exc:
+    with pytest.raises(
+        ProviderBlockedError, match="Browser-backed fallback unavailable"
+    ) as fallback_exc:
         fallback_client._fetch_flights(
             source="OTP",
             destination="MGA",

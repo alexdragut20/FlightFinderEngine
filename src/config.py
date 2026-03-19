@@ -121,7 +121,9 @@ SKYSCANNER_SCRAPE_PLAYWRIGHT_FALLBACK = ALLOW_PLAYWRIGHT_PROVIDERS and (
             "SKYSCANNER_SCRAPE_PLAYWRIGHT_FALLBACK",
             _skyscanner_playwright_fallback_default,
         )
-    ).strip().lower()
+    )
+    .strip()
+    .lower()
     not in {"0", "false", "off", "no"}
 )
 SKYSCANNER_PLAYWRIGHT_ASSISTED = ALLOW_PLAYWRIGHT_PROVIDERS and (
@@ -131,14 +133,13 @@ SKYSCANNER_PLAYWRIGHT_ASSISTED = ALLOW_PLAYWRIGHT_PROVIDERS and (
 SKYSCANNER_PLAYWRIGHT_BROWSER_CHANNEL = (
     str(os.getenv("SKYSCANNER_PLAYWRIGHT_BROWSER_CHANNEL", "") or "").strip() or None
 )
-SKYSCANNER_PLAYWRIGHT_PROFILE_DIR = (
-    str(os.getenv("SKYSCANNER_PLAYWRIGHT_PROFILE_DIR", "") or "").strip()
-    or os.path.join(
-        os.getenv("LOCALAPPDATA") or os.path.expanduser("~"),
-        "FlightFinderEngine",
-        "playwright",
-        "skyscanner",
-    )
+SKYSCANNER_PLAYWRIGHT_PROFILE_DIR = str(
+    os.getenv("SKYSCANNER_PLAYWRIGHT_PROFILE_DIR", "") or ""
+).strip() or os.path.join(
+    os.getenv("LOCALAPPDATA") or os.path.expanduser("~"),
+    "FlightFinderEngine",
+    "playwright",
+    "skyscanner",
 )
 try:
     _skyscanner_playwright_max_concurrency = int(

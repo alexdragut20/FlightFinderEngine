@@ -580,7 +580,9 @@ def test_optimizer_validation_context_and_provider_fallback_helpers_cover_budget
     assert filtered_ids == {"direct-best", "split-kept"}
 
 
-def test_prepare_destination_validation_context_preserves_price_floor_candidates_for_best_objective() -> None:
+def test_prepare_destination_validation_context_preserves_price_floor_candidates_for_best_objective() -> (
+    None
+):
     optimizer = SplitTripOptimizer(KiwiClient(), AirportCoordinates())
     config = optimizer.parse_search_config(
         {
@@ -710,7 +712,9 @@ def test_prepare_destination_validation_context_preserves_price_floor_candidates
         serpapi_active=False,
     )
 
-    limited_totals = {int(item.get("estimated_total") or 0) for item in context["limited_candidates"]}
+    limited_totals = {
+        int(item.get("estimated_total") or 0) for item in context["limited_candidates"]
+    }
     assert 900 in limited_totals
     assert any("price-floor candidate" in warning for warning in warnings)
 

@@ -273,9 +273,7 @@ class ProviderE2ERegressionPerfTests(unittest.TestCase):
             "provider_stats"
         ) or {}
         serpapi_blocked = int((provider_stats.get("oneway_blocked") or {}).get("serpapi", 0))
-        serpapi_return_blocked = int(
-            (provider_stats.get("return_blocked") or {}).get("serpapi", 0)
-        )
+        serpapi_return_blocked = int((provider_stats.get("return_blocked") or {}).get("serpapi", 0))
         self.assertTrue((serpapi_blocked + serpapi_return_blocked) > 0)
 
     def test_perf_suite_multi_provider_finishes_under_budget(self) -> None:

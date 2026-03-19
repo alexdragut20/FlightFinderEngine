@@ -2040,7 +2040,10 @@ def test_multi_provider_health_snapshot_reports_selected_no_result_errors_and_li
     assert snapshot["providers"]["momondo"]["skipped_budget"] == 1
     assert snapshot["providers"]["googleflights"]["status"] == "blocked"
     assert snapshot["providers"]["googleflights"]["blocked"] == 2
-    assert snapshot["providers"]["googleflights"]["manual_search_url"] == "https://www.google.com/travel/flights"
+    assert (
+        snapshot["providers"]["googleflights"]["manual_search_url"]
+        == "https://www.google.com/travel/flights"
+    )
     assert snapshot["providers"]["googleflights"]["cooldown_seconds"] > 0
     assert snapshots
     assert snapshots[-1]["providers"]["kiwi"]["selected"] == 3
