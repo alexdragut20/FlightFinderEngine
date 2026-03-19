@@ -2658,7 +2658,9 @@ def test_optimizer_chunked_candidate_parallelism_and_progress_cover_chunk_schedu
 
     assert set(results) == {"USM", "MGA"}
     assert len(captured_chunks) > 2
-    assert _FakeChunkProcessPool.created[0].max_workers == min(8, len(captured_chunks))
+    assert _FakeChunkProcessPool.created[0].max_workers == min(
+        config.cpu_workers, len(captured_chunks)
+    )
     assert _FakeChunkProcessPool.created[0].shutdown_calls[-1] == (True, False)
     assert all("chunk_label" in chunk for chunk in captured_chunks)
     assert "candidate chunks" in progress.snapshot()["phase_detail"]
