@@ -1308,6 +1308,7 @@ function storefrontFromUrl(url) {
     if (host.includes("azair.")) return "AZair";
     if (host.includes("aviasales.")) return "Aviasales";
     if (host.includes("kiwi.com")) return "Kiwi";
+    if (host.includes("ryanair.com")) return "Ryanair";
     if (host.includes("google.") && path.includes("/travel/flights")) return "Google Flights";
     if (host.includes("skyscanner.")) return "Skyscanner";
     if (host.includes("kayak.")) return "Kayak";
@@ -1321,6 +1322,7 @@ function storefrontFromUrl(url) {
 function defaultStorefrontForProvider(provider) {
   const id = String(provider || "").trim().toLowerCase();
   if (id === "azair") return "AZair";
+  if (id === "ryanair") return "Ryanair";
   if (id === "travelpayouts") return "Aviasales";
   if (id === "kiwi") return "Kiwi";
   if (id === "kayak") return "Kayak";

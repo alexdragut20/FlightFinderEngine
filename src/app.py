@@ -19,6 +19,7 @@ from .providers import (
     KiwiClient,
     MomondoScrapeClient,
     MultiProviderClient,
+    RyanairFareFinderClient,
     SerpApiGoogleFlightsClient,
     SkyscannerScrapeClient,
 )
@@ -90,6 +91,7 @@ __all__ = [
     "KiwiClient",
     "MomondoScrapeClient",
     "MultiProviderClient",
+    "RyanairFareFinderClient",
     "SerpApiGoogleFlightsClient",
     "SkyscannerScrapeClient",
     "build_parser",

@@ -45,6 +45,7 @@ from ..providers import (
     KiwiClient,
     MomondoScrapeClient,
     MultiProviderClient,
+    RyanairFareFinderClient,
     SerpApiGoogleFlightsClient,
     SkyscannerScrapeClient,
     TravelpayoutsDataClient,
@@ -1502,6 +1503,7 @@ class SplitTripOptimizer:
             providers["kiwi"] = KiwiClient()
 
         providers["azair"] = AzairScrapeClient(coordinates=self.coords)
+        providers["ryanair"] = RyanairFareFinderClient()
         providers["kayak"] = KayakScrapeClient()
         providers["momondo"] = MomondoScrapeClient()
         providers["googleflights"] = GoogleFlightsLocalClient()
@@ -1822,6 +1824,7 @@ class SplitTripOptimizer:
             # Keep free scraper providers uncapped unless the global cap is used.
             # `max_calls_kiwi` should only apply to Kiwi itself.
             "azair": None,
+            "ryanair": None,
             "kayak": None,
             "momondo": None,
             "googleflights": None,

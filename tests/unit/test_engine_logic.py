@@ -1439,6 +1439,7 @@ def test_merge_strategy_anchors_keeps_cheapest_option_visible() -> None:
             (
                 "kiwi",
                 "azair",
+                "ryanair",
                 "kayak",
                 "momondo",
                 "googleflights",
@@ -1515,6 +1516,7 @@ def test_parse_config_auto_provider_defaults_to_configured() -> None:
     assert config.provider_ids == (
         "kiwi",
         "azair",
+        "ryanair",
         "kayak",
         "momondo",
         "googleflights",
@@ -1550,6 +1552,7 @@ def test_provider_catalog_enables_free_scrapers_by_default() -> None:
     optimizer = SplitTripOptimizer(KiwiClient(), AirportCoordinates())
     catalog = {item["id"]: item for item in optimizer.provider_catalog()}
     assert catalog["azair"]["default_enabled"] is True
+    assert catalog["ryanair"]["default_enabled"] is True
     assert catalog["googleflights"]["default_enabled"] is True
     assert catalog["skyscanner"]["default_enabled"] is True
 
@@ -1897,6 +1900,7 @@ def test_build_search_client_applies_kiwi_cap_only_to_kiwi() -> None:
     caps = budget.get("max_calls_by_provider") or {}
     assert caps.get("kiwi") == 42
     assert caps.get("azair") is None
+    assert caps.get("ryanair") is None
     assert caps.get("kayak") is None
     assert caps.get("momondo") is None
     assert caps.get("googleflights") is None

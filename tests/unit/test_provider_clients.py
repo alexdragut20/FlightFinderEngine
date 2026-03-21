@@ -12,6 +12,7 @@ from src.providers.amadeus import AmadeusClient
 from src.providers.azair import AzairScrapeClient
 from src.providers.kiwi import KiwiClient
 from src.providers.multi import MultiProviderClient
+from src.providers.ryanair import RyanairFareFinderClient
 from src.providers.serpapi import SerpApiGoogleFlightsClient
 from src.providers.travelpayouts import TravelpayoutsDataClient
 
@@ -852,6 +853,105 @@ def test_azair_client_parses_calendar_and_exact_fares() -> None:
     assert roundtrip["outbound_stops"] == 1
     assert roundtrip["inbound_stops"] == 0
     assert roundtrip["booking_url"] == "https://www.azair.eu/azfin.php?tp=2&resultSubmit=Hledat"
+
+
+def test_ryanair_client_parses_calendar_and_exact_fares() -> None:
+    route_rows = [
+        {"arrivalAirport": {"code": "BGY"}},
+        {"arrivalAirport": {"code": "CIA"}},
+    ]
+    route_rows_reverse = [{"arrivalAirport": {"code": "OTP"}}]
+    oneway_month = {
+        "outbound": {
+            "fares": [
+                {
+                    "day": "2026-04-18",
+                    "departureDate": "2026-04-18T19:50:00",
+                    "arrivalDate": "2026-04-18T21:10:00",
+                    "price": {"value": 15.99, "currencyCode": "EUR"},
+                    "unavailable": False,
+                },
+                {
+                    "day": "2026-04-19",
+                    "departureDate": "2026-04-19T09:50:00",
+                    "arrivalDate": "2026-04-19T11:10:00",
+                    "price": {"value": 22.99, "currencyCode": "EUR"},
+                    "unavailable": False,
+                },
+            ]
+        }
+    }
+    roundtrip_month = {
+        "outbound": {
+            "fares": [
+                {
+                    "day": "2026-04-18",
+                    "departureDate": "2026-04-18T19:50:00",
+                    "arrivalDate": "2026-04-18T21:10:00",
+                    "price": {"value": 15.99, "currencyCode": "EUR"},
+                    "unavailable": False,
+                }
+            ]
+        },
+        "inbound": {
+            "fares": [
+                {
+                    "day": "2026-04-25",
+                    "departureDate": "2026-04-25T16:15:00",
+                    "arrivalDate": "2026-04-25T19:25:00",
+                    "price": {"value": 50.42, "currencyCode": "EUR"},
+                    "unavailable": False,
+                }
+            ]
+        },
+    }
+    session = _FakeSession(
+        get_responses=[
+            _FakeResponse(route_rows),
+            _FakeResponse(oneway_month),
+            _FakeResponse(route_rows_reverse),
+            _FakeResponse(roundtrip_month),
+        ]
+    )
+    client = RyanairFareFinderClient(base_url="https://www.ryanair.com")
+    client._session = lambda: session  # type: ignore[assignment]
+
+    prices = client.get_calendar_prices(
+        "OTP",
+        "BGY",
+        "2026-04-18",
+        "2026-04-19",
+        "EUR",
+        1,
+        1,
+        0,
+        0,
+    )
+    assert prices == {"2026-04-18": 16, "2026-04-19": 23}
+
+    oneway = client.get_best_oneway("OTP", "BGY", "2026-04-18", "EUR", 1, 1, 0, 0)
+    assert oneway is not None
+    assert oneway["price"] == 16
+    assert oneway["stops"] == 0
+    assert "originIata=OTP" in oneway["booking_url"]
+    assert "destinationIata=BGY" in oneway["booking_url"]
+
+    roundtrip = client.get_best_return(
+        "OTP",
+        "BGY",
+        "2026-04-18",
+        "2026-04-25",
+        "EUR",
+        1,
+        1,
+        0,
+        0,
+    )
+    assert roundtrip is not None
+    assert roundtrip["price"] == 66
+    assert roundtrip["outbound_stops"] == 0
+    assert roundtrip["inbound_stops"] == 0
+    assert "dateIn=2026-04-25" in roundtrip["booking_url"]
 
 
 def test_multi_provider_client_internal_selection_pause_and_tiebreak_paths(monkeypatch) -> None:

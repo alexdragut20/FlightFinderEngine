@@ -6,6 +6,7 @@ from .google_flights import GoogleFlightsLocalClient
 from .kayak import KayakScrapeClient, MomondoScrapeClient
 from .kiwi import KiwiClient
 from .multi import MultiProviderClient
+from .ryanair import RyanairFareFinderClient
 from .serpapi import SerpApiGoogleFlightsClient
 from .skyscanner import SkyscannerScrapeClient
 from .travelpayouts import TravelpayoutsDataClient
@@ -18,6 +19,7 @@ __all__ = [
     "KiwiClient",
     "MomondoScrapeClient",
     "MultiProviderClient",
+    "RyanairFareFinderClient",
     "SerpApiGoogleFlightsClient",
     "SkyscannerScrapeClient",
     "TravelpayoutsDataClient",
