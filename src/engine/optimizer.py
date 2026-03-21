@@ -46,6 +46,7 @@ from ..providers import (
     MultiProviderClient,
     SerpApiGoogleFlightsClient,
     SkyscannerScrapeClient,
+    TravelpayoutsDataClient,
 )
 from ..services.progress import SearchProgressTracker
 from ..services.route_graph import RouteConnectivityGraph
@@ -1455,6 +1456,16 @@ class SplitTripOptimizer:
         providers["momondo"] = MomondoScrapeClient()
         providers["googleflights"] = GoogleFlightsLocalClient()
         providers["skyscanner"] = SkyscannerScrapeClient()
+        travelpayouts_token = (
+            self.runtime_provider_secrets.get("travelpayouts_api_token") or ""
+        ).strip()
+        travelpayouts_market = (
+            self.runtime_provider_secrets.get("travelpayouts_market") or ""
+        ).strip()
+        providers["travelpayouts"] = TravelpayoutsDataClient(
+            api_token=travelpayouts_token if travelpayouts_token else None,
+            market=travelpayouts_market if travelpayouts_market else None,
+        )
 
         amadeus_id = (self.runtime_provider_secrets.get("amadeus_client_id") or "").strip()
         amadeus_secret = (self.runtime_provider_secrets.get("amadeus_client_secret") or "").strip()
@@ -1489,6 +1500,8 @@ class SplitTripOptimizer:
             payload: JSON-serializable payload for the operation.
         """
         mapping = {
+            "travelpayouts_api_token": "travelpayouts_api_token",
+            "travelpayouts_market": "travelpayouts_market",
             "amadeus_client_id": "amadeus_client_id",
             "amadeus_client_secret": "amadeus_client_secret",
             "amadeus_base_url": "amadeus_base_url",
@@ -1514,6 +1527,12 @@ class SplitTripOptimizer:
             dict[str, bool]: Runtime provider configuration status.
         """
         return {
+            "travelpayouts_api_token_set": bool(
+                self.runtime_provider_secrets.get("travelpayouts_api_token")
+            ),
+            "travelpayouts_market_set": bool(
+                self.runtime_provider_secrets.get("travelpayouts_market")
+            ),
             "amadeus_client_id_set": bool(self.runtime_provider_secrets.get("amadeus_client_id")),
             "amadeus_client_secret_set": bool(
                 self.runtime_provider_secrets.get("amadeus_client_secret")

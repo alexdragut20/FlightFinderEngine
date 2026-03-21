@@ -1434,7 +1434,19 @@ def test_merge_strategy_anchors_keeps_cheapest_option_visible() -> None:
     ("value", "expected"),
     [
         (["KIWI", "foo", "AMADEUS"], ("kiwi", "amadeus")),
-        ("all", ("kiwi", "kayak", "momondo", "googleflights", "skyscanner", "amadeus", "serpapi")),
+        (
+            "all",
+            (
+                "kiwi",
+                "kayak",
+                "momondo",
+                "googleflights",
+                "skyscanner",
+                "travelpayouts",
+                "amadeus",
+                "serpapi",
+            ),
+        ),
         ("", ("kiwi",)),
     ],
 )
@@ -1506,6 +1518,7 @@ def test_runtime_provider_secrets_enable_optional_providers() -> None:
     optimizer = SplitTripOptimizer(KiwiClient(), AirportCoordinates())
     optimizer.update_runtime_provider_secrets(
         {
+            "travelpayouts_api_token": "tp123",
             "amadeus_client_id": "id123",
             "amadeus_client_secret": "secret123",
             "serpapi_api_key": "key123",
@@ -1513,12 +1526,14 @@ def test_runtime_provider_secrets_enable_optional_providers() -> None:
         }
     )
     status = optimizer.runtime_provider_config_status()
+    assert status["travelpayouts_api_token_set"]
     assert status["amadeus_client_id_set"]
     assert status["amadeus_client_secret_set"]
     assert status["serpapi_api_key_set"]
     assert status["serpapi_return_option_scan_limit_set"]
 
     catalog = {item["id"]: item for item in optimizer.provider_catalog()}
+    assert catalog["travelpayouts"]["configured"]
     assert catalog["amadeus"]["configured"]
     assert catalog["serpapi"]["configured"]
 

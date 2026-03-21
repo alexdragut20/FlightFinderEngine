@@ -171,7 +171,7 @@
                   >
                 </span>
                 <small class="field-help"
-                  >Free providers are preselected by default. Paid providers stay available below once you add runtime keys.</small
+                  >Free providers are preselected by default. Credential-backed providers stay available below once you add runtime keys.</small
                 >
                 <input id="providers" type="hidden" value="" />
                 <div id="providers-picker" class="providers-picker"></div>
@@ -180,6 +180,10 @@
               <div class="provider-keys">
                 <p class="provider-keys-title">Provider API keys (local session only)</p>
                 <div class="provider-keys-grid">
+                  <label>
+                    Travelpayouts API token
+                    <input id="travelpayouts-api-token" type="password" autocomplete="off" />
+                  </label>
                   <label>
                     Amadeus client id
                     <input id="amadeus-client-id" type="password" autocomplete="off" />
@@ -245,7 +249,7 @@
               <label>
                 Max provider API calls / search (0 = no cap)
                 <small class="field-help"
-                  >Global cap for paid providers (Amadeus + SerpApi). Kiwi has its own separate cap.</small
+                  >Global cap for credential-backed providers. Kiwi has its own separate cap.</small
                 >
                 <input id="max-total-provider-calls" type="number" min="0" max="50000" value="145" />
               </label>

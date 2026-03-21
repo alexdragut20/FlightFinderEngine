@@ -16,7 +16,7 @@ It combines calendar seeding, route-graph hub discovery, live fare validation, a
 - Searches multiple destinations in one run.
 - Compares direct round-trips with split-ticket and planned stopover itineraries.
 - Auto-discovers hub candidates from route connectivity instead of relying only on static hub lists.
-- Supports multiple provider adapters: Kiwi, Kayak, Momondo, Google Flights, Skyscanner, Amadeus, and SerpApi.
+- Supports multiple provider adapters: Kiwi, Kayak, Momondo, Google Flights, Skyscanner, Travelpayouts/Aviasales, Amadeus, and SerpApi.
 - Validates top estimated candidates with live one-way and round-trip fare lookups.
 - Tracks long-running searches with asynchronous job progress, ETA, and full server-side logs.
 - Applies provider budgets and validation caps to keep paid API usage under control.
@@ -140,6 +140,7 @@ Free-first flow:
 
 Credential-backed providers:
 
+- `travelpayouts` (Aviasales Data API; token required, cached fare data)
 - `amadeus`
 - `serpapi`
 
@@ -148,6 +149,9 @@ Environment variables supported by the engine include:
 - `AMADEUS_CLIENT_ID`
 - `AMADEUS_CLIENT_SECRET`
 - `AMADEUS_BASE_URL`
+- `TRAVELPAYOUTS_API_TOKEN`
+- `TRAVELPAYOUTS_MARKET`
+- `TRAVELPAYOUTS_DATA_API_URL`
 - `SERPAPI_API_KEY`
 - `SERPAPI_SEARCH_URL`
 - `SERPAPI_RETURN_OPTION_SCAN_LIMIT`

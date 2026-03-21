@@ -136,6 +136,7 @@ def _sanitize_debug_value(value: Any) -> Any:
         "client_secret",
         "amadeus_client_secret",
         "serpapi_api_key",
+        "travelpayouts_api_token",
     }
     if isinstance(value, dict):
         cleaned: dict[str, Any] = {}

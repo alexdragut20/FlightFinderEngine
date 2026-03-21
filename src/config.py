@@ -14,6 +14,10 @@ AIRPORTS_DATA_URL = (
 ROUTES_DATA_URL = "https://raw.githubusercontent.com/jpatokal/openflights/master/data/routes.dat"
 AMADEUS_BASE_URL = os.getenv("AMADEUS_BASE_URL", "https://test.api.amadeus.com").rstrip("/")
 SERPAPI_SEARCH_URL = os.getenv("SERPAPI_SEARCH_URL", "https://serpapi.com/search.json").rstrip("/")
+TRAVELPAYOUTS_DATA_API_URL = os.getenv(
+    "TRAVELPAYOUTS_DATA_API_URL",
+    "https://api.travelpayouts.com/aviasales",
+).rstrip("/")
 KAYAK_SCRAPE_HOST = (
     os.getenv("KAYAK_SCRAPE_HOST", "www.kayak.com").strip().lower() or "www.kayak.com"
 )
@@ -32,6 +36,7 @@ SUPPORTED_PROVIDER_IDS = (
     "momondo",
     "googleflights",
     "skyscanner",
+    "travelpayouts",
     "amadeus",
     "serpapi",
 )

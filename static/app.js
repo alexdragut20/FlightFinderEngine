@@ -76,7 +76,9 @@ const fieldTooltips = {
   "hub-candidates":
     "Hub airport pool used by auto-hub logic. Broader pool increases coverage and runtime.",
   providers:
-    "Providers used for fare validation. Free providers are preselected and paid ones can be enabled with runtime keys.",
+    "Providers used for fare validation. Free providers are preselected and credential-backed ones can be enabled with runtime keys.",
+  "travelpayouts-api-token":
+    "Runtime Travelpayouts token for the Aviasales Data API (local session only).",
   "amadeus-client-id": "Runtime Amadeus client id (local session only).",
   "amadeus-client-secret": "Runtime Amadeus client secret (local session only).",
   "serpapi-api-key": "Runtime SerpApi API key (local session only).",
@@ -92,7 +94,7 @@ const fieldTooltips = {
   "max-validate-return-keys":
     "Hard cap for round-trip live fare keys per destination. 0 means no cap.",
   "max-total-provider-calls":
-    "Total paid-provider call budget for one search. Kiwi calls are still counted separately in Max Kiwi calls.",
+    "Total credential-backed provider call budget for one search. Kiwi calls are still counted separately in Max Kiwi calls.",
   "max-calls-kiwi": "Per-search Kiwi call budget. 0 means no cap.",
   "max-calls-amadeus": "Per-search Amadeus call budget. 0 means no cap.",
   "max-calls-serpapi": "Per-search SerpApi call budget. 0 means no cap.",
@@ -160,17 +162,17 @@ function getSelectedProviderIds() {
 
 function providerPickerMeta(provider) {
   const typeLabel = provider.requires_credentials ? "API key provider" : "Free provider";
+  if (provider.configured) {
+    return provider.requires_credentials
+      ? `${typeLabel}. Ready in this session.`
+      : `${typeLabel}. Ready now.`;
+  }
   if (provider.missing_env?.length) {
     return `${typeLabel}. Needs ${provider.missing_env.join("/")}.`;
   }
   const hint = String(provider.configuration_hint || "").trim();
   if (hint) {
     return `${typeLabel}. ${hint}`;
-  }
-  if (provider.configured) {
-    return provider.requires_credentials
-      ? `${typeLabel}. Ready in this session.`
-      : `${typeLabel}. Ready now.`;
   }
   return provider.requires_credentials
     ? `${typeLabel}. Add keys to enable.`
@@ -379,6 +381,7 @@ function renderProviderStatus(selectedIds) {
 
 function providerSecretsPayload() {
   return {
+    travelpayouts_api_token: document.getElementById("travelpayouts-api-token").value.trim(),
     amadeus_client_id: document.getElementById("amadeus-client-id").value.trim(),
     amadeus_client_secret: document.getElementById("amadeus-client-secret").value.trim(),
     serpapi_api_key: document.getElementById("serpapi-api-key").value.trim(),
@@ -390,12 +393,14 @@ function providerSecretsPayload() {
 
 function renderProviderKeySummary(runtimeConfig) {
   if (!providerKeysStatusEl) return;
+  const travelpayoutsReady = runtimeConfig?.travelpayouts_api_token_set;
   const amadeusReady =
     runtimeConfig?.amadeus_client_id_set && runtimeConfig?.amadeus_client_secret_set;
   const serpapiReady = runtimeConfig?.serpapi_api_key_set;
   const serpapiScanSet = runtimeConfig?.serpapi_return_option_scan_limit_set;
   providerKeysStatusEl.textContent =
-    `Runtime keys: amadeus ${amadeusReady ? "ready" : "missing"}, ` +
+    `Runtime keys: travelpayouts ${travelpayoutsReady ? "ready" : "missing"}, ` +
+    `amadeus ${amadeusReady ? "ready" : "missing"}, ` +
     `serpapi ${serpapiReady ? "ready" : "missing"}, ` +
     `serpapi scan limit ${serpapiScanSet ? "set" : "default"}.`;
 }
@@ -481,12 +486,14 @@ function applyBudgetAwarePreset() {
   }
   const periodWeeks = Math.max(1, Math.ceil(periodDays / 7));
 
+  const travelpayoutsConfigured = providerIsConfigured("travelpayouts");
   const amadeusConfigured = providerIsConfigured("amadeus");
   const serpapiConfigured = providerIsConfigured("serpapi");
   const enabledProviders = providerCatalog
     .filter((provider) => !provider.requires_credentials && provider.default_enabled !== false)
     .map((provider) => String(provider.id || "").toLowerCase())
     .filter(Boolean);
+  if (travelpayoutsConfigured) enabledProviders.push("travelpayouts");
   if (amadeusConfigured) enabledProviders.push("amadeus");
   if (serpapiConfigured) enabledProviders.push("serpapi");
   const currentProviders = getSelectedProviderIds();
@@ -542,7 +549,7 @@ function applyBudgetAwarePreset() {
     budgetPresetStatusEl.textContent =
       `Budget-aware preset applied (Smart Budget): ` +
       `providers ${providersForPreset.join("/")}, validate-top ${validateTop}, CPU auto-max, IO 32, pool x50 per destination, ` +
-      `Amadeus cap ${amadeusCalls || "off"}, SerpApi cap ${serpapiCalls || "off"}, total paid cap ${totalPaidBudget || "off"}.`;
+      `Travelpayouts ${travelpayoutsConfigured ? "on" : "off"}, Amadeus cap ${amadeusCalls || "off"}, SerpApi cap ${serpapiCalls || "off"}, total paid cap ${totalPaidBudget || "off"}.`;
   }
 }
 
@@ -1298,6 +1305,7 @@ function storefrontFromUrl(url) {
     const parsed = new URL(String(url));
     const host = parsed.hostname.toLowerCase();
     const path = parsed.pathname.toLowerCase();
+    if (host.includes("aviasales.")) return "Aviasales";
     if (host.includes("kiwi.com")) return "Kiwi";
     if (host.includes("google.") && path.includes("/travel/flights")) return "Google Flights";
     if (host.includes("skyscanner.")) return "Skyscanner";
@@ -1311,6 +1319,7 @@ function storefrontFromUrl(url) {
 
 function defaultStorefrontForProvider(provider) {
   const id = String(provider || "").trim().toLowerCase();
+  if (id === "travelpayouts") return "Aviasales";
   if (id === "kiwi") return "Kiwi";
   if (id === "kayak") return "Kayak";
   if (id === "momondo") return "Momondo";
@@ -1342,6 +1351,9 @@ function resolveWholeTripUrl(item, legs, comparisonLinks) {
 
   if (providerId === "amadeus") {
     return googleUrl || kayakUrl || skyscannerUrl || momondoUrl || legUrl || kiwiUrl;
+  }
+  if (providerId === "travelpayouts") {
+    return legUrl || kiwiUrl || googleUrl || skyscannerUrl || kayakUrl || momondoUrl;
   }
   if (providerId === "serpapi") {
     return legUrl || googleUrl || kiwiUrl || kayakUrl || skyscannerUrl || momondoUrl;

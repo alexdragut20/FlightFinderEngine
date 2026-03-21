@@ -7,6 +7,7 @@ from .kiwi import KiwiClient
 from .multi import MultiProviderClient
 from .serpapi import SerpApiGoogleFlightsClient
 from .skyscanner import SkyscannerScrapeClient
+from .travelpayouts import TravelpayoutsDataClient
 
 __all__ = [
     "AmadeusClient",
@@ -17,4 +18,5 @@ __all__ = [
     "MultiProviderClient",
     "SerpApiGoogleFlightsClient",
     "SkyscannerScrapeClient",
+    "TravelpayoutsDataClient",
 ]

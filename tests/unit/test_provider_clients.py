@@ -12,6 +12,7 @@ from src.providers.amadeus import AmadeusClient
 from src.providers.kiwi import KiwiClient
 from src.providers.multi import MultiProviderClient
 from src.providers.serpapi import SerpApiGoogleFlightsClient
+from src.providers.travelpayouts import TravelpayoutsDataClient
 
 
 class _FakeResponse:
@@ -644,6 +645,112 @@ def test_multi_provider_client_merges_prices_and_tracks_budgets(monkeypatch) -> 
     assert stats["calendar_errors"]["serpapi"] == 1
     assert stats["oneway_skipped_cooldown"]["serpapi"] == 1
     assert stats["return_skipped_budget"]["amadeus"] == 1
+
+
+def test_travelpayouts_client_parses_calendar_and_exact_fares() -> None:
+    session = _FakeSession(
+        get_responses=[
+            _FakeResponse(
+                {
+                    "success": True,
+                    "data": [
+                        {
+                            "origin": "OTP",
+                            "destination": "FCO",
+                            "price": 150,
+                            "airline": "W6",
+                            "departure_at": "2026-04-10T08:00:00+03:00",
+                            "transfers": 0,
+                            "duration_to": 120,
+                            "link": "/search/OTP1004FCO1",
+                        },
+                        {
+                            "origin": "OTP",
+                            "destination": "FCO",
+                            "price": 170,
+                            "airline": "FR",
+                            "departure_at": "2026-04-11T09:00:00+03:00",
+                            "transfers": 1,
+                            "duration_to": 180,
+                            "link": "/search/OTP1104FCO1",
+                        },
+                    ],
+                }
+            ),
+            _FakeResponse(
+                {
+                    "success": True,
+                    "data": [
+                        {
+                            "origin": "OTP",
+                            "destination": "FCO",
+                            "price": 310,
+                            "airline": "AZ",
+                            "departure_at": "2026-04-10T06:30:00+03:00",
+                            "return_at": "2026-04-17T19:20:00+02:00",
+                            "transfers": 1,
+                            "return_transfers": 0,
+                            "duration": 360,
+                            "duration_to": 175,
+                            "duration_back": 185,
+                            "link": "/search/OTP1004FCO1704",
+                        },
+                        {
+                            "origin": "OTP",
+                            "destination": "FCO",
+                            "price": 295,
+                            "airline": "AZ",
+                            "departure_at": "2026-04-12T06:30:00+03:00",
+                            "return_at": "2026-04-19T19:20:00+02:00",
+                            "transfers": 0,
+                            "return_transfers": 0,
+                            "duration": 300,
+                            "duration_to": 150,
+                            "duration_back": 150,
+                            "link": "/search/OTP1204FCO1904",
+                        },
+                    ],
+                }
+            ),
+        ]
+    )
+    client = TravelpayoutsDataClient(api_token="tp-token")
+    client._session = lambda: session  # type: ignore[assignment]
+
+    prices = client.get_calendar_prices(
+        "OTP",
+        "FCO",
+        "2026-04-10",
+        "2026-04-11",
+        "EUR",
+        1,
+        1,
+        1,
+        0,
+    )
+    best_oneway = client.get_best_oneway("OTP", "FCO", "2026-04-10", "EUR", 1, 1, 1, 0)
+    best_return = client.get_best_return(
+        "OTP",
+        "FCO",
+        "2026-04-10",
+        "2026-04-17",
+        "EUR",
+        1,
+        1,
+        1,
+        0,
+    )
+
+    assert prices == {"2026-04-10": 150, "2026-04-11": 170}
+    assert best_oneway is not None
+    assert best_oneway["price"] == 150
+    assert best_oneway["booking_url"] == "https://www.aviasales.com/search/OTP1004FCO1"
+    assert best_return is not None
+    assert best_return["price"] == 310
+    assert best_return["outbound_stops"] == 1
+    assert best_return["inbound_stops"] == 0
+    assert best_return["booking_url"] == "https://www.aviasales.com/search/OTP1004FCO1704"
+    assert len(session.get_calls) == 2
 
 
 def test_multi_provider_client_internal_selection_pause_and_tiebreak_paths(monkeypatch) -> None:
