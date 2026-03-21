@@ -39,6 +39,7 @@ from ..data.airports import AirportCoordinates
 from ..models import PassengerConfig, SearchConfig
 from ..providers import (
     AmadeusClient,
+    AzairScrapeClient,
     GoogleFlightsLocalClient,
     KayakScrapeClient,
     KiwiClient,
@@ -1085,6 +1086,30 @@ def _estimate_candidates_for_destination_compact(task: dict[str, Any]) -> list[d
                                                 estimated_outbound_time_seconds
                                             ),
                                             "estimated_pricing_strategy": estimated_pricing_strategy,
+                                            "estimated_inner_return_outbound_market_price": (
+                                                second_leg_price
+                                                if (
+                                                    origin == arrival_origin
+                                                    and outbound_hub == inbound_hub
+                                                )
+                                                else None
+                                            ),
+                                            "estimated_inner_return_inbound_market_price": (
+                                                third_leg_price
+                                                if (
+                                                    origin == arrival_origin
+                                                    and outbound_hub == inbound_hub
+                                                )
+                                                else None
+                                            ),
+                                            "estimated_inner_return_bundle_price": (
+                                                bundle_price
+                                                if (
+                                                    origin == arrival_origin
+                                                    and outbound_hub == inbound_hub
+                                                )
+                                                else None
+                                            ),
                                         },
                                         estimated_score=estimated_score,
                                         estimated_total=estimated_total,
@@ -1301,6 +1326,30 @@ def _estimate_candidates_for_destination_compact(task: dict[str, Any]) -> list[d
                                                     estimated_outbound_time_seconds
                                                 ),
                                                 "estimated_pricing_strategy": estimated_pricing_strategy,
+                                                "estimated_inner_return_outbound_market_price": (
+                                                    third_leg_price
+                                                    if (
+                                                        origin == arrival_origin
+                                                        and out_hub_b == in_hub_a
+                                                    )
+                                                    else None
+                                                ),
+                                                "estimated_inner_return_inbound_market_price": (
+                                                    fourth_leg_price
+                                                    if (
+                                                        origin == arrival_origin
+                                                        and out_hub_b == in_hub_a
+                                                    )
+                                                    else None
+                                                ),
+                                                "estimated_inner_return_bundle_price": (
+                                                    bundle_price
+                                                    if (
+                                                        origin == arrival_origin
+                                                        and out_hub_b == in_hub_a
+                                                    )
+                                                    else None
+                                                ),
                                                 "outbound_legs": [
                                                     {
                                                         "source": origin,
@@ -1432,10 +1481,10 @@ class SplitTripOptimizer:
             client: Provider client used for the request.
             coordinates: Airport coordinates to evaluate.
         """
+        self.coords = coordinates
         self.runtime_provider_secrets: dict[str, str] = {}
         self.providers: dict[str, Any] = {}
         self._set_provider_instances(client)
-        self.coords = coordinates
         self.route_graph = RouteConnectivityGraph()
 
     def _set_provider_instances(self, client: KiwiClient | dict[str, Any]) -> None:
@@ -1452,6 +1501,7 @@ class SplitTripOptimizer:
         if "kiwi" not in providers:
             providers["kiwi"] = KiwiClient()
 
+        providers["azair"] = AzairScrapeClient(coordinates=self.coords)
         providers["kayak"] = KayakScrapeClient()
         providers["momondo"] = MomondoScrapeClient()
         providers["googleflights"] = GoogleFlightsLocalClient()
@@ -1771,6 +1821,7 @@ class SplitTripOptimizer:
             "kiwi": config.max_calls_kiwi,
             # Keep free scraper providers uncapped unless the global cap is used.
             # `max_calls_kiwi` should only apply to Kiwi itself.
+            "azair": None,
             "kayak": None,
             "momondo": None,
             "googleflights": None,
@@ -4073,6 +4124,272 @@ class SplitTripOptimizer:
         )
         return discovered, warnings
 
+    def _build_free_provider_return_discovery_keys(
+        self,
+        *,
+        destination: str,
+        estimated_candidates: list[dict[str, Any]],
+        config: SearchConfig,
+    ) -> tuple[tuple[str, str, str, str], ...]:
+        """Build whole-trip return keys for free-provider bundle discovery.
+
+        Args:
+            destination: Destination airport code for the request.
+            estimated_candidates: Estimated candidates for the destination.
+            config: Search configuration for the operation.
+
+        Returns:
+            tuple[tuple[str, str, str, str], ...]: Ranked round-trip keys to probe.
+        """
+        return_rank: dict[tuple[str, str, str, str], int] = {}
+        ranked_candidates = sorted(
+            estimated_candidates,
+            key=lambda item: (
+                float(
+                    item.get("estimated_best_value_score")
+                    if config.objective == "best"
+                    and item.get("estimated_best_value_score") is not None
+                    else item.get("estimated_score") or PRICE_SENTINEL
+                ),
+                int(item.get("estimated_total") or PRICE_SENTINEL),
+            ),
+        )[:COVERAGE_AUDIT_TOP_CANDIDATES]
+
+        for candidate in ranked_candidates:
+            candidate_type = str(candidate.get("candidate_type") or "split_stopover")
+            return_key: tuple[str, str, str, str] | None = None
+            if candidate_type == "direct_roundtrip":
+                origin = str(candidate.get("origin") or "").strip().upper()
+                arrival_origin = str(candidate.get("arrival_origin") or "").strip().upper()
+                depart_origin_date = str(candidate.get("depart_origin_date") or "")[:10]
+                return_origin_date = str(candidate.get("return_origin_date") or "")[:10]
+                if (
+                    not origin
+                    or not destination
+                    or not depart_origin_date
+                    or not return_origin_date
+                ):
+                    continue
+                if arrival_origin and arrival_origin != origin:
+                    continue
+                return_key = (origin, destination, depart_origin_date, return_origin_date)
+            else:
+                inner_return_plan = self._candidate_inner_return_plan(candidate)
+                if inner_return_plan is not None:
+                    return_key = tuple(
+                        str(value or "").strip().upper() if index < 2 else str(value or "")[:10]
+                        for index, value in enumerate(inner_return_plan["return_key"])
+                    )
+            if return_key is None or not all(return_key):
+                continue
+            estimated_total = int(candidate.get("estimated_total") or PRICE_SENTINEL)
+            current = return_rank.get(return_key)
+            if current is None or estimated_total < current:
+                return_rank[return_key] = estimated_total
+
+        if not return_rank:
+            return ()
+
+        max_keys = max(4, min(24, int(config.validate_top_per_destination)))
+        return tuple(
+            sorted(
+                return_rank,
+                key=lambda key: (
+                    return_rank.get(key, PRICE_SENTINEL),
+                    key[0],
+                    key[1],
+                    key[2],
+                    key[3],
+                ),
+            )[:max_keys]
+        )
+
+    async def _probe_free_provider_return_discovery(
+        self,
+        *,
+        search_client: MultiProviderClient,
+        provider_ids: tuple[str, ...],
+        return_keys: tuple[tuple[str, str, str, str], ...],
+        config: SearchConfig,
+        io_pool: ThreadPoolExecutor,
+        io_cap: int | None = None,
+    ) -> tuple[dict[tuple[str, str, str, str], dict[str, Any]], list[str]]:
+        """Probe exact whole-trip fares from free providers for ranked return keys.
+
+        Args:
+            search_client: Client used to execute search requests.
+            provider_ids: Free-provider identifiers used for discovery.
+            return_keys: Ranked whole-trip keys mapped as origin/destination/outbound/inbound.
+            config: Search configuration for the operation.
+            io_pool: Thread pool used for I/O-bound provider validation.
+            io_cap: Maximum concurrency cap for the sparse discovery stage.
+
+        Returns:
+            tuple[dict[tuple[str, str, str, str], dict[str, Any]], list[str]]:
+                Discovered whole-trip fares keyed by round-trip market/date tuples.
+        """
+        if not provider_ids or not return_keys:
+            return {}, []
+
+        loop = asyncio.get_running_loop()
+        sem = asyncio.Semaphore(
+            max(
+                1,
+                min(
+                    int(io_cap or max(1, min(4, COVERAGE_AUDIT_DISCOVERY_IO_CAP))),
+                    bounded_io_concurrency(config.io_workers),
+                ),
+            )
+        )
+        max_connection_layover_seconds = (
+            int(config.max_connection_layover_hours * SECONDS_PER_HOUR)
+            if config.max_connection_layover_hours
+            else None
+        )
+        discovered: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+        warnings: list[str] = []
+
+        async def probe_return(return_key: tuple[str, str, str, str]) -> None:
+            source, target, outbound_iso, inbound_iso = return_key
+            async with sem:
+                try:
+                    fn = partial(
+                        search_client.get_best_return,
+                        source=source,
+                        destination=target,
+                        outbound_iso=outbound_iso,
+                        inbound_iso=inbound_iso,
+                        currency=config.currency,
+                        max_stops_per_leg=config.max_stops_per_leg,
+                        adults=config.passengers.adults,
+                        hand_bags=config.passengers.hand_bags,
+                        hold_bags=config.passengers.hold_bags,
+                        max_connection_layover_seconds=max_connection_layover_seconds,
+                        provider_ids=provider_ids,
+                    )
+                    item = await loop.run_in_executor(io_pool, fn)
+                except Exception as exc:
+                    warnings.append(
+                        "Whole-trip discovery failed "
+                        f"{source}->{target} {outbound_iso}/{inbound_iso}: {exc}"
+                    )
+                    return
+                if not item:
+                    return
+                price = int(item.get("price") or 0)
+                if price <= 0:
+                    return
+                current = discovered.get(return_key)
+                if current is None or price < int(current.get("price") or PRICE_SENTINEL):
+                    discovered[return_key] = dict(item)
+
+        await asyncio.gather(*(probe_return(return_key) for return_key in return_keys))
+        return discovered, warnings
+
+    def _apply_return_discovery_to_estimated_candidates(
+        self,
+        *,
+        destination: str,
+        estimated_candidates: list[dict[str, Any]],
+        discovered_returns: dict[tuple[str, str, str, str], dict[str, Any]],
+        config: SearchConfig,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Apply cheaper whole-trip discoveries back onto estimated candidates.
+
+        Args:
+            destination: Destination airport code for the request.
+            estimated_candidates: Estimated candidates for the destination.
+            discovered_returns: Whole-trip fares keyed by market/date tuple.
+            config: Search configuration for the operation.
+
+        Returns:
+            tuple[list[dict[str, Any]], int]: Updated estimated candidates and improved count.
+        """
+        if not discovered_returns:
+            return list(estimated_candidates), 0
+
+        improved = 0
+        updated_candidates: list[dict[str, Any]] = []
+        for candidate in estimated_candidates:
+            candidate_type = str(candidate.get("candidate_type") or "split_stopover")
+            return_key: tuple[str, str, str, str] | None = None
+            current_bundle_component: int | None = None
+            exact_pricing_strategy: str | None = None
+            if candidate_type == "direct_roundtrip":
+                return_key = (
+                    str(candidate.get("origin") or "").strip().upper(),
+                    destination,
+                    str(candidate.get("depart_origin_date") or "")[:10],
+                    str(candidate.get("return_origin_date") or "")[:10],
+                )
+                current_bundle_component = int(candidate.get("estimated_total") or PRICE_SENTINEL)
+                exact_pricing_strategy = str(
+                    candidate.get("estimated_pricing_strategy") or ""
+                ).strip()
+            else:
+                inner_return_plan = self._candidate_inner_return_plan(candidate)
+                outbound_market_price = _coerce_optional_price(
+                    candidate.get("estimated_inner_return_outbound_market_price")
+                )
+                inbound_market_price = _coerce_optional_price(
+                    candidate.get("estimated_inner_return_inbound_market_price")
+                )
+                market_total = int(outbound_market_price or 0) + int(inbound_market_price or 0)
+                if inner_return_plan is not None and market_total > 0:
+                    return_key = tuple(
+                        str(value or "").strip().upper() if index < 2 else str(value or "")[:10]
+                        for index, value in enumerate(inner_return_plan["return_key"])
+                    )
+                    current_bundle_component = market_total
+                    if str(candidate.get("estimated_pricing_strategy") or "") == (
+                        "inner_return_bundle_proxy"
+                    ):
+                        current_bundle_component = int(
+                            candidate.get("estimated_inner_return_bundle_price") or market_total
+                        )
+                    exact_pricing_strategy = "inner_return_bundle_exact"
+            if return_key is None or current_bundle_component is None:
+                updated_candidates.append(candidate)
+                continue
+            discovered_fare = discovered_returns.get(return_key)
+            if not discovered_fare:
+                updated_candidates.append(candidate)
+                continue
+
+            discovered_price = int(discovered_fare.get("price") or 0)
+            current_total = int(candidate.get("estimated_total") or PRICE_SENTINEL)
+            if discovered_price <= 0:
+                updated_candidates.append(candidate)
+                continue
+            if candidate_type == "direct_roundtrip":
+                exact_total = discovered_price
+            else:
+                exact_total = current_total - int(current_bundle_component) + discovered_price
+            if exact_total >= current_total:
+                updated_candidates.append(candidate)
+                continue
+
+            updated = dict(candidate)
+            updated["estimated_total"] = exact_total
+            updated["estimated_score"] = _estimate_objective_score(
+                objective=config.objective,
+                estimated_total=exact_total,
+                distance_basis_km=updated.get("distance_basis_km"),
+                outbound_time_proxy_seconds=updated.get(
+                    "estimated_outbound_time_to_destination_seconds"
+                ),
+            )
+            if exact_pricing_strategy:
+                updated["estimated_pricing_strategy"] = exact_pricing_strategy
+            updated["estimated_whole_trip_provider"] = (
+                str(discovered_fare.get("provider") or "").strip().lower() or None
+            )
+            updated["estimated_whole_trip_discovery_price"] = discovered_price
+            updated_candidates.append(updated)
+            improved += 1
+
+        return updated_candidates, improved
+
     async def _run_initial_free_provider_discovery(
         self,
         *,
@@ -4366,6 +4683,149 @@ class SplitTripOptimizer:
                 phase="candidates",
             )
         return audited_estimates, audit_metadata, warnings
+
+    async def _run_free_provider_whole_trip_discovery(
+        self,
+        *,
+        search_client: MultiProviderClient,
+        candidate_tasks: list[dict[str, Any]],
+        estimated_by_destination: dict[str, list[dict[str, Any]]],
+        config: SearchConfig,
+        io_pool: ThreadPoolExecutor,
+        progress: SearchProgressTracker | None = None,
+    ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, dict[str, Any]], list[str]]:
+        """Probe exact whole-trip fares from free providers and promote cheaper bundles.
+
+        Args:
+            search_client: Client used to execute search requests.
+            candidate_tasks: Estimator tasks used to score candidates.
+            estimated_by_destination: Estimated candidates grouped by destination.
+            config: Search configuration for the operation.
+            io_pool: Thread pool used for I/O-bound provider validation.
+            progress: Progress tracker for the search job.
+
+        Returns:
+            tuple[dict[str, list[dict[str, Any]]], dict[str, dict[str, Any]], list[str]]:
+                Updated destination estimates, metadata, and warnings.
+        """
+        provider_ids = tuple(
+            provider_id
+            for provider_id in search_client.active_provider_ids
+            if provider_id in _FREE_PROVIDER_IDS
+            and provider_id != "kiwi"
+            and not bool(getattr(self.providers.get(provider_id), "supports_calendar", True))
+        )
+        if progress is not None:
+            progress.set_runtime_data(
+                "whole_trip_discovery",
+                {"destinations": [], "provider_ids": list(provider_ids)},
+            )
+        if not provider_ids or not estimated_by_destination:
+            return {}, {}, []
+
+        selected_destinations = self._select_coverage_audit_destinations(
+            estimated_by_destination=estimated_by_destination,
+            objective=config.objective,
+        )
+        if not selected_destinations:
+            return {}, {}, []
+
+        warnings: list[str] = []
+        task_by_destination = {
+            str(task.get("destination") or ""): task
+            for task in candidate_tasks
+            if task.get("destination")
+        }
+        updated_estimates: dict[str, list[dict[str, Any]]] = {}
+        metadata: dict[str, dict[str, Any]] = {}
+
+        for destination in selected_destinations:
+            estimated_candidates = list(estimated_by_destination.get(destination) or [])
+            base_task = task_by_destination.get(destination)
+            if not estimated_candidates or base_task is None:
+                continue
+
+            return_keys = self._build_free_provider_return_discovery_keys(
+                destination=destination,
+                estimated_candidates=estimated_candidates,
+                config=config,
+            )
+            if not return_keys:
+                continue
+
+            if progress is not None:
+                progress.log_message(
+                    f"{destination}: probing {len(return_keys)} whole-trip key(s) on "
+                    f"{'/'.join(provider_ids)} for cheaper bundled fares.",
+                    phase="candidates",
+                )
+
+            (
+                discovered_returns,
+                discovery_warnings,
+            ) = await self._probe_free_provider_return_discovery(
+                search_client=search_client,
+                provider_ids=provider_ids,
+                return_keys=return_keys,
+                config=config,
+                io_pool=io_pool,
+            )
+            warnings.extend(discovery_warnings[:12])
+            if not discovered_returns:
+                continue
+
+            adjusted_candidates, improved_candidates = (
+                self._apply_return_discovery_to_estimated_candidates(
+                    destination=destination,
+                    estimated_candidates=estimated_candidates,
+                    discovered_returns=discovered_returns,
+                    config=config,
+                )
+            )
+            provider_counts: dict[str, int] = {}
+            for item in discovered_returns.values():
+                provider_id = str(item.get("provider") or "").strip().lower()
+                if provider_id:
+                    provider_counts[provider_id] = provider_counts.get(provider_id, 0) + 1
+            metadata[destination] = {
+                "destination": destination,
+                "provider_ids": list(provider_ids),
+                "seed_return_keys": len(return_keys),
+                "discovered_return_keys": len(discovered_returns),
+                "improved_candidates": improved_candidates,
+                "selected_providers": provider_counts,
+            }
+            if improved_candidates <= 0:
+                continue
+
+            split_count = sum(
+                1
+                for candidate in adjusted_candidates
+                if candidate.get("candidate_type") != "direct_roundtrip"
+            )
+            direct_count = max(0, len(adjusted_candidates) - split_count)
+            updated_estimates[destination] = _finalize_estimated_candidates(
+                adjusted_candidates,
+                objective=str(base_task.get("objective") or config.objective),
+                max_candidates=max(split_count, int(base_task["max_candidates"])),
+                max_direct_candidates=max(
+                    direct_count,
+                    int(base_task.get("max_direct_candidates") or base_task["max_candidates"]),
+                ),
+            )
+            if progress is not None:
+                progress.log_message(
+                    f"{destination}: whole-trip discovery improved {improved_candidates} "
+                    f"direct candidate(s) across {len(discovered_returns)} return key(s).",
+                    phase="candidates",
+                )
+
+        if progress is not None:
+            progress.set_runtime_data(
+                "whole_trip_discovery",
+                {"destinations": list(metadata.values()), "provider_ids": list(provider_ids)},
+            )
+        return updated_estimates, metadata, warnings
 
     @staticmethod
     def _prune_dominated_split_results(
@@ -5301,6 +5761,10 @@ class SplitTripOptimizer:
                 "coverage_audit",
                 {"destinations": [], "provider_ids": []},
             )
+            progress.set_runtime_data(
+                "whole_trip_discovery",
+                {"destinations": [], "provider_ids": []},
+            )
             stats_listener_setter = getattr(search_client, "set_stats_listener", None)
             if callable(stats_listener_setter):
                 stats_listener_setter(
@@ -5597,6 +6061,7 @@ class SplitTripOptimizer:
         )
         coverage_audit_estimates: dict[str, list[dict[str, Any]]] = {}
         coverage_audit_metadata: dict[str, dict[str, Any]] = {}
+        whole_trip_discovery_metadata: dict[str, dict[str, Any]] = {}
         if estimated_by_destination:
             (
                 coverage_audit_estimates,
@@ -5658,6 +6123,21 @@ class SplitTripOptimizer:
                         ),
                     },
                 )
+            (
+                whole_trip_adjusted_estimates,
+                whole_trip_discovery_metadata,
+                whole_trip_discovery_warnings,
+            ) = await self._run_free_provider_whole_trip_discovery(
+                search_client=search_client,
+                candidate_tasks=candidate_tasks,
+                estimated_by_destination=estimated_by_destination,
+                config=config,
+                io_pool=io_pool,
+                progress=progress,
+            )
+            warnings.extend(whole_trip_discovery_warnings)
+            for destination, adjusted_candidates in whole_trip_adjusted_estimates.items():
+                estimated_by_destination[destination] = adjusted_candidates
         if progress is not None:
             progress.complete_phase(
                 "candidates",
@@ -7194,6 +7674,7 @@ class SplitTripOptimizer:
                     "provider_health": provider_health,
                     "free_provider_discovery": list(free_provider_discovery_metadata.values()),
                     "coverage_audit": list(coverage_audit_metadata.values()),
+                    "whole_trip_discovery": list(whole_trip_discovery_metadata.values()),
                     "max_total_provider_calls": config.max_total_provider_calls,
                     "max_calls_kiwi": config.max_calls_kiwi,
                     "max_calls_amadeus": config.max_calls_amadeus,

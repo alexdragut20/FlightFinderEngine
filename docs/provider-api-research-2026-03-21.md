@@ -123,6 +123,23 @@ Conclusion:
 - Good for flight status, schedules, routes, airports, and airline operational data.
 - Not selected because it does not solve airfare shopping.
 
+### 7. AZair
+
+Website:
+
+- https://www.azair.eu/
+
+What stands out:
+
+- No account or API token is required for basic result pages.
+- Exact-date and flexi-date searches return plain HTML that can be parsed without browser challenges in this environment.
+- Flexi search can cover many departure dates in one response, which is useful for cheap-date seeding.
+
+Tradeoffs:
+
+- The site is positioned around Europe and the Middle East, so it is not a broad replacement for long-haul global coverage.
+- Best fit is as an extra free discovery source for cheap feeder legs and regional budget fares, not as the only provider.
+
 ## Recommendation
 
 Best results-for-money choice from this pass:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .amadeus import AmadeusClient
+from .azair import AzairScrapeClient
 from .google_flights import GoogleFlightsLocalClient
 from .kayak import KayakScrapeClient, MomondoScrapeClient
 from .kiwi import KiwiClient
@@ -11,6 +12,7 @@ from .travelpayouts import TravelpayoutsDataClient
 
 __all__ = [
     "AmadeusClient",
+    "AzairScrapeClient",
     "GoogleFlightsLocalClient",
     "KayakScrapeClient",
     "KiwiClient",

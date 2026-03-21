@@ -9,6 +9,7 @@ import requests
 
 from src.exceptions import ProviderBlockedError, ProviderNoResultError
 from src.providers.amadeus import AmadeusClient
+from src.providers.azair import AzairScrapeClient
 from src.providers.kiwi import KiwiClient
 from src.providers.multi import MultiProviderClient
 from src.providers.serpapi import SerpApiGoogleFlightsClient
@@ -751,6 +752,106 @@ def test_travelpayouts_client_parses_calendar_and_exact_fares() -> None:
     assert best_return["inbound_stops"] == 0
     assert best_return["booking_url"] == "https://www.aviasales.com/search/OTP1004FCO1704"
     assert len(session.get_calls) == 2
+
+
+def test_azair_client_parses_calendar_and_exact_fares() -> None:
+    oneway_html_payload = """
+<!DOCTYPE html>
+<html>
+  <body>
+    <div class="result " id="_:1:2026-04-18:63:13.50:1">
+      <div class="text">
+        <p><span class="caption tam">There</span> <span class="date">Sat 18/04/26</span> <span class="durcha">3:05 h / direct</span> <span class="subPrice">62.98</span></p>
+        <p><span class="sumPrice">Total: <span class="bp">62.98</span><br/></span></p>
+      </div>
+      <div class="bookmark"><a href="azfin.php?tp=0&resultSubmit=Hledat"></a></div>
+      <div class="close"></div>
+      <div class="smBarDetail"></div>
+    </div>
+    <div class="result " id="_:1:2026-04-20:55:09.00:1">
+      <div class="text">
+        <p><span class="caption tam">There</span> <span class="date">Mon 20/04/26</span> <span class="durcha">2:10 h / direct</span> <span class="subPrice">54.99</span></p>
+        <p><span class="sumPrice">Total: <span class="bp">54.99</span><br/></span></p>
+      </div>
+      <div class="bookmark"><a href="azfin.php?tp=1&resultSubmit=Hledat"></a></div>
+      <div class="close"></div>
+      <div class="smBarDetail"></div>
+    </div>
+  </body>
+</html>
+"""
+    roundtrip_html_payload = """
+<!DOCTYPE html>
+<html>
+  <body>
+    <div class="result " id="_:1:2026-04-18:63:13.50:2">
+      <div class="text">
+        <p><span class="caption tam">There</span> <span class="date">Sat 18/04/26</span> <span class="durcha">11:50 h / 1 change</span> <span class="subPrice">62.98</span></p>
+        <p><span class="caption sem">Back</span> <span class="date">Sat 25/04/26</span> <span class="durcha">6:40 h / direct</span> <span class="subPrice">66.26</span></p>
+        <p><span class="sumPrice">Total: <span class="bp">129.24</span><br/></span></p>
+      </div>
+      <div class="bookmark"><a href="azfin.php?tp=2&resultSubmit=Hledat"></a></div>
+      <div class="close"></div>
+      <div class="smBarDetail"></div>
+    </div>
+  </body>
+</html>
+"""
+    client = AzairScrapeClient(base_url="https://www.azair.eu")
+    client._market_supported = lambda *_args, **_kwargs: True  # type: ignore[assignment]
+
+    def _fake_search_results(  # type: ignore[no-untyped-def]
+        _source,
+        _destination,
+        _date_start_iso,
+        _date_end_iso,
+        _currency,
+        _max_stops_per_leg,
+        *,
+        one_way,
+        stay_nights,
+    ):
+        del stay_nights
+        payload = oneway_html_payload if one_way else roundtrip_html_payload
+        return client._parse_results(payload, currency="EUR")
+
+    client._search_results = _fake_search_results  # type: ignore[assignment]
+
+    prices = client.get_calendar_prices(
+        "OTP",
+        "FCO",
+        "2026-04-18",
+        "2026-04-21",
+        "EUR",
+        1,
+        1,
+        0,
+        0,
+    )
+    assert prices == {"2026-04-18": 63, "2026-04-20": 55}
+
+    oneway = client.get_best_oneway("OTP", "FCO", "2026-04-20", "EUR", 1, 1, 0, 0)
+    assert oneway is not None
+    assert oneway["price"] == 55
+    assert oneway["stops"] == 0
+    assert oneway["booking_url"] == "https://www.azair.eu/azfin.php?tp=1&resultSubmit=Hledat"
+
+    roundtrip = client.get_best_return(
+        "OTP",
+        "FCO",
+        "2026-04-18",
+        "2026-04-25",
+        "EUR",
+        1,
+        1,
+        0,
+        0,
+    )
+    assert roundtrip is not None
+    assert roundtrip["price"] == 129
+    assert roundtrip["outbound_stops"] == 1
+    assert roundtrip["inbound_stops"] == 0
+    assert roundtrip["booking_url"] == "https://www.azair.eu/azfin.php?tp=2&resultSubmit=Hledat"
 
 
 def test_multi_provider_client_internal_selection_pause_and_tiebreak_paths(monkeypatch) -> None:

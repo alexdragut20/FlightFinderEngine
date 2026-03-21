@@ -13,6 +13,7 @@ from .engine import SplitTripOptimizer, _estimate_candidates_for_destination
 from .exceptions import ProviderNoResultError
 from .providers import (
     AmadeusClient,
+    AzairScrapeClient,
     GoogleFlightsLocalClient,
     KayakScrapeClient,
     KiwiClient,
@@ -83,6 +84,7 @@ __all__ = [
     "_capture_provider_response",
     "log_event",
     "AmadeusClient",
+    "AzairScrapeClient",
     "GoogleFlightsLocalClient",
     "KayakScrapeClient",
     "KiwiClient",

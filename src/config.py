@@ -18,6 +18,7 @@ TRAVELPAYOUTS_DATA_API_URL = os.getenv(
     "TRAVELPAYOUTS_DATA_API_URL",
     "https://api.travelpayouts.com/aviasales",
 ).rstrip("/")
+AZAIR_BASE_URL = os.getenv("AZAIR_BASE_URL", "https://www.azair.eu").rstrip("/")
 KAYAK_SCRAPE_HOST = (
     os.getenv("KAYAK_SCRAPE_HOST", "www.kayak.com").strip().lower() or "www.kayak.com"
 )
@@ -32,6 +33,7 @@ KAYAK_SCRAPE_SCHEME = "https"
 
 SUPPORTED_PROVIDER_IDS = (
     "kiwi",
+    "azair",
     "kayak",
     "momondo",
     "googleflights",
@@ -40,7 +42,7 @@ SUPPORTED_PROVIDER_IDS = (
     "amadeus",
     "serpapi",
 )
-_FREE_PROVIDER_IDS = {"kiwi", "kayak", "momondo", "googleflights", "skyscanner"}
+_FREE_PROVIDER_IDS = {"kiwi", "azair", "kayak", "momondo", "googleflights", "skyscanner"}
 
 
 def _detect_playwright_browser_channel() -> str:

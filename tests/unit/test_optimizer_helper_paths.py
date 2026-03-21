@@ -2946,3 +2946,151 @@ def test_optimizer_coverage_audit_helpers_cover_empty_and_success_paths(monkeypa
     snapshot = progress.snapshot()
     assert snapshot["coverage_audit"]["destinations"][0]["destination"] == "USM"
     assert any("Coverage audit complete" in event["message"] for event in snapshot["events"])
+
+
+def test_optimizer_whole_trip_discovery_helpers_promote_cheaper_bundle_fares() -> None:
+    optimizer = SplitTripOptimizer(KiwiClient(), AirportCoordinates())
+    config = optimizer.parse_search_config(
+        {
+            "origins": ["OTP"],
+            "destinations": ["USM"],
+            "period_start": "2026-04-20",
+            "period_end": "2026-04-25",
+            "providers": ["kiwi", "googleflights"],
+            "objective": "cheapest",
+            "validate_top_per_destination": 12,
+            "cpu_workers": 1,
+            "io_workers": 2,
+        }
+    )
+    direct_candidate = {
+        "candidate_type": "direct_roundtrip",
+        "destination": "USM",
+        "origin": "OTP",
+        "arrival_origin": "OTP",
+        "depart_origin_date": "2026-04-20",
+        "return_origin_date": "2026-04-25",
+        "estimated_total": 900,
+        "estimated_score": 900.0,
+        "estimated_outbound_time_to_destination_seconds": 7200,
+        "distance_basis_km": 8600.0,
+    }
+    split_candidate = {
+        "candidate_type": "split_stopover",
+        "destination": "USM",
+        "origin": "OTP",
+        "arrival_origin": "OTP",
+        "outbound_hub": "BKK",
+        "inbound_hub": "BKK",
+        "depart_origin_date": "2026-04-20",
+        "depart_destination_date": "2026-04-21",
+        "leave_destination_date": "2026-04-24",
+        "return_origin_date": "2026-04-25",
+        "outbound_stopover_days": 1,
+        "inbound_stopover_days": 1,
+        "estimated_total": 760,
+        "estimated_score": 760.0,
+        "estimated_outbound_time_to_destination_seconds": 7600,
+        "distance_basis_km": 8600.0,
+        "estimated_pricing_strategy": "inner_return_bundle_proxy",
+        "estimated_inner_return_outbound_market_price": 180,
+        "estimated_inner_return_inbound_market_price": 140,
+        "estimated_inner_return_bundle_price": 220,
+    }
+
+    return_keys = optimizer._build_free_provider_return_discovery_keys(
+        destination="USM",
+        estimated_candidates=[direct_candidate, split_candidate],
+        config=config,
+    )
+    assert return_keys == (
+        ("BKK", "USM", "2026-04-21", "2026-04-24"),
+        ("OTP", "USM", "2026-04-20", "2026-04-25"),
+    )
+
+    class _ReturnDiscoveryClient:
+        active_provider_ids = ["kiwi", "googleflights"]
+
+        def get_best_return(self, **kwargs):  # type: ignore[no-untyped-def]
+            if kwargs["destination"] == "DXB":
+                raise RuntimeError("return exploded")
+            if (
+                kwargs["source"] == "OTP"
+                and kwargs["destination"] == "USM"
+                and kwargs["outbound_iso"] == "2026-04-20"
+                and kwargs["inbound_iso"] == "2026-04-25"
+            ):
+                return {"price": 650, "provider": "googleflights", "formatted_price": "650 RON"}
+            if (
+                kwargs["source"] == "BKK"
+                and kwargs["destination"] == "USM"
+                and kwargs["outbound_iso"] == "2026-04-21"
+                and kwargs["inbound_iso"] == "2026-04-24"
+            ):
+                return {"price": 160, "provider": "googleflights", "formatted_price": "160 RON"}
+            return None
+
+    with ThreadPoolExecutor(max_workers=2) as io_pool:
+        discovered, warnings = asyncio.run(
+            optimizer._probe_free_provider_return_discovery(
+                search_client=_ReturnDiscoveryClient(),  # type: ignore[arg-type]
+                provider_ids=("googleflights",),
+                return_keys=(
+                    ("OTP", "USM", "2026-04-20", "2026-04-25"),
+                    ("BKK", "USM", "2026-04-21", "2026-04-24"),
+                    ("OTP", "DXB", "2026-04-20", "2026-04-25"),
+                ),
+                config=config,
+                io_pool=io_pool,
+                io_cap=2,
+            )
+        )
+    assert discovered[("OTP", "USM", "2026-04-20", "2026-04-25")]["price"] == 650
+    assert discovered[("BKK", "USM", "2026-04-21", "2026-04-24")]["price"] == 160
+    assert any("OTP->DXB 2026-04-20/2026-04-25" in warning for warning in warnings)
+
+    adjusted_candidates, improved = optimizer._apply_return_discovery_to_estimated_candidates(
+        destination="USM",
+        estimated_candidates=[direct_candidate, split_candidate],
+        discovered_returns=discovered,
+        config=config,
+    )
+    assert improved == 2
+    assert adjusted_candidates[0]["estimated_total"] == 650
+    assert adjusted_candidates[0]["estimated_whole_trip_provider"] == "googleflights"
+    assert adjusted_candidates[1]["estimated_total"] == 700
+    assert adjusted_candidates[1]["estimated_pricing_strategy"] == "inner_return_bundle_exact"
+
+    progress = SearchProgressTracker("whole-trip-discovery")
+    progress.start_phase("candidates", total=1, detail="Scoring route candidates.")
+    with ThreadPoolExecutor(max_workers=2) as io_pool:
+        updated_estimates, metadata, run_warnings = asyncio.run(
+            optimizer._run_free_provider_whole_trip_discovery(
+                search_client=_ReturnDiscoveryClient(),  # type: ignore[arg-type]
+                candidate_tasks=[
+                    {
+                        "destination": "USM",
+                        "max_candidates": 6,
+                        "max_direct_candidates": 4,
+                        "objective": "cheapest",
+                    }
+                ],
+                estimated_by_destination={"USM": [direct_candidate, split_candidate]},
+                config=config,
+                io_pool=io_pool,
+                progress=progress,
+            )
+        )
+
+    assert run_warnings == []
+    assert metadata["USM"]["improved_candidates"] == 2
+    assert metadata["USM"]["selected_providers"]["googleflights"] == 2
+    assert updated_estimates["USM"][0]["estimated_total"] == 650
+    assert updated_estimates["USM"][1]["estimated_total"] == 700
+    snapshot = progress.snapshot()
+    assert (
+        snapshot["runtime_data"]["whole_trip_discovery"]["destinations"][0]["destination"] == "USM"
+    )
+    assert any(
+        "whole-trip discovery improved" in event["message"].lower() for event in snapshot["events"]
+    )

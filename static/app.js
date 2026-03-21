@@ -1305,6 +1305,7 @@ function storefrontFromUrl(url) {
     const parsed = new URL(String(url));
     const host = parsed.hostname.toLowerCase();
     const path = parsed.pathname.toLowerCase();
+    if (host.includes("azair.")) return "AZair";
     if (host.includes("aviasales.")) return "Aviasales";
     if (host.includes("kiwi.com")) return "Kiwi";
     if (host.includes("google.") && path.includes("/travel/flights")) return "Google Flights";
@@ -1319,6 +1320,7 @@ function storefrontFromUrl(url) {
 
 function defaultStorefrontForProvider(provider) {
   const id = String(provider || "").trim().toLowerCase();
+  if (id === "azair") return "AZair";
   if (id === "travelpayouts") return "Aviasales";
   if (id === "kiwi") return "Kiwi";
   if (id === "kayak") return "Kayak";
