@@ -166,6 +166,7 @@ What we implemented:
 Measured result:
 
 - On a live OTP bundle of 20 Ryanair-served round-trip destinations for April 18-25, 2026, `kiwi + ryanair` beat `kiwi` alone on 9 destinations for exact one-way and 9 destinations for exact round-trip pricing, with no regressions on the sampled bundle.
+- On a stricter same-window coverage benchmark across 38 OTP Ryanair-served round-trip destinations for April 18-25, 2026, `kiwi` and `kiwi + ryanair` both produced 304 unique route/date calendar cells, so the gain was price competitiveness rather than added route/date coverage.
 
 Conclusion:
 
@@ -201,6 +202,52 @@ Conclusion:
 
 - Worth another research iteration, but only as a partial lead for now rather than a working provider.
 
+### 11. AirAsia public search surfaces
+
+Public sources used:
+
+- https://www.airasia.com/en/gb
+- AirAsia production bundles referenced from the public homepage
+
+Observed result:
+
+- The public homepage was reachable in this environment.
+- Public JavaScript bundles exposed production search/listing configuration, including `https://www.airasia.com/flights/search/`, `https://flights.airasia.{domain}`, and other flight-search constants.
+- A direct public search URL was blocked by a Cloudflare challenge before fare data could be verified.
+
+Conclusion:
+
+- Strong research lead for Southeast Asia coverage, but not yet a working provider.
+- Worth another pass focused on official non-challenged endpoints or SSR data sources.
+
+### 12. VietJet public app
+
+Public source used:
+
+- https://www.vietjetair.com/
+
+Observed result:
+
+- The homepage loaded, but the public app also exposed AWS WAF and Google reCAPTCHA enterprise wiring.
+
+Conclusion:
+
+- Much colder lead than AirAsia for this environment.
+
+### 13. Scoot public site
+
+Public source used:
+
+- https://www.flyscoot.com/
+
+Observed result:
+
+- The site returned `403 Access Denied` on first probe.
+
+Conclusion:
+
+- Not selected for implementation in this pass.
+
 ## Recommendation
 
 Best results-for-money choice from this pass:
@@ -231,3 +278,4 @@ Why:
 
 - It required no account, no spend, and no anti-bot workarounds in this environment.
 - It produced cheaper exact-date fares than Kiwi on a meaningful OTP route bundle, including both one-way and round-trip checks.
+- It did not increase unique route/date coverage on the stricter calendar benchmark used in this pass, so it should be treated as a price-improvement provider rather than a coverage-expansion provider.

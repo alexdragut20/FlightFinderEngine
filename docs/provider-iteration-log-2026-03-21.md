@@ -134,6 +134,47 @@ Examples where Ryanair beat Kiwi:
   - one-way: `121 EUR` vs `200 EUR`
   - return: `194 EUR` vs `493 EUR`
 
+Coverage correction:
+
+- On a stricter calendar-cell benchmark across `38` OTP Ryanair-served round-trip destinations for `2026-04-18` through `2026-04-25`, Kiwi-only and Kiwi+Ryanair both returned `304` unique route/date price cells.
+- That means this iteration improved exact-price competitiveness on the sampled bundle, but it did not increase unique result coverage on that benchmark.
+
 ## Current conclusion
 
-The most productive free-provider iteration so far was Ryanair. AZair was a real working addition but did not move the benchmark enough. Wizz was blocked. easyJet remains a promising research lead but not yet a verified fare source. Travelpayouts remains the best future API expansion once a user-owned token is available.
+The most productive free-provider iteration so far was Ryanair for price competitiveness, not for unique result-count growth. AZair was a real working addition but did not move the benchmark enough. Wizz was blocked. easyJet remains a promising research lead but not yet a verified fare source. Travelpayouts remains the best future API expansion once a user-owned token is available. Future work should prioritize providers that increase unique route/date coverage on the same benchmark, not just providers that beat Kiwi on price.
+
+## Iteration 6 - Coverage benchmark correction and Southeast Asia leads
+
+Hypothesis:
+
+- If we benchmark the same route bundle by unique route/date cells instead of only cheapest winners, we can separate real coverage growth from normal provider price movement.
+
+What happened:
+
+- Added a repeatable benchmark script in `scripts/benchmark_provider_coverage.py`.
+- The script measures unique calendar route/date cells, unique exact one-way coverage, unique exact return coverage, per-provider quote counts, and secondary price deltas against a baseline provider set.
+- Re-ran the OTP Ryanair-served bundle using the stricter metric.
+
+Outcome:
+
+- Success on methodology.
+- The corrected benchmark showed that `kiwi + ryanair` and `kiwi + azair + ryanair` still produced `304` unique calendar route/date cells across the sampled 38-route bundle, exactly matching Kiwi-only coverage.
+- This confirmed that the measured Ryanair gain was real on price, but not on unique route/date expansion.
+
+Additional research signals:
+
+- AirAsia:
+  - homepage was reachable
+  - public bundles exposed production flight-search config, listing URLs, and `flights.airasia.{domain}` backend templates
+  - direct public search URL returned a Cloudflare challenge in this environment
+- VietJet:
+  - homepage was reachable
+  - public app included AWS WAF and reCAPTCHA enterprise wiring
+- Scoot:
+  - public site returned `403 Access Denied`
+- Cebu Pacific:
+  - homepage timed out during a first probe
+
+Why this matters:
+
+- The next provider work should target sources like AirAsia only if they can increase unique route/date coverage on the benchmark, not just undercut Kiwi on price for routes Kiwi already covers.
