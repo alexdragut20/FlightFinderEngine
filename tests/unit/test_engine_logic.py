@@ -2212,6 +2212,112 @@ def test_result_time_windows_filter_whole_outbound_and_return_journeys() -> None
     assert not optimizer._result_matches_time_windows(result, blocked_config)
 
 
+def test_time_window_helpers_handle_invalid_and_roundtrip_segments() -> None:
+    optimizer = SplitTripOptimizer(KiwiClient(), AirportCoordinates())
+    no_limit_config = optimizer.parse_search_config(
+        {
+            "origins": ["OTP"],
+            "destinations": ["MRS"],
+            "period_start": "2026-06-25",
+            "period_end": "2026-07-02",
+        }
+    )
+
+    assert optimizer._time_minutes("") is None
+    assert optimizer._time_minutes("bad") is None
+    assert optimizer._time_minutes("25:00") is None
+    assert optimizer._time_minutes("2026-06-25T21:55:00Z") == 21 * 60 + 55
+    assert optimizer._time_in_window("bad", "21:00", "22:00") is False
+    assert optimizer._time_in_window("09:00", "09:00", "09:00") is True
+    assert optimizer._result_matches_time_windows(
+        {"destination_code": "MRS", "legs": []}, no_limit_config
+    )
+
+    roundtrip_result = {
+        "destination_code": "MRS",
+        "legs": [
+            {
+                "ticket_type": "roundtrip",
+                "source": "OTP",
+                "destination": "MRS",
+                "outbound_segments": [
+                    {
+                        "from": "OTP",
+                        "to": "MRS",
+                        "depart_local": "2026-06-25T21:55:00",
+                        "arrive_local": "2026-06-25T23:50:00",
+                    }
+                ],
+                "inbound_segments": [
+                    {
+                        "from": "MRS",
+                        "to": "OTP",
+                        "depart_local": "2026-07-02T17:55:00",
+                        "arrive_local": "2026-07-02T21:30:00",
+                    }
+                ],
+            }
+        ],
+    }
+    config = optimizer.parse_search_config(
+        {
+            "origins": ["OTP"],
+            "destinations": ["MRS"],
+            "period_start": "2026-06-25",
+            "period_end": "2026-07-02",
+            "outbound_departure_time_start": "21:00",
+            "outbound_departure_time_end": "22:30",
+            "return_arrival_time_start": "21:00",
+            "return_arrival_time_end": "22:00",
+        }
+    )
+    assert (
+        optimizer._direction_segments_for_time_filter(roundtrip_result, "outbound")[0]["from"]
+        == "OTP"
+    )
+    assert (
+        optimizer._direction_segments_for_time_filter(roundtrip_result, "return")[0]["from"]
+        == "MRS"
+    )
+    assert optimizer._result_matches_time_windows(roundtrip_result, config)
+
+    fallback_leg = {
+        "source": "OTP",
+        "destination": "MRS",
+        "departure_local": "2026-06-25T08:10:00",
+        "arrival_local": "2026-06-25T10:20:00",
+    }
+    assert optimizer._leg_segments_for_time_filter(fallback_leg, direction="outbound") == [
+        {
+            "from": "OTP",
+            "to": "MRS",
+            "depart_local": "2026-06-25T08:10:00",
+            "arrive_local": "2026-06-25T10:20:00",
+        }
+    ]
+    assert (
+        optimizer._direction_segments_for_time_filter(
+            {"destination_code": "", "legs": []}, "outbound"
+        )
+        == []
+    )
+
+    filtered_config = optimizer.parse_search_config(
+        {
+            "origins": ["OTP"],
+            "destinations": ["MRS"],
+            "period_start": "2026-06-25",
+            "period_end": "2026-07-02",
+            "outbound_departure_time_start": "21:00",
+            "outbound_departure_time_end": "22:00",
+        }
+    )
+    assert not optimizer._result_matches_time_windows(
+        {"destination_code": "MRS", "legs": [{"source": "OTP", "destination": "MRS"}]},
+        filtered_config,
+    )
+
+
 def test_merge_baggage_compared_fares_preserves_selected_fare_mode() -> None:
     selected = SplitTripOptimizer._merge_baggage_compared_fares(
         {
