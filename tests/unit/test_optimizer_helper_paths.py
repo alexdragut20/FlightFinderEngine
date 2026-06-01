@@ -3331,14 +3331,34 @@ def test_optimizer_free_provider_discovery_helpers_cover_sampling_seed_build_pro
                 io_pool=io_pool,
             )
         )
+        calendar_only_discovered, calendar_only_warnings = asyncio.run(
+            optimizer._probe_free_provider_discovery(
+                search_client=_DiscoveryClient(),  # type: ignore[arg-type]
+                provider_ids=("azair", "kayak", "momondo"),
+                route_dates={
+                    ("OTP", "IST"): ("2026-04-20",),
+                    ("OTP", "DXB"): ("2026-04-20",),
+                },
+                config=config,
+                io_pool=io_pool,
+                io_cap=2,
+                include_exact_providers=False,
+            )
+        )
     assert discovered == {("OTP", "IST"): {"2026-04-20": 120, "2026-04-21": 140}}
     assert any("OTP->DXB 2026-04-20" in warning for warning in warnings)
     assert empty_discovered == {}
     assert empty_warnings == []
+    assert calendar_only_discovered == {("OTP", "IST"): {"2026-04-20": 130, "2026-04-21": 140}}
+    assert calendar_only_warnings == []
 
     progress = SearchProgressTracker("free-discovery")
+    probe_provider_ids = []
+    probe_include_exact = []
 
     async def _fake_probe(**kwargs):  # type: ignore[no-untyped-def]
+        probe_provider_ids.append(tuple(kwargs.get("provider_ids") or ()))
+        probe_include_exact.append(bool(kwargs.get("include_exact_providers")))
         if kwargs["route_dates"]:
             return ({("OTP", "USM"): {"2026-04-20": 111}}, ["probe warning"])
         return ({}, [])
@@ -3374,6 +3394,8 @@ def test_optimizer_free_provider_discovery_helpers_cover_sampling_seed_build_pro
     assert metadata["USM"]["discovered_routes"] == 1
     assert metadata["USM"]["discovered_price_points"] == 1
     assert run_warnings == ["probe warning"]
+    assert probe_provider_ids == [("azair",)]
+    assert probe_include_exact == [False]
     messages = [event["message"] for event in progress.snapshot()["events"]]
     assert any("Free-provider discovery" in message for message in messages)
     assert any("USM: probing" in message for message in messages)
@@ -3393,7 +3415,15 @@ def test_optimizer_coverage_audit_helpers_cover_empty_and_success_paths(monkeypa
     )
 
     class _AuditClient:
-        active_provider_ids = ["kiwi", "kayak", "momondo"]
+        active_provider_ids = ["kiwi", "azair", "kayak", "momondo"]
+        _providers = {
+            "azair": type("_CalendarProvider", (), {"supports_calendar": True})(),
+            "kayak": type("_ExactProvider", (), {"supports_calendar": False})(),
+            "momondo": type("_ExactProvider", (), {"supports_calendar": False})(),
+        }
+
+        def provider_for_id(self, provider_id: str):  # type: ignore[no-untyped-def]
+            return self._providers.get(str(provider_id))
 
     with ThreadPoolExecutor(max_workers=2) as io_pool:
         empty_audit = asyncio.run(

@@ -96,6 +96,7 @@ from ..utils.constants import (
     FASTEST_OBJECTIVE_PRICE_MULTIPLIER,
     FREE_PROVIDER_DISCOVERY_IO_CAP,
     FREE_PROVIDER_DISCOVERY_MAX_DATES_PER_ROUTE,
+    FREE_PROVIDER_DISCOVERY_MAX_DESTINATIONS,
     FREE_PROVIDER_DISCOVERY_MAX_ROUTES_PER_DESTINATION,
     INNER_RETURN_BUNDLE_DISCOUNT_FACTOR,
     MAX_EXHAUSTIVE_DIRECT_CANDIDATES_PER_DESTINATION,
@@ -4990,6 +4991,41 @@ class SplitTripOptimizer:
             out[route_key] = tuple(sorted(expanded_dates)[:COVERAGE_AUDIT_MAX_DATES_PER_ROUTE])
         return out
 
+    @staticmethod
+    def _free_provider_calendar_ids(
+        search_client: MultiProviderClient,
+        provider_ids: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        """Return free discovery providers that can answer one route with one calendar call."""
+        provider_for_id = getattr(search_client, "provider_for_id", None)
+        if not callable(provider_for_id):
+            return ()
+        out: list[str] = []
+        for provider_id in provider_ids:
+            provider = provider_for_id(provider_id)
+            if bool(getattr(provider, "supports_calendar", False)):
+                out.append(provider_id)
+        return tuple(out)
+
+    @staticmethod
+    def _initial_free_discovery_task_score(task: dict[str, Any]) -> tuple[int, str]:
+        """Return a stable priority key for quick pre-scoring provider discovery."""
+        best_price = PRICE_SENTINEL
+        for mapping_name in (
+            "origin_to_destination",
+            "destination_to_origin",
+            "origin_to_hub",
+            "hub_to_origin",
+            "hub_to_destination",
+            "destination_to_hub",
+            "hub_to_hub",
+        ):
+            for series in dict(task.get(mapping_name) or {}).values():
+                min_price = _min_series_price(series)
+                if min_price is not None:
+                    best_price = min(best_price, int(min_price))
+        return best_price, str(task.get("destination") or "")
+
     async def _probe_free_provider_discovery(
         self,
         *,
@@ -4999,6 +5035,7 @@ class SplitTripOptimizer:
         config: SearchConfig,
         io_pool: ThreadPoolExecutor,
         io_cap: int | None = None,
+        include_exact_providers: bool = True,
     ) -> tuple[dict[tuple[str, str], dict[str, int]], list[str]]:
         """Probe free providers for sparse route/date discovery prices.
 
@@ -5009,6 +5046,7 @@ class SplitTripOptimizer:
             config: Search configuration for the operation.
             io_pool: Thread pool used for I/O-bound provider validation.
             io_cap: Maximum concurrency cap for the sparse discovery stage.
+            include_exact_providers: Whether to call non-calendar providers per date.
 
         Returns:
             tuple[dict[tuple[str, str], dict[str, int]], list[str]]: Sparse discovered prices and warnings.
@@ -5045,8 +5083,14 @@ class SplitTripOptimizer:
                 )
             )
         )
-        exact_provider_ids = tuple(
-            provider_id for provider_id in provider_ids if provider_id not in calendar_provider_ids
+        exact_provider_ids = (
+            tuple(
+                provider_id
+                for provider_id in provider_ids
+                if provider_id not in calendar_provider_ids
+            )
+            if include_exact_providers
+            else ()
         )
 
         async def probe_calendar_route(
@@ -5471,37 +5515,84 @@ class SplitTripOptimizer:
             for provider_id in search_client.active_provider_ids
             if provider_id in _FREE_PROVIDER_IDS and provider_id != "kiwi"
         )
-        if not free_discovery_provider_ids or not candidate_tasks:
+        quick_discovery_provider_ids = self._free_provider_calendar_ids(
+            search_client,
+            free_discovery_provider_ids,
+        )
+        if not quick_discovery_provider_ids or not candidate_tasks:
+            if progress is not None and free_discovery_provider_ids and candidate_tasks:
+                progress.log_message(
+                    "Free-provider discovery skipped: no fast calendar providers are active.",
+                    phase="setup",
+                )
             return candidate_tasks, {}, []
+
+        seed_entries: list[
+            tuple[int, tuple[int, str], dict[str, Any], dict[tuple[str, str], tuple[str, ...]]]
+        ] = []
+        unseeded_indices: set[int] = set()
+        for index, task in enumerate(candidate_tasks):
+            route_dates = self._build_initial_free_provider_discovery_seed_map(task=task)
+            if route_dates:
+                seed_entries.append(
+                    (
+                        index,
+                        self._initial_free_discovery_task_score(task),
+                        task,
+                        route_dates,
+                    )
+                )
+            else:
+                unseeded_indices.add(index)
+        if not seed_entries:
+            return candidate_tasks, {}, []
+
+        selected_entries = sorted(seed_entries, key=lambda item: (item[1], item[0]))[
+            :FREE_PROVIDER_DISCOVERY_MAX_DESTINATIONS
+        ]
+        selected_indices = {index for index, *_ in selected_entries}
+        seed_map_by_index = {
+            index: route_dates for index, _score, _task, route_dates in seed_entries
+        }
 
         if progress is not None:
             progress.log_message(
-                "Free-provider discovery: probing non-Kiwi providers for extra candidate dates.",
+                "Free-provider discovery: probing fast calendar providers "
+                f"{'/'.join(quick_discovery_provider_ids)} for extra candidate dates.",
                 phase="setup",
             )
+            skipped_seeded = max(0, len(seed_entries) - len(selected_entries))
+            if skipped_seeded:
+                progress.log_message(
+                    "Free-provider discovery capped to "
+                    f"{len(selected_entries)}/{len(seed_entries)} destination(s); "
+                    f"skipping {skipped_seeded} lower-priority destination(s) before scoring.",
+                    phase="setup",
+                )
 
         updated_tasks: list[dict[str, Any]] = []
         discovery_metadata: dict[str, dict[str, Any]] = {}
         warnings: list[str] = []
-        for task in candidate_tasks:
+        for index, task in enumerate(candidate_tasks):
             destination = str(task.get("destination") or "")
-            route_dates = self._build_initial_free_provider_discovery_seed_map(task=task)
-            if not route_dates:
+            route_dates = seed_map_by_index.get(index) or {}
+            if index in unseeded_indices or not route_dates or index not in selected_indices:
                 updated_tasks.append(task)
                 continue
             if progress is not None:
                 progress.log_message(
                     f"{destination}: probing {len(route_dates)} route(s) on "
-                    f"{'/'.join(free_discovery_provider_ids)} before candidate scoring.",
+                    f"{'/'.join(quick_discovery_provider_ids)} before candidate scoring.",
                     phase="setup",
                 )
             discovered_prices, discovery_warnings = await self._probe_free_provider_discovery(
                 search_client=search_client,
-                provider_ids=free_discovery_provider_ids,
+                provider_ids=quick_discovery_provider_ids,
                 route_dates=route_dates,
                 config=config,
                 io_pool=io_pool,
                 io_cap=FREE_PROVIDER_DISCOVERY_IO_CAP,
+                include_exact_providers=False,
             )
             warnings.extend(discovery_warnings[:12])
             updated_tasks.append(
@@ -5512,12 +5603,13 @@ class SplitTripOptimizer:
             )
             discovery_metadata[destination] = {
                 "destination": destination,
-                "provider_ids": list(free_discovery_provider_ids),
+                "provider_ids": list(quick_discovery_provider_ids),
                 "seed_routes": len(route_dates),
                 "discovered_routes": len(discovered_prices),
                 "discovered_price_points": sum(
                     len(prices) for prices in discovered_prices.values()
                 ),
+                "skipped_destination_count": max(0, len(seed_entries) - len(selected_entries)),
             }
         return updated_tasks, discovery_metadata, warnings
 
@@ -5631,6 +5723,10 @@ class SplitTripOptimizer:
             for provider_id in search_client.active_provider_ids
             if provider_id in _FREE_PROVIDER_IDS and provider_id != "kiwi"
         )
+        quick_discovery_provider_ids = self._free_provider_calendar_ids(
+            search_client,
+            free_discovery_provider_ids,
+        )
         if progress is not None:
             progress.log_message(
                 f"Coverage audit: widening search for {len(audit_destinations)} destination(s).",
@@ -5653,19 +5749,20 @@ class SplitTripOptimizer:
             )
             discovered_prices: dict[tuple[str, str], dict[str, int]] = {}
             discovery_warnings: list[str] = []
-            if free_discovery_provider_ids and route_dates:
+            if quick_discovery_provider_ids and route_dates:
                 if progress is not None:
                     progress.log_message(
                         f"{destination}: probing {len(route_dates)} route(s) on "
-                        f"{'/'.join(free_discovery_provider_ids)} for extra date discovery.",
+                        f"{'/'.join(quick_discovery_provider_ids)} for extra date discovery.",
                         phase="candidates",
                     )
                 discovered_prices, discovery_warnings = await self._probe_free_provider_discovery(
                     search_client=search_client,
-                    provider_ids=free_discovery_provider_ids,
+                    provider_ids=quick_discovery_provider_ids,
                     route_dates=route_dates,
                     config=config,
                     io_pool=io_pool,
+                    include_exact_providers=False,
                 )
                 warnings.extend(discovery_warnings[:12])
 
@@ -5697,7 +5794,7 @@ class SplitTripOptimizer:
             discovery_price_points = sum(len(prices) for prices in discovered_prices.values())
             audit_metadata[destination] = {
                 "destination": destination,
-                "provider_ids": list(free_discovery_provider_ids),
+                "provider_ids": list(quick_discovery_provider_ids),
                 "seed_routes": len(route_dates),
                 "discovered_routes": discovery_route_count,
                 "discovered_price_points": discovery_price_points,
@@ -5718,7 +5815,7 @@ class SplitTripOptimizer:
                 "coverage_audit",
                 {
                     "destinations": list(audit_metadata.values()),
-                    "provider_ids": list(free_discovery_provider_ids),
+                    "provider_ids": list(quick_discovery_provider_ids),
                 },
             )
 
