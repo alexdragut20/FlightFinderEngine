@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import math
 import threading
 from typing import Any
 from urllib.parse import urlencode
@@ -9,7 +10,7 @@ import requests
 
 from ..config import RYANAIR_API_LANGUAGE, RYANAIR_BASE_URL, RYANAIR_SITE_PATH
 from ..exceptions import ProviderNoResultError
-from ..utils import date_only, parse_money_amount_int
+from ..utils import convert_currency_amount, date_only, parse_money_amount_int
 from ..utils.logging import capture_provider_response as _capture_provider_response
 from ._cache import per_instance_lru_cache
 
@@ -47,7 +48,7 @@ class RyanairFareFinderClient:
     @staticmethod
     def configuration_hint() -> str:
         """Return a short provider note for the UI."""
-        return "Official Ryanair fare-finder API for direct one-way and round-trip fares."
+        return "Official Ryanair fare-finder API for direct base fares; skipped when paid bags are requested."
 
     def _session(self) -> requests.Session:
         """Return a cached requests session."""
@@ -111,9 +112,104 @@ class RyanairFareFinderClient:
         return int((arrival_dt - departure_dt).total_seconds())
 
     @staticmethod
-    def _price_int(item: dict[str, Any]) -> int | None:
-        """Return the normalized price for a Ryanair fare row."""
-        return parse_money_amount_int((item.get("price") or {}).get("value"))
+    def _price_amount(item: dict[str, Any]) -> float | None:
+        """Return the source-currency per-adult base price for a Ryanair fare row."""
+        if bool(item.get("soldOut")) or bool(item.get("unavailable")):
+            return None
+        price = item.get("price") or {}
+        raw_value = price.get("value") if isinstance(price, dict) else None
+        try:
+            amount = float(raw_value)
+        except (TypeError, ValueError):
+            parsed = parse_money_amount_int(raw_value)
+            return float(parsed) if parsed is not None else None
+        if not math.isfinite(amount) or amount <= 0:
+            return None
+        return amount
+
+    @staticmethod
+    def _price_currency(item: dict[str, Any], fallback_currency: str) -> str:
+        """Return the provider source currency for a Ryanair fare row."""
+        price = item.get("price") or {}
+        source_currency = (
+            str((price.get("currencyCode") if isinstance(price, dict) else "") or "")
+            .strip()
+            .upper()
+        )
+        return source_currency or (str(fallback_currency or "EUR").strip().upper() or "EUR")
+
+    @classmethod
+    def _normalized_price(
+        cls,
+        item: dict[str, Any],
+        *,
+        target_currency: str,
+        adults: int,
+    ) -> tuple[int, float, str] | None:
+        """Return total target price, source total, and source currency for a fare row."""
+        per_adult_source_price = cls._price_amount(item)
+        if per_adult_source_price is None:
+            return None
+        source_currency = cls._price_currency(item, target_currency)
+        source_total = per_adult_source_price * max(1, int(adults or 1))
+        normalized_target = (
+            str(target_currency or source_currency).strip().upper() or source_currency
+        )
+        converted = convert_currency_amount(source_total, source_currency, normalized_target)
+        if converted is None:
+            return None
+        return converted, source_total, source_currency
+
+    @staticmethod
+    def _format_price(
+        price: int,
+        *,
+        currency: str,
+        source_total: float | None = None,
+        source_currency: str | None = None,
+    ) -> str:
+        """Return a display label that keeps converted Ryanair prices auditable."""
+        target_currency = str(currency or "").strip().upper()
+        formatted = f"{price} {target_currency}"
+        if (
+            source_total is not None
+            and source_currency
+            and str(source_currency).strip().upper() != target_currency
+        ):
+            formatted += f" (source {source_total:.2f} {str(source_currency).strip().upper()})"
+        return formatted
+
+    @staticmethod
+    def _direct_segments(
+        item: dict[str, Any],
+        *,
+        source: str,
+        destination: str,
+    ) -> list[dict[str, Any]]:
+        """Return a one-segment Ryanair leg when the fare row exposes local times."""
+        departure = str(item.get("departureDate") or "").strip()
+        arrival = str(item.get("arrivalDate") or "").strip()
+        if not departure or not arrival:
+            return []
+        return [
+            {
+                "from": str(source or "").strip().upper(),
+                "to": str(destination or "").strip().upper(),
+                "depart_local": departure,
+                "arrive_local": arrival,
+                "carrier": "FR",
+                "carrier_name": "Ryanair",
+            }
+        ]
+
+    @staticmethod
+    def _reject_baggage_profile(hand_bags: int, hold_bags: int) -> None:
+        """Reject Ryanair fare-finder fares when paid bag add-ons are requested."""
+        if int(hand_bags or 0) > 0 or int(hold_bags or 0) > 0:
+            raise ProviderNoResultError(
+                "Ryanair fare-finder exposes base fares only; skipping because cabin/hold bag "
+                "add-ons were requested."
+            )
 
     def _build_booking_url(
         self,
@@ -169,15 +265,26 @@ class RyanairFareFinderClient:
             raise RuntimeError(f"Ryanair request failed: {error}")
         return payload
 
+    @staticmethod
+    def _looks_like_missing_market_error(exc: Exception) -> bool:
+        """Return whether an exception looks like an unsupported market/airport."""
+        message = str(exc or "").upper()
+        return "HTTP 400" in message or "HTTP 404" in message
+
     @per_instance_lru_cache(maxsize=512)
     def _route_destinations(self, source: str) -> tuple[str, ...]:
         """Return the active Ryanair destinations served from the source airport."""
         normalized_source = str(source or "").strip().upper()
         if not normalized_source:
             return ()
-        payload = self._request_json(
-            f"/api/views/locate/searchWidget/routes/{self._api_language}/airport/{normalized_source}"
-        )
+        try:
+            payload = self._request_json(
+                f"/api/views/locate/searchWidget/routes/{self._api_language}/airport/{normalized_source}"
+            )
+        except RuntimeError as exc:
+            if self._looks_like_missing_market_error(exc):
+                return ()
+            raise
         if not isinstance(payload, list):
             return ()
         destinations: list[str] = []
@@ -213,13 +320,18 @@ class RyanairFareFinderClient:
         normalized_destination = str(destination or "").strip().upper()
         if not self._market_supported(normalized_source, normalized_destination):
             return ()
-        payload = self._request_json(
-            f"/api/farfnd/v4/oneWayFares/{normalized_source}/{normalized_destination}/cheapestPerDay",
-            params={
-                "outboundMonthOfDate": month_start_iso,
-                "currency": str(currency or "EUR").strip().upper() or "EUR",
-            },
-        )
+        try:
+            payload = self._request_json(
+                f"/api/farfnd/v4/oneWayFares/{normalized_source}/{normalized_destination}/cheapestPerDay",
+                params={
+                    "outboundMonthOfDate": month_start_iso,
+                    "currency": str(currency or "EUR").strip().upper() or "EUR",
+                },
+            )
+        except RuntimeError as exc:
+            if self._looks_like_missing_market_error(exc):
+                return ()
+            raise
         fares = (
             ((payload.get("outbound") or {}).get("fares") or [])
             if isinstance(payload, dict)
@@ -243,14 +355,19 @@ class RyanairFareFinderClient:
             return (), ()
         if not self._market_supported(normalized_destination, normalized_source):
             return (), ()
-        payload = self._request_json(
-            f"/api/farfnd/v4/roundTripFares/{normalized_source}/{normalized_destination}/cheapestPerDay",
-            params={
-                "outboundMonthOfDate": outbound_month_start_iso,
-                "inboundMonthOfDate": inbound_month_start_iso,
-                "currency": str(currency or "EUR").strip().upper() or "EUR",
-            },
-        )
+        try:
+            payload = self._request_json(
+                f"/api/farfnd/v4/roundTripFares/{normalized_source}/{normalized_destination}/cheapestPerDay",
+                params={
+                    "outboundMonthOfDate": outbound_month_start_iso,
+                    "inboundMonthOfDate": inbound_month_start_iso,
+                    "currency": str(currency or "EUR").strip().upper() or "EUR",
+                },
+            )
+        except RuntimeError as exc:
+            if self._looks_like_missing_market_error(exc):
+                return (), ()
+            raise
         if not isinstance(payload, dict):
             return (), ()
         outbound = tuple(
@@ -278,7 +395,9 @@ class RyanairFareFinderClient:
         hold_bags: int,
     ) -> dict[str, int]:
         """Return the cheapest Ryanair direct fare per departure day in the range."""
-        del max_stops_per_leg, adults, hand_bags, hold_bags
+        del max_stops_per_leg
+        if int(hand_bags or 0) > 0 or int(hold_bags or 0) > 0:
+            return {}
         normalized_start = date_only(date_start_iso)
         normalized_end = date_only(date_end_iso)
         out: dict[str, int] = {}
@@ -291,9 +410,14 @@ class RyanairFareFinderClient:
                     or departure_day > normalized_end
                 ):
                     continue
-                price = self._price_int(item)
-                if price is None:
+                normalized_price = self._normalized_price(
+                    item,
+                    target_currency=currency,
+                    adults=adults,
+                )
+                if normalized_price is None:
                     continue
+                price = normalized_price[0]
                 previous = out.get(departure_day)
                 if previous is None or price < previous:
                     out[departure_day] = price
@@ -312,7 +436,8 @@ class RyanairFareFinderClient:
         max_connection_layover_seconds: int | None = None,
     ) -> dict[str, Any] | None:
         """Return the best exact Ryanair one-way fare for the requested day."""
-        del max_stops_per_leg, hand_bags, hold_bags, max_connection_layover_seconds
+        del max_stops_per_leg, max_connection_layover_seconds
+        self._reject_baggage_profile(hand_bags, hold_bags)
         if not self._market_supported(source, destination):
             raise ProviderNoResultError(f"Ryanair does not serve {source}->{destination}.")
         for item in self._oneway_month(
@@ -320,17 +445,30 @@ class RyanairFareFinderClient:
         ):
             if date_only(item.get("day")) != date_only(departure_iso):
                 continue
-            price = self._price_int(item)
-            if price is None:
+            normalized_price = self._normalized_price(
+                item,
+                target_currency=currency,
+                adults=adults,
+            )
+            if normalized_price is None:
                 continue
+            price, source_total, source_currency = normalized_price
             duration_seconds = self._parse_duration_seconds(
                 str(item.get("departureDate") or "").strip() or None,
                 str(item.get("arrivalDate") or "").strip() or None,
             )
+            target_currency = str(currency or source_currency).strip().upper() or source_currency
             return {
                 "price": price,
-                "formatted_price": f"{price} {str(currency or 'EUR').strip().upper() or 'EUR'}",
-                "currency": str(currency or "EUR").strip().upper() or "EUR",
+                "formatted_price": self._format_price(
+                    price,
+                    currency=target_currency,
+                    source_total=source_total,
+                    source_currency=source_currency,
+                ),
+                "currency": target_currency,
+                "source_price": round(source_total, 2),
+                "source_currency": source_currency,
                 "duration_seconds": duration_seconds,
                 "stops": 0,
                 "transfer_events": 0,
@@ -341,8 +479,11 @@ class RyanairFareFinderClient:
                     inbound_iso=None,
                     adults=adults,
                 ),
-                "segments": [],
+                "segments": self._direct_segments(item, source=source, destination=destination),
                 "provider": self.provider_id,
+                "fare_mode": "base_no_bags",
+                "price_mode": "base_per_adult_scaled_converted",
+                "baggage_included": False,
             }
         raise ProviderNoResultError(
             f"Ryanair returned no exact one-way fare for {source}->{destination} on {departure_iso}."
@@ -362,7 +503,8 @@ class RyanairFareFinderClient:
         max_connection_layover_seconds: int | None = None,
     ) -> dict[str, Any] | None:
         """Return the best exact Ryanair round-trip fare for the requested day pair."""
-        del max_stops_per_leg, hand_bags, hold_bags, max_connection_layover_seconds
+        del max_stops_per_leg, max_connection_layover_seconds
+        self._reject_baggage_profile(hand_bags, hold_bags)
         if not self._market_supported(source, destination):
             raise ProviderNoResultError(f"Ryanair does not serve {source}->{destination}.")
         if not self._market_supported(destination, source):
@@ -391,13 +533,23 @@ class RyanairFareFinderClient:
                 "Ryanair returned no exact round-trip fare "
                 f"for {source}->{destination} on {outbound_iso}/{inbound_iso}."
             )
-        outbound_price = self._price_int(outbound_item)
-        inbound_price = self._price_int(inbound_item)
-        if outbound_price is None or inbound_price is None:
+        outbound_normalized = self._normalized_price(
+            outbound_item,
+            target_currency=currency,
+            adults=adults,
+        )
+        inbound_normalized = self._normalized_price(
+            inbound_item,
+            target_currency=currency,
+            adults=adults,
+        )
+        if outbound_normalized is None or inbound_normalized is None:
             raise ProviderNoResultError(
                 "Ryanair returned no exact round-trip fare "
                 f"for {source}->{destination} on {outbound_iso}/{inbound_iso}."
             )
+        outbound_price, outbound_source_total, outbound_source_currency = outbound_normalized
+        inbound_price, inbound_source_total, inbound_source_currency = inbound_normalized
         outbound_duration = self._parse_duration_seconds(
             str(outbound_item.get("departureDate") or "").strip() or None,
             str(outbound_item.get("arrivalDate") or "").strip() or None,
@@ -410,10 +562,24 @@ class RyanairFareFinderClient:
         total_duration = None
         if outbound_duration is not None and inbound_duration is not None:
             total_duration = outbound_duration + inbound_duration
+        target_currency = str(currency or outbound_source_currency).strip().upper() or "EUR"
+        source_currency = (
+            outbound_source_currency
+            if outbound_source_currency == inbound_source_currency
+            else f"{outbound_source_currency}/{inbound_source_currency}"
+        )
+        source_total = outbound_source_total + inbound_source_total
         return {
             "price": total_price,
-            "formatted_price": f"{total_price} {str(currency or 'EUR').strip().upper() or 'EUR'}",
-            "currency": str(currency or "EUR").strip().upper() or "EUR",
+            "formatted_price": self._format_price(
+                total_price,
+                currency=target_currency,
+                source_total=source_total,
+                source_currency=source_currency,
+            ),
+            "currency": target_currency,
+            "source_price": round(source_total, 2),
+            "source_currency": source_currency,
             "duration_seconds": total_duration,
             "outbound_duration_seconds": outbound_duration,
             "inbound_duration_seconds": inbound_duration,
@@ -427,7 +593,18 @@ class RyanairFareFinderClient:
                 inbound_iso=inbound_iso,
                 adults=adults,
             ),
-            "outbound_segments": [],
-            "inbound_segments": [],
+            "outbound_segments": self._direct_segments(
+                outbound_item,
+                source=source,
+                destination=destination,
+            ),
+            "inbound_segments": self._direct_segments(
+                inbound_item,
+                source=destination,
+                destination=source,
+            ),
             "provider": self.provider_id,
+            "fare_mode": "base_no_bags",
+            "price_mode": "base_per_adult_scaled_converted",
+            "baggage_included": False,
         }

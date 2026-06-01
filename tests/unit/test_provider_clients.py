@@ -933,6 +933,8 @@ def test_ryanair_client_parses_calendar_and_exact_fares() -> None:
     assert oneway is not None
     assert oneway["price"] == 16
     assert oneway["stops"] == 0
+    assert oneway["fare_mode"] == "base_no_bags"
+    assert oneway["segments"][0]["depart_local"] == "2026-04-18T19:50:00"
     assert "originIata=OTP" in oneway["booking_url"]
     assert "destinationIata=BGY" in oneway["booking_url"]
 
@@ -951,7 +953,135 @@ def test_ryanair_client_parses_calendar_and_exact_fares() -> None:
     assert roundtrip["price"] == 66
     assert roundtrip["outbound_stops"] == 0
     assert roundtrip["inbound_stops"] == 0
+    assert roundtrip["fare_mode"] == "base_no_bags"
+    assert roundtrip["outbound_segments"][0]["depart_local"] == "2026-04-18T19:50:00"
+    assert roundtrip["inbound_segments"][0]["depart_local"] == "2026-04-25T16:15:00"
     assert "dateIn=2026-04-25" in roundtrip["booking_url"]
+
+
+def test_ryanair_client_converts_source_currency_and_scales_adults(monkeypatch) -> None:
+    route_rows = [{"arrivalAirport": {"code": "MRS"}}]
+    route_rows_reverse = [{"arrivalAirport": {"code": "OTP"}}]
+    roundtrip_month = {
+        "outbound": {
+            "fares": [
+                {
+                    "day": "2026-06-25",
+                    "departureDate": "2026-06-25T21:55:00",
+                    "arrivalDate": "2026-06-25T23:50:00",
+                    "price": {"value": 65.99, "currencyCode": "EUR"},
+                }
+            ]
+        },
+        "inbound": {
+            "fares": [
+                {
+                    "day": "2026-07-02",
+                    "departureDate": "2026-07-02T17:55:00",
+                    "arrivalDate": "2026-07-02T21:30:00",
+                    "price": {"value": 108.16, "currencyCode": "EUR"},
+                }
+            ]
+        },
+    }
+    session = _FakeSession(
+        get_responses=[
+            _FakeResponse(route_rows),
+            _FakeResponse(route_rows_reverse),
+            _FakeResponse(roundtrip_month),
+        ]
+    )
+    monkeypatch.setattr(
+        "src.providers.ryanair.convert_currency_amount",
+        lambda amount, source, target: (
+            int(round(float(amount) * 5))
+            if (source, target) == ("EUR", "RON")
+            else int(round(float(amount)))
+        ),
+    )
+    client = RyanairFareFinderClient(base_url="https://www.ryanair.com")
+    client._session = lambda: session  # type: ignore[assignment]
+
+    roundtrip = client.get_best_return(
+        "OTP",
+        "MRS",
+        "2026-06-25",
+        "2026-07-02",
+        "RON",
+        0,
+        2,
+        0,
+        0,
+    )
+
+    assert roundtrip is not None
+    assert roundtrip["price"] == 1742
+    assert roundtrip["source_price"] == 348.3
+    assert roundtrip["source_currency"] == "EUR"
+    assert roundtrip["currency"] == "RON"
+    assert roundtrip["price_mode"] == "base_per_adult_scaled_converted"
+    assert "source 348.30 EUR" in roundtrip["formatted_price"]
+
+
+def test_ryanair_client_skips_base_fares_when_baggage_requested() -> None:
+    client = RyanairFareFinderClient(base_url="https://www.ryanair.com")
+
+    assert (
+        client.get_calendar_prices(
+            "OTP",
+            "MRS",
+            "2026-06-25",
+            "2026-07-02",
+            "RON",
+            0,
+            2,
+            1,
+            0,
+        )
+        == {}
+    )
+    with pytest.raises(ProviderNoResultError, match="base fares only"):
+        client.get_best_return("OTP", "MRS", "2026-06-25", "2026-07-02", "RON", 0, 2, 1, 0)
+
+
+def test_ryanair_client_treats_missing_market_responses_as_no_service() -> None:
+    session = _FakeSession(
+        get_responses=[
+            _FakeResponse({}, status_code=404),
+            _FakeResponse([{"arrivalAirport": {"code": "BGY"}}]),
+            _FakeResponse({}, status_code=404),
+            _FakeResponse([{"arrivalAirport": {"code": "OTP"}}]),
+            _FakeResponse({}, status_code=404),
+        ]
+    )
+    client = RyanairFareFinderClient(base_url="https://www.ryanair.com")
+    client._session = lambda: session  # type: ignore[assignment]
+
+    assert client._route_destinations("XXX") == ()
+    assert (
+        client.get_calendar_prices(
+            "OTP",
+            "BGY",
+            "2026-04-18",
+            "2026-04-19",
+            "EUR",
+            1,
+            1,
+            0,
+            0,
+        )
+        == {}
+    )
+    with pytest.raises(ProviderNoResultError, match="no exact one-way fare"):
+        client.get_best_oneway("OTP", "BGY", "2026-04-18", "EUR", 1, 1, 0, 0)
+    with pytest.raises(ProviderNoResultError, match="no exact round-trip fare"):
+        client.get_best_return("OTP", "BGY", "2026-04-18", "2026-04-25", "EUR", 1, 1, 0, 0)
+
+
+def test_multi_provider_client_empty_scope_skips_all_providers() -> None:
+    client = MultiProviderClient([_StubProvider("kiwi"), _StubProvider("azair")])
+    assert client._providers_for_selection(None)[0].provider_id == "kiwi"
+    assert client._providers_for_selection(()) == ()
 
 
 def test_multi_provider_client_internal_selection_pause_and_tiebreak_paths(monkeypatch) -> None:
@@ -1030,7 +1160,7 @@ def test_multi_provider_client_internal_selection_pause_and_tiebreak_paths(monke
         "kiwi",
         "amadeus",
     ]
-    assert client._providers_for_selection(tuple()) == client.providers
+    assert client._providers_for_selection(tuple()) == ()
     assert client._is_better_oneway(fast._oneway or {}, slow._oneway or {})
     assert client._is_better_return(fast._return or {}, slow._return or {})
 
@@ -2283,7 +2413,7 @@ def test_multi_provider_client_remaining_edge_paths_cover_calendar_filters_and_t
     )
     assert prices == {"2026-03-10": 300}
     assert client._providers_for_selection(("", "   ")) == ()
-    assert client._providers_for_selection((None,)) == client.providers
+    assert client._providers_for_selection((None,)) == ()
     assert client._is_better_oneway(
         {"price": 500, "stops": 1, "duration_seconds": 4000},
         {"price": 500, "stops": 1, "duration_seconds": 5000},

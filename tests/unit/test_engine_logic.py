@@ -4,12 +4,19 @@ from collections import Counter
 
 import pytest
 
+from src import utils as utils_module
 from src.config import (
     MIN_SPLIT_CONNECTION_CROSS_AIRPORT_SECONDS,
     MIN_SPLIT_CONNECTION_SAME_AIRPORT_SECONDS,
 )
 from src.data.airports import AirportCoordinates
-from src.engine import SplitTripOptimizer, _estimate_candidates_for_destination
+from src.engine import (
+    SplitTripOptimizer,
+    _estimate_candidates_for_destination,
+)
+from src.engine import (
+    optimizer as optimizer_module,
+)
 from src.exceptions import ProviderNoResultError
 from src.providers import KiwiClient, MultiProviderClient, SerpApiGoogleFlightsClient
 from src.utils import (
@@ -420,6 +427,49 @@ def test_best_estimator_prefers_faster_candidate_before_validation() -> None:
         best_candidates[0]["estimated_best_value_score"]
         < best_candidates[1]["estimated_best_value_score"]
     )
+
+
+def test_estimator_respects_zero_transfer_cap_and_excludes_split_candidates() -> None:
+    candidates = _estimate_candidates_for_destination(
+        {
+            "destination": "BKK",
+            "origins": ["OTP"],
+            "outbound_hubs": ["DOH"],
+            "inbound_hubs": ["DOH"],
+            "period_start": "2026-03-10",
+            "period_end": "2026-03-20",
+            "min_stay_days": 1,
+            "max_stay_days": 1,
+            "min_stopover_days": 0,
+            "max_stopover_days": 1,
+            "objective": "cheapest",
+            "max_candidates": 20,
+            "max_direct_candidates": 20,
+            "max_transfers_per_direction": 0,
+            "origin_to_hub": {
+                "OTP|DOH": {"2026-03-10": 100},
+            },
+            "hub_to_origin": {
+                "DOH|OTP": {"2026-03-12": 100},
+            },
+            "hub_to_destination": {
+                "DOH": {"2026-03-10": 100},
+            },
+            "destination_to_hub": {
+                "DOH": {"2026-03-11": 100},
+            },
+            "origin_to_destination": {
+                "OTP|BKK": {"2026-03-10": 650},
+            },
+            "destination_to_origin": {
+                "BKK|OTP": {"2026-03-11": 550},
+            },
+            "destination_distance_map": {"OTP|BKK": 7735.8},
+        }
+    )
+
+    assert candidates
+    assert {candidate["candidate_type"] for candidate in candidates} == {"direct_roundtrip"}
 
 
 def test_split_candidate_key_distinguishes_same_summary_dates_with_different_leg_dates() -> None:
@@ -1280,6 +1330,210 @@ def test_search_builds_direct_and_standard_split_results_from_live_validation_pa
     assert totals["split_stopover"] == 1000
 
 
+def test_search_retains_visible_provider_quotes_for_same_exact_route(monkeypatch) -> None:
+    def segment(
+        source: str,
+        destination: str,
+        depart_local: str,
+        arrive_local: str,
+    ) -> dict[str, str]:
+        return {
+            "from": source,
+            "to": destination,
+            "depart_local": depart_local,
+            "arrive_local": arrive_local,
+        }
+
+    class _BaseProvider:
+        supports_calendar = True
+        requires_credentials = False
+        credential_env: tuple[str, ...] = ()
+        default_enabled = True
+
+        def is_configured(self) -> bool:
+            return True
+
+        def __init__(self, provider_id: str, return_price: int) -> None:
+            self.provider_id = provider_id
+            self.display_name = provider_id.title()
+            self._return_price = return_price
+
+        def get_calendar_prices(self, **kwargs):  # type: ignore[no-untyped-def]
+            route = (kwargs.get("source"), kwargs.get("destination"))
+            if route == ("OTP", "BGY"):
+                return {"2026-04-18": self._return_price // 2}
+            if route == ("BGY", "OTP"):
+                return {"2026-04-25": self._return_price // 2}
+            return {}
+
+        def get_best_oneway(self, **kwargs):  # type: ignore[no-untyped-def]
+            route = (
+                kwargs.get("source"),
+                kwargs.get("destination"),
+                kwargs.get("departure_iso"),
+            )
+            if route == ("OTP", "BGY", "2026-04-18"):
+                price = self._return_price // 2
+                return {
+                    "price": price,
+                    "formatted_price": f"{price} RON",
+                    "currency": "RON",
+                    "duration_seconds": 2 * 3600,
+                    "stops": 0,
+                    "transfer_events": 0,
+                    "booking_url": f"https://example.test/{self.provider_id}/otp-bgy",
+                    "segments": [
+                        segment("OTP", "BGY", "2026-04-18T08:00:00", "2026-04-18T10:00:00")
+                    ],
+                    "provider": self.provider_id,
+                    "fare_mode": "selected_bags",
+                    "price_mode": "explicit_total",
+                }
+            if route == ("BGY", "OTP", "2026-04-25"):
+                price = self._return_price // 2
+                return {
+                    "price": price,
+                    "formatted_price": f"{price} RON",
+                    "currency": "RON",
+                    "duration_seconds": 2 * 3600,
+                    "stops": 0,
+                    "transfer_events": 0,
+                    "booking_url": f"https://example.test/{self.provider_id}/bgy-otp",
+                    "segments": [
+                        segment("BGY", "OTP", "2026-04-25T18:00:00", "2026-04-25T20:00:00")
+                    ],
+                    "provider": self.provider_id,
+                    "fare_mode": "selected_bags",
+                    "price_mode": "explicit_total",
+                }
+            return None
+
+        def get_best_return(self, **kwargs):  # type: ignore[no-untyped-def]
+            route = (
+                kwargs.get("source"),
+                kwargs.get("destination"),
+                kwargs.get("outbound_iso"),
+                kwargs.get("inbound_iso"),
+            )
+            if route != ("OTP", "BGY", "2026-04-18", "2026-04-25"):
+                return None
+            return {
+                "price": self._return_price,
+                "formatted_price": f"{self._return_price} RON",
+                "currency": "RON",
+                "duration_seconds": 4 * 3600,
+                "outbound_duration_seconds": 2 * 3600,
+                "inbound_duration_seconds": 2 * 3600,
+                "outbound_stops": 0,
+                "inbound_stops": 0,
+                "outbound_transfer_events": 0,
+                "inbound_transfer_events": 0,
+                "booking_url": f"https://example.test/{self.provider_id}/otp-bgy-rt",
+                "outbound_segments": [
+                    segment("OTP", "BGY", "2026-04-18T08:00:00", "2026-04-18T10:00:00")
+                ],
+                "inbound_segments": [
+                    segment("BGY", "OTP", "2026-04-25T18:00:00", "2026-04-25T20:00:00")
+                ],
+                "provider": self.provider_id,
+                "fare_mode": "selected_bags",
+                "price_mode": "explicit_total",
+            }
+
+    class UnavailableRouteGraph:
+        def available(self) -> bool:
+            return False
+
+    optimizer = SplitTripOptimizer(
+        {
+            "kiwi": _BaseProvider("kiwi", 1220),
+            "freeone": _BaseProvider("freeone", 1180),
+        },
+        AirportCoordinates(),
+    )
+    monkeypatch.setattr(
+        optimizer_module,
+        "SUPPORTED_PROVIDER_IDS",
+        (
+            "kiwi",
+            "freeone",
+            "azair",
+            "ryanair",
+            "kayak",
+            "momondo",
+            "googleflights",
+            "skyscanner",
+            "travelpayouts",
+            "amadeus",
+            "serpapi",
+        ),
+    )
+    monkeypatch.setattr(
+        utils_module,
+        "SUPPORTED_PROVIDER_IDS",
+        (
+            "kiwi",
+            "freeone",
+            "azair",
+            "ryanair",
+            "kayak",
+            "momondo",
+            "googleflights",
+            "skyscanner",
+            "travelpayouts",
+            "amadeus",
+            "serpapi",
+        ),
+    )
+    monkeypatch.setattr(optimizer_module, "_FREE_PROVIDER_IDS", ("kiwi", "freeone"))
+    optimizer.route_graph = UnavailableRouteGraph()
+    config = optimizer.parse_search_config(
+        {
+            "origins": ["OTP"],
+            "destinations": ["BGY"],
+            "providers": ["kiwi", "freeone"],
+            "period_start": "2026-04-18",
+            "period_end": "2026-04-25",
+            "min_stay_days": 7,
+            "max_stay_days": 7,
+            "max_transfers_per_direction": 0,
+            "top_results": 3,
+            "validate_top_per_destination": 6,
+            "market_compare_fares": False,
+            "io_workers": 2,
+            "cpu_workers": 1,
+        }
+    )
+
+    result = optimizer.search(config)
+
+    assert len(result["results"]) == 1
+    selected = result["results"][0]
+    assert selected["provider_quote_count"] == 2
+    quote_summaries = sorted(
+        (
+            str(quote["provider"]),
+            int(quote["price"]),
+        )
+        for quote in selected["provider_quotes"]
+    )
+    assert quote_summaries == [
+        ("freeone", 1180),
+        ("kiwi", 1220),
+    ]
+    selected_quotes = [quote for quote in selected["provider_quotes"] if quote["selected"]]
+    assert len(selected_quotes) == 1
+    assert selected_quotes[0]["provider"] == selected["provider"]
+    assert selected_quotes[0]["price"] == selected["total_price"]
+    assert result["meta"]["engine"]["visible_provider_quotes"] == {
+        "results_with_quotes": 1,
+        "total_quote_entries": 2,
+        "providers": ["freeone", "kiwi"],
+        "oneway_keys_enriched": 0,
+        "return_keys_enriched": 1,
+    }
+
+
 def test_merge_strategy_anchors_keeps_destination_coverage() -> None:
     optimizer = SplitTripOptimizer(KiwiClient(), AirportCoordinates())
     ranked = [
@@ -1872,6 +2126,107 @@ def test_parse_config_explicit_search_timeout_is_preserved() -> None:
         }
     )
     assert config.search_timeout_seconds == 1800
+
+
+def test_parse_config_defaults_time_windows_to_no_limit() -> None:
+    optimizer = SplitTripOptimizer(KiwiClient(), AirportCoordinates())
+    config = optimizer.parse_search_config(
+        {
+            "origins": ["OTP"],
+            "destinations": ["MRS"],
+            "period_start": "2026-06-25",
+            "period_end": "2026-07-02",
+        }
+    )
+
+    assert config.outbound_departure_time_start == "00:00"
+    assert config.outbound_departure_time_end == "00:00"
+    assert config.outbound_arrival_time_start == "00:00"
+    assert config.outbound_arrival_time_end == "00:00"
+    assert config.return_departure_time_start == "00:00"
+    assert config.return_departure_time_end == "00:00"
+    assert config.return_arrival_time_start == "00:00"
+    assert config.return_arrival_time_end == "00:00"
+
+
+def test_result_time_windows_filter_whole_outbound_and_return_journeys() -> None:
+    optimizer = SplitTripOptimizer(KiwiClient(), AirportCoordinates())
+    config = optimizer.parse_search_config(
+        {
+            "origins": ["OTP"],
+            "destinations": ["MRS"],
+            "period_start": "2026-06-25",
+            "period_end": "2026-07-02",
+            "outbound_departure_time_start": "21:00",
+            "outbound_departure_time_end": "23:00",
+            "outbound_arrival_time_start": "23:00",
+            "outbound_arrival_time_end": "00:30",
+            "return_departure_time_start": "17:00",
+            "return_departure_time_end": "19:00",
+            "return_arrival_time_start": "21:00",
+            "return_arrival_time_end": "22:00",
+        }
+    )
+    result = {
+        "destination_code": "MRS",
+        "legs": [
+            {
+                "source": "OTP",
+                "destination": "MRS",
+                "segments": [
+                    {
+                        "from": "OTP",
+                        "to": "MRS",
+                        "depart_local": "2026-06-25T21:55:00",
+                        "arrive_local": "2026-06-25T23:50:00",
+                    }
+                ],
+            },
+            {
+                "source": "MRS",
+                "destination": "OTP",
+                "segments": [
+                    {
+                        "from": "MRS",
+                        "to": "OTP",
+                        "depart_local": "2026-07-02T17:55:00",
+                        "arrive_local": "2026-07-02T21:30:00",
+                    }
+                ],
+            },
+        ],
+    }
+
+    assert optimizer._result_matches_time_windows(result, config)
+
+    blocked_config = optimizer.parse_search_config(
+        {
+            "origins": ["OTP"],
+            "destinations": ["MRS"],
+            "period_start": "2026-06-25",
+            "period_end": "2026-07-02",
+            "return_arrival_time_start": "08:00",
+            "return_arrival_time_end": "09:00",
+        }
+    )
+    assert not optimizer._result_matches_time_windows(result, blocked_config)
+
+
+def test_merge_baggage_compared_fares_preserves_selected_fare_mode() -> None:
+    selected = SplitTripOptimizer._merge_baggage_compared_fares(
+        {
+            "price": 1200,
+            "formatted_price": "1200 RON",
+            "provider": "ryanair",
+            "fare_mode": "base_no_bags",
+            "price_mode": "base_per_adult_scaled_converted",
+        },
+        None,
+    )
+
+    assert selected is not None
+    assert selected["fare_mode"] == "base_no_bags"
+    assert selected["price_mode"] == "base_per_adult_scaled_converted"
 
 
 def test_build_search_client_applies_kiwi_cap_only_to_kiwi() -> None:

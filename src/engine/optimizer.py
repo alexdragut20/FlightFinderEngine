@@ -10,6 +10,7 @@ import os
 import time
 import uuid
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import replace
 from functools import partial
 from typing import Any
@@ -111,9 +112,7 @@ from ..utils.constants import (
     SECONDS_PER_DAY,
     SECONDS_PER_HOUR,
 )
-from ..utils.logging import log_event
-
-_CANDIDATE_WORKER_TASKS: dict[str, dict[str, Any]] = {}
+from ..utils.logging import exception_message, log_event
 
 
 def _min_calendar_price(prices: dict[str, int] | None) -> int | None:
@@ -327,6 +326,24 @@ def _coerce_optional_price(value: Any) -> int | None:
         return None
 
 
+def _normalize_time_of_day(value: Any) -> str:
+    """Normalize a time input into HH:MM, defaulting to no-limit midnight."""
+    raw = str(value or "").strip()
+    if not raw:
+        return "00:00"
+    parts = raw.split(":")
+    if len(parts) < 2:
+        return "00:00"
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1])
+    except (TypeError, ValueError):
+        return "00:00"
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        return "00:00"
+    return f"{hour:02d}:{minute:02d}"
+
+
 def _min_series_price(
     series: tuple[int | None, ...] | list[int | None] | dict[Any, Any] | None,
 ) -> int | None:
@@ -395,6 +412,13 @@ def _compact_candidate_task(task: dict[str, Any]) -> dict[str, Any]:
     Returns:
         dict[str, Any]: Compact estimator task payload ready for chunk processing.
     """
+
+    def _task_int_or_default(key: str, default: int) -> int:
+        value = task.get(key)
+        if value in (None, ""):
+            return int(default)
+        return int(value)
+
     if "date_keys" in task:
         date_keys = tuple(str(value) for value in task["date_keys"])
     else:
@@ -415,8 +439,14 @@ def _compact_candidate_task(task: dict[str, Any]) -> dict[str, Any]:
         "max_stopover_days": int(task["max_stopover_days"]),
         "objective": str(task["objective"]),
         "max_candidates": int(task["max_candidates"]),
-        "max_direct_candidates": int(task.get("max_direct_candidates") or task["max_candidates"]),
-        "max_transfers_per_direction": int(task.get("max_transfers_per_direction") or 2),
+        "max_direct_candidates": _task_int_or_default(
+            "max_direct_candidates",
+            int(task["max_candidates"]),
+        ),
+        "max_transfers_per_direction": _task_int_or_default(
+            "max_transfers_per_direction",
+            2,
+        ),
         "chunk_start_index": max(0, int(task.get("chunk_start_index") or 0)),
         "chunk_end_index": min(
             len(date_keys),
@@ -466,16 +496,6 @@ def _compact_candidate_task(task: dict[str, Any]) -> dict[str, Any]:
         for raw_key, value in dict(task["destination_distance_map"]).items()
     }
     return compact_task
-
-
-def _candidate_worker_init(task_map: dict[str, dict[str, Any]]) -> None:
-    """Initialize worker-local candidate task state.
-
-    Args:
-        task_map: Compact estimator tasks keyed by task identifier.
-    """
-    global _CANDIDATE_WORKER_TASKS
-    _CANDIDATE_WORKER_TASKS = task_map
 
 
 def _lookup_route_prices(
@@ -780,7 +800,9 @@ def _estimate_candidates_for_chunk(chunk: dict[str, Any]) -> tuple[str, list[dic
         tuple[str, list[dict[str, Any]]]: Destination code and estimated candidates for the chunk.
     """
     task_id = str(chunk["task_id"])
-    base_task = _CANDIDATE_WORKER_TASKS.get(task_id) or dict(chunk["base_task"])
+    base_task = dict(chunk.get("base_task") or {})
+    if not base_task:
+        raise ValueError(f"Missing base candidate task payload for {task_id}.")
     chunk_task = dict(base_task)
     chunk_task["chunk_start_index"] = int(chunk["chunk_start_index"])
     chunk_task["chunk_end_index"] = int(chunk["chunk_end_index"])
@@ -800,6 +822,32 @@ def _estimate_candidates_for_destination(task: dict[str, Any]) -> list[dict[str,
     return _estimate_candidates_for_destination_compact(task)
 
 
+def _merge_chunk_batches(
+    partial_batches: dict[str, list[list[dict[str, Any]]]],
+    compact_tasks: dict[str, dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Merge chunked estimator batches back into final per-destination candidates.
+
+    Args:
+        partial_batches: Chunk estimator outputs keyed by destination.
+        compact_tasks: Compact task metadata keyed by destination.
+
+    Returns:
+        dict[str, list[dict[str, Any]]]: Finalized candidates per destination.
+    """
+    out: dict[str, list[dict[str, Any]]] = {}
+    for destination, batches in partial_batches.items():
+        merged = [candidate for batch in batches for candidate in batch]
+        task_meta = compact_tasks[destination]
+        out[destination] = _finalize_estimated_candidates(
+            merged,
+            objective=str(task_meta["objective"]),
+            max_candidates=int(task_meta["max_candidates"]),
+            max_direct_candidates=int(task_meta["max_direct_candidates"]),
+        )
+    return out
+
+
 def _estimate_candidates_for_destination_compact(task: dict[str, Any]) -> list[dict[str, Any]]:
     """Estimate candidate routes for a compact destination task.
 
@@ -809,6 +857,13 @@ def _estimate_candidates_for_destination_compact(task: dict[str, Any]) -> list[d
     Returns:
         list[dict[str, Any]]: Estimated candidate routes for the provided chunk.
     """
+
+    def _task_int_or_default(key: str, default: int) -> int:
+        value = task.get(key)
+        if value in (None, ""):
+            return int(default)
+        return int(value)
+
     task = _compact_candidate_task(task)
     destination = str(task["destination"])
     origins = list(task["origins"])
@@ -825,8 +880,8 @@ def _estimate_candidates_for_destination_compact(task: dict[str, Any]) -> list[d
     max_stopover_days = int(task["max_stopover_days"])
     objective = str(task["objective"])
     max_candidates = int(task["max_candidates"])
-    max_direct_candidates = int(task.get("max_direct_candidates") or max_candidates)
-    max_transfers_per_direction = int(task.get("max_transfers_per_direction") or 2)
+    max_direct_candidates = _task_int_or_default("max_direct_candidates", max_candidates)
+    max_transfers_per_direction = _task_int_or_default("max_transfers_per_direction", 2)
     prune_score_margin_ratio = max(
         0.0,
         float(task.get("prune_score_margin_ratio", CANDIDATE_PRUNING_SCORE_MARGIN_RATIO)),
@@ -1462,6 +1517,8 @@ def _estimate_candidates_for_destination_compact(task: dict[str, Any]) -> list[d
                 )
 
     split_candidates = [item[3] for item in heap]
+    if max_transfers_per_direction <= 0:
+        split_candidates = []
     return _finalize_estimated_candidates(
         split_candidates + direct_candidates,
         objective=objective,
@@ -2102,6 +2159,33 @@ class SplitTripOptimizer:
             max_stops_per_leg=max_stops_per_leg,
             max_layovers_per_direction=max_layovers_per_direction,
             max_connection_layover_hours=max_connection_layover_hours,
+            outbound_departure_time_start=_normalize_time_of_day(
+                payload.get("outbound_departure_time_start")
+            ),
+            outbound_departure_time_end=_normalize_time_of_day(
+                payload.get("outbound_departure_time_end")
+            ),
+            outbound_arrival_time_start=_normalize_time_of_day(
+                payload.get("outbound_arrival_time_start")
+            ),
+            outbound_arrival_time_end=_normalize_time_of_day(
+                payload.get("outbound_arrival_time_end")
+            ),
+            return_departure_time_start=_normalize_time_of_day(
+                payload.get("return_departure_time_start")
+                or payload.get("inbound_departure_time_start")
+            ),
+            return_departure_time_end=_normalize_time_of_day(
+                payload.get("return_departure_time_end")
+                or payload.get("inbound_departure_time_end")
+            ),
+            return_arrival_time_start=_normalize_time_of_day(
+                payload.get("return_arrival_time_start")
+                or payload.get("inbound_arrival_time_start")
+            ),
+            return_arrival_time_end=_normalize_time_of_day(
+                payload.get("return_arrival_time_end") or payload.get("inbound_arrival_time_end")
+            ),
             currency=currency,
             objective=objective,
             provider_ids=provider_ids,
@@ -2213,6 +2297,166 @@ class SplitTripOptimizer:
         if gap_seconds is None:
             return False
         return gap_seconds > max_allowed_seconds
+
+    @staticmethod
+    def _time_minutes(value: Any) -> int | None:
+        """Return local minutes after midnight from an ISO date-time or HH:MM value."""
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        try:
+            if "T" in raw:
+                parsed = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                return parsed.hour * 60 + parsed.minute
+            parts = raw.split(":")
+            if len(parts) >= 2:
+                hour = int(parts[0])
+                minute = int(parts[1])
+                if 0 <= hour <= 23 and 0 <= minute <= 59:
+                    return hour * 60 + minute
+        except (TypeError, ValueError):
+            return None
+        return None
+
+    @classmethod
+    def _time_window_active(cls, start: str, end: str) -> bool:
+        """Return whether a time window should filter results."""
+        start_minutes = cls._time_minutes(start)
+        end_minutes = cls._time_minutes(end)
+        return (
+            start_minutes is not None and end_minutes is not None and start_minutes != end_minutes
+        )
+
+    @classmethod
+    def _time_in_window(cls, value: Any, start: str, end: str) -> bool:
+        """Return whether a local time falls inside an inclusive possibly overnight window."""
+        time_minutes = cls._time_minutes(value)
+        start_minutes = cls._time_minutes(start)
+        end_minutes = cls._time_minutes(end)
+        if start_minutes is None or end_minutes is None or start_minutes == end_minutes:
+            return True
+        if time_minutes is None:
+            return False
+        if start_minutes < end_minutes:
+            return start_minutes <= time_minutes <= end_minutes
+        return time_minutes >= start_minutes or time_minutes <= end_minutes
+
+    @staticmethod
+    def _leg_segments_for_time_filter(
+        leg: dict[str, Any],
+        *,
+        direction: str,
+    ) -> list[dict[str, Any]]:
+        """Return normalized leg segments for whole-direction time filtering."""
+        if str(leg.get("ticket_type") or "").strip().lower() == "roundtrip":
+            key = "outbound_segments" if direction == "outbound" else "inbound_segments"
+            segments = leg.get(key) or []
+        else:
+            segments = leg.get("segments") or []
+        if segments:
+            return [dict(segment) for segment in segments if isinstance(segment, dict)]
+        if leg.get("departure_local") or leg.get("arrival_local"):
+            return [
+                {
+                    "from": leg.get("source"),
+                    "to": leg.get("destination"),
+                    "depart_local": leg.get("departure_local"),
+                    "arrive_local": leg.get("arrival_local"),
+                }
+            ]
+        return []
+
+    @classmethod
+    def _direction_segments_for_time_filter(
+        cls,
+        item: dict[str, Any],
+        direction: str,
+    ) -> list[dict[str, Any]]:
+        """Return the full outbound or return segment sequence for a result."""
+        destination_code = str(item.get("destination_code") or "").strip().upper()
+        legs = [leg for leg in (item.get("legs") or []) if isinstance(leg, dict)]
+        if not destination_code or not legs:
+            return []
+
+        outbound_segments: list[dict[str, Any]] = []
+        return_segments: list[dict[str, Any]] = []
+        phase = "outbound"
+
+        def append_to_phase(segments: list[dict[str, Any]], target_phase: str) -> None:
+            if not segments:
+                return
+            if target_phase == "outbound":
+                outbound_segments.extend(segments)
+            else:
+                return_segments.extend(segments)
+
+        for leg in legs:
+            if str(leg.get("ticket_type") or "").strip().lower() == "roundtrip":
+                outbound_part = cls._leg_segments_for_time_filter(leg, direction="outbound")
+                append_to_phase(outbound_part, phase)
+                phase = "return"
+                inbound_part = cls._leg_segments_for_time_filter(leg, direction="return")
+                append_to_phase(inbound_part, "return")
+                continue
+
+            segments = cls._leg_segments_for_time_filter(leg, direction=phase)
+            append_to_phase(segments, phase)
+            leg_destination = str(leg.get("destination") or "").strip().upper()
+            if phase == "outbound" and leg_destination == destination_code:
+                phase = "return"
+
+        return outbound_segments if direction == "outbound" else return_segments
+
+    @classmethod
+    def _result_matches_time_windows(cls, item: dict[str, Any], config: SearchConfig) -> bool:
+        """Return whether a result satisfies configured outbound and return time windows."""
+        windows = (
+            (
+                "outbound",
+                "departure",
+                config.outbound_departure_time_start,
+                config.outbound_departure_time_end,
+            ),
+            (
+                "outbound",
+                "arrival",
+                config.outbound_arrival_time_start,
+                config.outbound_arrival_time_end,
+            ),
+            (
+                "return",
+                "departure",
+                config.return_departure_time_start,
+                config.return_departure_time_end,
+            ),
+            (
+                "return",
+                "arrival",
+                config.return_arrival_time_start,
+                config.return_arrival_time_end,
+            ),
+        )
+        if not any(cls._time_window_active(start, end) for _, _, start, end in windows):
+            return True
+
+        segment_cache: dict[str, list[dict[str, Any]]] = {}
+        for direction, point, start, end in windows:
+            if not cls._time_window_active(start, end):
+                continue
+            segments = segment_cache.setdefault(
+                direction,
+                cls._direction_segments_for_time_filter(item, direction),
+            )
+            if not segments:
+                return False
+            value = (
+                segments[0].get("depart_local")
+                if point == "departure"
+                else segments[-1].get("arrive_local")
+            )
+            if not cls._time_in_window(value, start, end):
+                return False
+        return True
 
     @staticmethod
     def _candidate_split_plans(candidate: dict[str, Any]) -> dict[str, Any] | None:
@@ -2664,6 +2908,670 @@ class SplitTripOptimizer:
                 "inbound_duration_seconds": self._as_int(fare.get("inbound_duration_seconds")),
             }
         return cache
+
+    def _build_direct_roundtrip_from_oneways(
+        self,
+        *,
+        candidate: dict[str, Any],
+        oneway_cache: dict[tuple[str, str, str], dict[str, Any]],
+        config: SearchConfig,
+        distance_basis_km: float | None,
+        destination_name: str,
+        notes: dict[str, str],
+        max_connection_layover_seconds: int | None,
+        comparison_links: dict[str, str],
+    ) -> dict[str, Any] | None:
+        """Build a direct round-trip from validated one-way fares when no bundled fare exists."""
+        outbound_key = (
+            str(candidate.get("origin") or "").strip().upper(),
+            str(candidate.get("destination") or "").strip().upper(),
+            str(candidate.get("depart_origin_date") or "")[:10],
+        )
+        inbound_key = (
+            str(candidate.get("destination") or "").strip().upper(),
+            str(candidate.get("arrival_origin") or "").strip().upper(),
+            str(candidate.get("return_origin_date") or "")[:10],
+        )
+        outbound_entry = oneway_cache.get(outbound_key)
+        inbound_entry = oneway_cache.get(inbound_key)
+        if not outbound_entry or not inbound_entry:
+            return None
+
+        outbound_segments = outbound_entry.get("segments") or []
+        inbound_segments = inbound_entry.get("segments") or []
+        if self._exceeds_connection_layover_limit(
+            outbound_segments,
+            max_connection_layover_seconds,
+        ) or self._exceeds_connection_layover_limit(
+            inbound_segments,
+            max_connection_layover_seconds,
+        ):
+            return None
+
+        outbound_source = str(outbound_entry.get("source") or "")
+        outbound_destination = str(outbound_entry.get("destination") or "")
+        inbound_source = str(inbound_entry.get("source") or "")
+        inbound_destination = str(inbound_entry.get("destination") or "")
+        if not self._leg_matches_expected_route(
+            outbound_source,
+            outbound_destination,
+            candidate["origin"],
+            candidate["destination"],
+        ) or not self._leg_matches_expected_route(
+            inbound_source,
+            inbound_destination,
+            candidate["destination"],
+            candidate["arrival_origin"],
+        ):
+            return None
+
+        outbound_fare = dict(outbound_entry.get("fare") or {})
+        inbound_fare = dict(inbound_entry.get("fare") or {})
+        outbound_layovers = int(
+            outbound_fare.get("transfer_events", outbound_entry.get("stops", 0)) or 0
+        )
+        inbound_layovers = int(
+            inbound_fare.get("transfer_events", inbound_entry.get("stops", 0)) or 0
+        )
+        if (
+            outbound_layovers > config.max_layovers_per_direction
+            or inbound_layovers > config.max_layovers_per_direction
+        ):
+            return None
+
+        outbound_price = self._as_int(outbound_fare.get("price"))
+        inbound_price = self._as_int(inbound_fare.get("price"))
+        if outbound_price is None or inbound_price is None:
+            return None
+
+        total_price = outbound_price + inbound_price
+        score = self._score_candidate(
+            total_price,
+            distance_basis_km,
+            config.objective,
+        )
+        price_per_1000_km = (
+            round((total_price / distance_basis_km) * 1000.0, 1)
+            if distance_basis_km and distance_basis_km > 0
+            else None
+        )
+        outbound_time_to_destination_seconds = self._as_int(outbound_entry.get("duration_seconds"))
+        inbound_time_to_origin_seconds = self._as_int(inbound_entry.get("duration_seconds"))
+        out_transfers = self._transfer_airports(outbound_segments)
+        in_transfers = self._transfer_airports(inbound_segments)
+        legs = [
+            self._oneway_entry_to_leg(
+                outbound_entry,
+                fallback_source=outbound_key[0],
+                fallback_destination=outbound_key[1],
+                fallback_date=outbound_key[2],
+                max_stops_per_leg=config.max_stops_per_leg,
+            ),
+            self._oneway_entry_to_leg(
+                inbound_entry,
+                fallback_source=inbound_key[0],
+                fallback_destination=inbound_key[1],
+                fallback_date=inbound_key[2],
+                max_stops_per_leg=config.max_stops_per_leg,
+            ),
+        ]
+        provider_ids = [
+            str(outbound_fare.get("provider") or "").strip().lower(),
+            str(inbound_fare.get("provider") or "").strip().lower(),
+        ]
+        provider_ids = [provider_id for provider_id in provider_ids if provider_id]
+        primary_provider = provider_ids[0] if provider_ids else "kiwi"
+        fare_mode_values = [
+            str(outbound_fare.get("fare_mode") or "").strip(),
+            str(inbound_fare.get("fare_mode") or "").strip(),
+        ]
+        fare_mode_values = [value for value in fare_mode_values if value]
+        price_mode_values = [
+            str(outbound_fare.get("price_mode") or "").strip(),
+            str(inbound_fare.get("price_mode") or "").strip(),
+        ]
+        price_mode_values = [value for value in price_mode_values if value]
+        per_adult_price = round(total_price / max(1, int(config.passengers.adults)), 2)
+
+        return {
+            "result_id": (
+                f"{candidate['destination']}|direct|{candidate['origin']}|"
+                f"{candidate['depart_origin_date']}|{candidate['return_origin_date']}"
+            ),
+            "itinerary_type": "direct_roundtrip",
+            "destination_code": candidate["destination"],
+            "destination_name": destination_name,
+            "destination_note": notes.get("note"),
+            "total_price": total_price,
+            "passengers_adults": int(config.passengers.adults),
+            "price_per_adult": per_adult_price,
+            "price_modes": list(dict.fromkeys(price_mode_values)),
+            "currency": config.currency,
+            "formatted_total_price": f"{total_price} {config.currency}",
+            "price_per_1000_km": price_per_1000_km,
+            "distance_km": round(distance_basis_km, 1) if distance_basis_km else None,
+            "distance_basis": "direct_origin_to_destination",
+            "score": score,
+            "outbound_time_to_destination_seconds": outbound_time_to_destination_seconds,
+            "inbound_time_to_origin_seconds": inbound_time_to_origin_seconds,
+            "objective": config.objective,
+            "provider": primary_provider,
+            "pricing_strategy": "separate_oneways",
+            "pricing_strategy_note": (
+                "Bundled round-trip fare was unavailable, so the engine paired exact direct one-way legs."
+            ),
+            "outbound": {
+                "origin": candidate["origin"],
+                "hub": "/".join(out_transfers) if out_transfers else "DIRECT",
+                "transfer_airports": out_transfers,
+                "date_from_origin": candidate["depart_origin_date"],
+                "date_to_destination": candidate["depart_origin_date"],
+                "stopover_days": 0,
+                "layovers_count": outbound_layovers,
+                "provider": primary_provider,
+            },
+            "fare_mode": (
+                fare_mode_values[0]
+                if len(set(fare_mode_values)) == 1 and fare_mode_values
+                else "selected_bags"
+            ),
+            "main_destination_stay_days": candidate["main_stay_days"],
+            "inbound": {
+                "hub": "/".join(in_transfers) if in_transfers else "DIRECT",
+                "transfer_airports": in_transfers,
+                "arrival_origin": candidate["arrival_origin"],
+                "date_from_destination": candidate["return_origin_date"],
+                "date_to_origin": candidate["return_origin_date"],
+                "stopover_days": 0,
+                "layovers_count": inbound_layovers,
+                "provider": primary_provider,
+            },
+            "comparison_links": comparison_links,
+            "legs": legs,
+            "risk_notes": [
+                "This option combines two exact one-way fares because a bundled round-trip fare was not available.",
+                "Baggage and fare rules can differ across the outbound and inbound tickets.",
+            ],
+        }
+
+    @staticmethod
+    def _provider_quote_sort_key(quote: dict[str, Any]) -> tuple[int, int, int, str]:
+        """Return a stable sort key for provider quote summaries."""
+        return (
+            int(quote.get("price") or PRICE_SENTINEL),
+            int(quote.get("stops") or 0),
+            int(quote.get("duration_seconds") or PRICE_SENTINEL),
+            str(quote.get("provider") or ""),
+        )
+
+    @classmethod
+    def _sorted_provider_quotes(cls, quotes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Return provider quote summaries sorted by price, stops, and duration."""
+        return sorted(
+            [dict(item) for item in quotes if item],
+            key=cls._provider_quote_sort_key,
+        )
+
+    def _provider_supports_market(
+        self,
+        provider_id: str,
+        source: str,
+        destination: str,
+        *,
+        support_cache: dict[tuple[str, str, str], bool] | None = None,
+    ) -> bool:
+        """Return whether a provider likely supports the requested market."""
+        normalized_provider_id = str(provider_id or "").strip().lower()
+        normalized_source = str(source or "").strip().upper()
+        normalized_destination = str(destination or "").strip().upper()
+        if not normalized_provider_id or not normalized_source or not normalized_destination:
+            return False
+        cache_key = (normalized_provider_id, normalized_source, normalized_destination)
+        if support_cache is not None and cache_key in support_cache:
+            return bool(support_cache[cache_key])
+
+        provider = self.providers.get(normalized_provider_id)
+        if provider is None:
+            supported = False
+        else:
+            market_supported = getattr(provider, "_market_supported", None)
+            if callable(market_supported):
+                try:
+                    supported = bool(market_supported(normalized_source, normalized_destination))
+                except Exception:
+                    # If support discovery itself is unavailable, keep the provider in play
+                    # and let the real fare query decide.
+                    supported = True
+            else:
+                supported = True
+
+        if support_cache is not None:
+            support_cache[cache_key] = supported
+        return supported
+
+    def _route_aware_provider_scope(
+        self,
+        provider_ids: tuple[str, ...],
+        *,
+        source: str,
+        destination: str,
+        roundtrip: bool = False,
+        support_cache: dict[tuple[str, str, str], bool] | None = None,
+    ) -> tuple[str, ...]:
+        """Return the providers worth querying for a specific market."""
+        normalized_provider_ids = tuple(
+            dict.fromkeys(
+                str(provider_id or "").strip().lower()
+                for provider_id in provider_ids
+                if str(provider_id or "").strip()
+            )
+        )
+        if not normalized_provider_ids:
+            return ()
+
+        scoped_provider_ids = tuple(
+            provider_id
+            for provider_id in normalized_provider_ids
+            if self._provider_supports_market(
+                provider_id,
+                source,
+                destination,
+                support_cache=support_cache,
+            )
+            and (
+                not roundtrip
+                or self._provider_supports_market(
+                    provider_id,
+                    destination,
+                    source,
+                    support_cache=support_cache,
+                )
+            )
+        )
+        if scoped_provider_ids:
+            return scoped_provider_ids
+
+        # Kiwi is the broad fallback provider when nothing else claims the market.
+        if "kiwi" in normalized_provider_ids:
+            return ("kiwi",)
+        return ()
+
+    @staticmethod
+    def _oneway_fare_to_quote_summary(fare: dict[str, Any]) -> dict[str, Any] | None:
+        """Convert a one-way fare into a compact provider quote summary."""
+        if not fare:
+            return None
+        price = SplitTripOptimizer._as_int(fare.get("price"))
+        if price is None:
+            return None
+        return {
+            "provider": str(fare.get("provider") or "").strip().lower() or "unknown",
+            "price": price,
+            "formatted_price": fare.get("formatted_price"),
+            "currency": fare.get("currency"),
+            "stops": int(fare.get("stops") or 0),
+            "duration_seconds": SplitTripOptimizer._as_int(fare.get("duration_seconds")),
+            "fare_mode": fare.get("fare_mode", "selected_bags"),
+            "price_mode": fare.get("price_mode"),
+            "booking_url": fare.get("booking_url"),
+        }
+
+    @staticmethod
+    def _return_fare_to_quote_summary(fare: dict[str, Any]) -> dict[str, Any] | None:
+        """Convert a round-trip fare into a compact provider quote summary."""
+        if not fare:
+            return None
+        price = SplitTripOptimizer._as_int(fare.get("price"))
+        if price is None:
+            return None
+        return {
+            "provider": str(fare.get("provider") or "").strip().lower() or "unknown",
+            "price": price,
+            "formatted_price": fare.get("formatted_price"),
+            "currency": fare.get("currency"),
+            "stops": int(fare.get("outbound_stops") or 0) + int(fare.get("inbound_stops") or 0),
+            "duration_seconds": SplitTripOptimizer._as_int(fare.get("duration_seconds")),
+            "outbound_stops": int(fare.get("outbound_stops") or 0),
+            "inbound_stops": int(fare.get("inbound_stops") or 0),
+            "fare_mode": fare.get("fare_mode", "selected_bags"),
+            "price_mode": fare.get("price_mode"),
+            "booking_url": fare.get("booking_url"),
+        }
+
+    def _fetch_provider_specific_oneway_fare(
+        self,
+        *,
+        provider: Any,
+        provider_id: str,
+        source: str,
+        destination: str,
+        date_iso: str,
+        config: SearchConfig,
+        max_connection_layover_seconds: int | None,
+    ) -> dict[str, Any] | None:
+        """Fetch an exact one-way fare for a single provider."""
+        item = provider.get_best_oneway(
+            source=source,
+            destination=destination,
+            departure_iso=date_iso,
+            currency=config.currency,
+            max_stops_per_leg=config.max_stops_per_leg,
+            adults=config.passengers.adults,
+            hand_bags=config.passengers.hand_bags,
+            hold_bags=config.passengers.hold_bags,
+            max_connection_layover_seconds=max_connection_layover_seconds,
+        )
+        item = dict(item) if item else None
+        compare_to_base = bool(config.market_compare_fares) and (
+            config.passengers.hand_bags > 0 or config.passengers.hold_bags > 0
+        )
+        if compare_to_base and str(provider_id or "").strip().lower() == "kiwi":
+            base_item = provider.get_best_oneway(
+                source=source,
+                destination=destination,
+                departure_iso=date_iso,
+                currency=config.currency,
+                max_stops_per_leg=config.max_stops_per_leg,
+                adults=config.passengers.adults,
+                hand_bags=0,
+                hold_bags=0,
+                max_connection_layover_seconds=max_connection_layover_seconds,
+            )
+            item = self._merge_baggage_compared_fares(item, base_item)
+        return item
+
+    def _fetch_provider_specific_return_fare(
+        self,
+        *,
+        provider: Any,
+        provider_id: str,
+        source: str,
+        destination: str,
+        outbound_iso: str,
+        inbound_iso: str,
+        config: SearchConfig,
+        max_connection_layover_seconds: int | None,
+    ) -> dict[str, Any] | None:
+        """Fetch an exact round-trip fare for a single provider."""
+        item = provider.get_best_return(
+            source=source,
+            destination=destination,
+            outbound_iso=outbound_iso,
+            inbound_iso=inbound_iso,
+            currency=config.currency,
+            max_stops_per_leg=config.max_stops_per_leg,
+            adults=config.passengers.adults,
+            hand_bags=config.passengers.hand_bags,
+            hold_bags=config.passengers.hold_bags,
+            max_connection_layover_seconds=max_connection_layover_seconds,
+        )
+        item = dict(item) if item else None
+        compare_to_base = bool(config.market_compare_fares) and (
+            config.passengers.hand_bags > 0 or config.passengers.hold_bags > 0
+        )
+        if compare_to_base and str(provider_id or "").strip().lower() == "kiwi":
+            base_item = provider.get_best_return(
+                source=source,
+                destination=destination,
+                outbound_iso=outbound_iso,
+                inbound_iso=inbound_iso,
+                currency=config.currency,
+                max_stops_per_leg=config.max_stops_per_leg,
+                adults=config.passengers.adults,
+                hand_bags=0,
+                hold_bags=0,
+                max_connection_layover_seconds=max_connection_layover_seconds,
+            )
+            item = self._merge_baggage_compared_fares(item, base_item)
+        return item
+
+    @staticmethod
+    def _mark_selected_provider_quotes(
+        quotes: list[dict[str, Any]],
+        *,
+        selected_provider: str,
+        selected_price: int | None,
+    ) -> list[dict[str, Any]]:
+        """Return provider quotes annotated with which quote won the final result."""
+        normalized_provider = str(selected_provider or "").strip().lower()
+        normalized_price = SplitTripOptimizer._as_int(selected_price)
+        out: list[dict[str, Any]] = []
+        selected_found = False
+        for quote in quotes:
+            candidate = dict(quote)
+            matches_selected = (
+                normalized_provider
+                and str(candidate.get("provider") or "").strip().lower() == normalized_provider
+                and SplitTripOptimizer._as_int(candidate.get("price")) == normalized_price
+            )
+            if matches_selected and not selected_found:
+                candidate["selected"] = True
+                selected_found = True
+            else:
+                candidate["selected"] = False
+            out.append(candidate)
+        return out
+
+    def _attach_provider_quotes_to_results(
+        self,
+        results: list[dict[str, Any]],
+        *,
+        oneway_quotes: dict[tuple[str, str, str], list[dict[str, Any]]],
+        return_quotes: dict[tuple[str, str, str, str], list[dict[str, Any]]],
+    ) -> dict[str, Any]:
+        """Attach provider quote alternatives to already-built results."""
+        total_quote_entries = 0
+        results_with_quotes = 0
+        quote_providers: set[str] = set()
+        for item in results:
+            item_quote_count = 0
+            itinerary_type = str(item.get("itinerary_type") or "").strip().lower()
+            if itinerary_type == "direct_roundtrip":
+                return_key = (
+                    str((item.get("outbound") or {}).get("origin") or item.get("origin") or "")
+                    .strip()
+                    .upper(),
+                    str(item.get("destination_code") or "").strip().upper(),
+                    str((item.get("outbound") or {}).get("date_from_origin") or "")[:10],
+                    str((item.get("inbound") or {}).get("date_from_destination") or "")[:10],
+                )
+                quotes = return_quotes.get(return_key) or []
+                if quotes:
+                    marked_quotes = self._mark_selected_provider_quotes(
+                        quotes,
+                        selected_provider=str(item.get("provider") or ""),
+                        selected_price=self._as_int(item.get("total_price")),
+                    )
+                    item["provider_quotes"] = marked_quotes
+                    item_quote_count += len(marked_quotes)
+                    quote_providers.update(
+                        str(quote.get("provider") or "").strip().lower()
+                        for quote in marked_quotes
+                        if str(quote.get("provider") or "").strip()
+                    )
+            for leg in item.get("legs") or []:
+                if str(leg.get("ticket_type") or "").strip().lower() == "roundtrip":
+                    continue
+                oneway_key = (
+                    str(leg.get("source") or "").strip().upper(),
+                    str(leg.get("destination") or "").strip().upper(),
+                    str(leg.get("date") or "")[:10],
+                )
+                quotes = oneway_quotes.get(oneway_key) or []
+                if not quotes:
+                    continue
+                marked_quotes = self._mark_selected_provider_quotes(
+                    quotes,
+                    selected_provider=str(leg.get("provider") or ""),
+                    selected_price=self._as_int(leg.get("price")),
+                )
+                leg["provider_quotes"] = marked_quotes
+                item_quote_count += len(marked_quotes)
+                quote_providers.update(
+                    str(quote.get("provider") or "").strip().lower()
+                    for quote in marked_quotes
+                    if str(quote.get("provider") or "").strip()
+                )
+            if item_quote_count > 0:
+                results_with_quotes += 1
+                total_quote_entries += item_quote_count
+                item["provider_quote_count"] = item_quote_count
+                item["provider_quote_providers"] = sorted(
+                    {
+                        str(quote.get("provider") or "").strip().lower()
+                        for quote in (item.get("provider_quotes") or [])
+                        if str(quote.get("provider") or "").strip()
+                    }
+                    | {
+                        str(quote.get("provider") or "").strip().lower()
+                        for leg in (item.get("legs") or [])
+                        for quote in ((leg or {}).get("provider_quotes") or [])
+                        if str(quote.get("provider") or "").strip()
+                    }
+                )
+        return {
+            "results_with_quotes": results_with_quotes,
+            "total_quote_entries": total_quote_entries,
+            "providers": sorted(provider_id for provider_id in quote_providers if provider_id),
+        }
+
+    async def _collect_visible_provider_quotes(
+        self,
+        *,
+        search_client: MultiProviderClient,
+        results: list[dict[str, Any]],
+        config: SearchConfig,
+        io_pool: ThreadPoolExecutor,
+        max_connection_layover_seconds: int | None,
+    ) -> dict[str, Any]:
+        """Collect free-provider quote alternatives for the final visible results."""
+        free_provider_ids = tuple(
+            provider_id
+            for provider_id in search_client.active_provider_ids
+            if str(provider_id or "").strip().lower() in _FREE_PROVIDER_IDS
+        )
+        if len(free_provider_ids) < 2 or not results:
+            return {
+                "results_with_quotes": 0,
+                "total_quote_entries": 0,
+                "providers": [],
+                "oneway_keys_enriched": 0,
+                "return_keys_enriched": 0,
+            }
+
+        ordered_oneway_keys: list[tuple[str, str, str]] = []
+        seen_oneway_keys: set[tuple[str, str, str]] = set()
+        ordered_return_keys: list[tuple[str, str, str, str]] = []
+        seen_return_keys: set[tuple[str, str, str, str]] = set()
+
+        for item in results:
+            itinerary_type = str(item.get("itinerary_type") or "").strip().lower()
+            if itinerary_type == "direct_roundtrip":
+                return_key = (
+                    str((item.get("outbound") or {}).get("origin") or item.get("origin") or "")
+                    .strip()
+                    .upper(),
+                    str(item.get("destination_code") or "").strip().upper(),
+                    str((item.get("outbound") or {}).get("date_from_origin") or "")[:10],
+                    str((item.get("inbound") or {}).get("date_from_destination") or "")[:10],
+                )
+                if all(return_key) and return_key not in seen_return_keys:
+                    seen_return_keys.add(return_key)
+                    ordered_return_keys.append(return_key)
+                continue
+            for leg in item.get("legs") or []:
+                if str(leg.get("ticket_type") or "").strip().lower() == "roundtrip":
+                    continue
+                oneway_key = (
+                    str(leg.get("source") or "").strip().upper(),
+                    str(leg.get("destination") or "").strip().upper(),
+                    str(leg.get("date") or "")[:10],
+                )
+                if all(oneway_key) and oneway_key not in seen_oneway_keys:
+                    seen_oneway_keys.add(oneway_key)
+                    ordered_oneway_keys.append(oneway_key)
+
+        ordered_oneway_keys = ordered_oneway_keys[:120]
+        ordered_return_keys = ordered_return_keys[:60]
+
+        loop = asyncio.get_running_loop()
+        sem = asyncio.Semaphore(bounded_io_concurrency(min(config.io_workers, 8)))
+        oneway_quotes: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+        return_quotes: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
+
+        async def fetch_oneway_quotes(key: tuple[str, str, str]) -> None:
+            source, destination, date_iso = key
+            async with sem:
+                quotes: list[dict[str, Any]] = []
+                for provider_id in free_provider_ids:
+                    provider = search_client.provider_for_id(provider_id)
+                    if provider is None:
+                        continue
+                    try:
+                        fare = await loop.run_in_executor(
+                            io_pool,
+                            partial(
+                                self._fetch_provider_specific_oneway_fare,
+                                provider=provider,
+                                provider_id=provider_id,
+                                source=source,
+                                destination=destination,
+                                date_iso=date_iso,
+                                config=config,
+                                max_connection_layover_seconds=max_connection_layover_seconds,
+                            ),
+                        )
+                    except Exception:
+                        continue
+                    quote = self._oneway_fare_to_quote_summary(fare or {})
+                    if quote:
+                        quotes.append(quote)
+                if quotes:
+                    oneway_quotes[key] = self._sorted_provider_quotes(quotes)
+
+        async def fetch_return_quotes(key: tuple[str, str, str, str]) -> None:
+            source, destination, outbound_iso, inbound_iso = key
+            async with sem:
+                quotes: list[dict[str, Any]] = []
+                for provider_id in free_provider_ids:
+                    provider = search_client.provider_for_id(provider_id)
+                    if provider is None:
+                        continue
+                    try:
+                        fare = await loop.run_in_executor(
+                            io_pool,
+                            partial(
+                                self._fetch_provider_specific_return_fare,
+                                provider=provider,
+                                provider_id=provider_id,
+                                source=source,
+                                destination=destination,
+                                outbound_iso=outbound_iso,
+                                inbound_iso=inbound_iso,
+                                config=config,
+                                max_connection_layover_seconds=max_connection_layover_seconds,
+                            ),
+                        )
+                    except Exception:
+                        continue
+                    quote = self._return_fare_to_quote_summary(fare or {})
+                    if quote:
+                        quotes.append(quote)
+                if quotes:
+                    return_quotes[key] = self._sorted_provider_quotes(quotes)
+
+        await asyncio.gather(
+            *(fetch_oneway_quotes(key) for key in ordered_oneway_keys),
+            *(fetch_return_quotes(key) for key in ordered_return_keys),
+        )
+        summary = self._attach_provider_quotes_to_results(
+            results,
+            oneway_quotes=oneway_quotes,
+            return_quotes=return_quotes,
+        )
+        summary["oneway_keys_enriched"] = len(oneway_quotes)
+        summary["return_keys_enriched"] = len(return_quotes)
+        return summary
 
     def _build_split_candidate_with_inner_return_bundle(
         self,
@@ -3683,11 +4591,29 @@ class SplitTripOptimizer:
                     candidate["depart_origin_date"],
                     candidate["return_origin_date"],
                 )
+                direct_leg_keys = (
+                    (
+                        candidate["origin"],
+                        candidate["destination"],
+                        candidate["depart_origin_date"],
+                    ),
+                    (
+                        candidate["destination"],
+                        candidate["arrival_origin"],
+                        candidate["return_origin_date"],
+                    ),
+                )
                 candidate["_direct_return_key"] = direct_return_key
+                candidate["_leg_keys"] = direct_leg_keys
                 unique_return_keys.add(direct_return_key)
                 prev_return_rank = return_rank_score.get(direct_return_key)
                 if prev_return_rank is None or estimated_total < prev_return_rank:
                     return_rank_score[direct_return_key] = estimated_total
+                for leg_key in direct_leg_keys:
+                    unique_leg_keys.add(leg_key)
+                    prev_leg_rank = leg_rank_score.get(leg_key)
+                    if prev_leg_rank is None or estimated_total < prev_leg_rank:
+                        leg_rank_score[leg_key] = estimated_total
                 continue
 
             split_plans = self._candidate_split_plans(candidate)
@@ -3761,8 +4687,26 @@ class SplitTripOptimizer:
                 f"{destination}: capped return key validations by budget ({dropped} dropped)."
             )
 
-        oneway_provider_map: dict[tuple[str, str, str], tuple[str, ...]] = {}
-        return_provider_map: dict[tuple[str, str, str, str], tuple[str, ...]] = {}
+        route_support_cache: dict[tuple[str, str, str], bool] = {}
+        oneway_provider_map: dict[tuple[str, str, str], tuple[str, ...]] = {
+            leg_key: self._route_aware_provider_scope(
+                core_provider_ids,
+                source=str(leg_key[0]),
+                destination=str(leg_key[1]),
+                support_cache=route_support_cache,
+            )
+            for leg_key in ordered_oneway_keys
+        }
+        return_provider_map: dict[tuple[str, str, str, str], tuple[str, ...]] = {
+            return_key: self._route_aware_provider_scope(
+                core_provider_ids,
+                source=str(return_key[0]),
+                destination=str(return_key[1]),
+                roundtrip=True,
+                support_cache=route_support_cache,
+            )
+            for return_key in ordered_return_keys
+        }
         if serpapi_active and "serpapi" not in core_provider_ids and core_provider_ids:
             serpapi_probe_oneway_keys = max(0, config.serpapi_probe_oneway_keys)
             serpapi_probe_return_keys = max(0, config.serpapi_probe_return_keys)
@@ -3774,7 +4718,6 @@ class SplitTripOptimizer:
                         f"{destination}: SerpApi probes were 0; auto-enabled lightweight probes "
                         f"({serpapi_probe_oneway_keys} one-way, {serpapi_probe_return_keys} return)."
                     )
-            provider_with_serpapi = tuple(dict.fromkeys((*core_provider_ids, "serpapi")))
             probe_leg_count = min(
                 len(ordered_oneway_keys),
                 serpapi_probe_oneway_keys,
@@ -3786,12 +4729,18 @@ class SplitTripOptimizer:
             top_leg_keys = set(ordered_oneway_keys[:probe_leg_count])
             top_return_keys = set(ordered_return_keys[:probe_return_count])
             for leg_key in ordered_oneway_keys:
+                scoped_provider_ids = oneway_provider_map.get(leg_key, core_provider_ids)
                 oneway_provider_map[leg_key] = (
-                    provider_with_serpapi if leg_key in top_leg_keys else core_provider_ids
+                    tuple(dict.fromkeys((*scoped_provider_ids, "serpapi")))
+                    if leg_key in top_leg_keys
+                    else scoped_provider_ids
                 )
             for return_key in ordered_return_keys:
+                scoped_provider_ids = return_provider_map.get(return_key, core_provider_ids)
                 return_provider_map[return_key] = (
-                    provider_with_serpapi if return_key in top_return_keys else core_provider_ids
+                    tuple(dict.fromkeys((*scoped_provider_ids, "serpapi")))
+                    if return_key in top_return_keys
+                    else scoped_provider_ids
                 )
             warnings.append(
                 f"{destination}: SerpApi probe scope {probe_leg_count} one-way keys and "
@@ -4084,8 +5033,96 @@ class SplitTripOptimizer:
         )
         discovered: dict[tuple[str, str], dict[str, int]] = {}
         warnings: list[str] = []
+        route_support_cache: dict[tuple[str, str, str], bool] = {}
+        calendar_provider_ids = tuple(
+            provider_id
+            for provider_id in provider_ids
+            if bool(
+                getattr(
+                    search_client.provider_for_id(provider_id),
+                    "supports_calendar",
+                    False,
+                )
+            )
+        )
+        exact_provider_ids = tuple(
+            provider_id for provider_id in provider_ids if provider_id not in calendar_provider_ids
+        )
+
+        async def probe_calendar_route(
+            source: str,
+            target: str,
+            dates: tuple[str, ...],
+        ) -> None:
+            if not calendar_provider_ids or not dates:
+                return
+            date_start_iso = min(str(date_iso) for date_iso in dates)
+            date_end_iso = max(str(date_iso) for date_iso in dates)
+            scoped_calendar_provider_ids = tuple(
+                provider_id
+                for provider_id in self._route_aware_provider_scope(
+                    calendar_provider_ids,
+                    source=source,
+                    destination=target,
+                    support_cache=route_support_cache,
+                )
+                if provider_id in calendar_provider_ids
+            )
+            if not scoped_calendar_provider_ids:
+                return
+            async with sem:
+                try:
+                    fn = partial(
+                        search_client.get_calendar_prices,
+                        source=source,
+                        destination=target,
+                        date_start_iso=date_start_iso,
+                        date_end_iso=date_end_iso,
+                        currency=config.currency,
+                        max_stops_per_leg=config.max_stops_per_leg,
+                        adults=config.passengers.adults,
+                        hand_bags=config.passengers.hand_bags,
+                        hold_bags=config.passengers.hold_bags,
+                        provider_ids=scoped_calendar_provider_ids,
+                    )
+                    prices = await loop.run_in_executor(io_pool, fn)
+                except Exception as exc:
+                    warnings.append(
+                        f"Coverage audit discovery failed {source}->{target} "
+                        f"{date_start_iso}/{date_end_iso}: {exc}"
+                    )
+                    return
+                if not isinstance(prices, dict):
+                    return
+                route_key = (source, target)
+                route_prices: dict[str, int] = {}
+                for raw_date_iso, raw_price in prices.items():
+                    date_iso = str(raw_date_iso or "")[:10]
+                    if not date_iso:
+                        continue
+                    price = self._as_int(raw_price)
+                    if price is None or price <= 0:
+                        continue
+                    current = route_prices.get(date_iso)
+                    if current is None or price < current:
+                        route_prices[date_iso] = price
+                if not route_prices:
+                    return
+                existing_route_prices = discovered.setdefault(route_key, {})
+                for date_iso, price in route_prices.items():
+                    current = existing_route_prices.get(date_iso)
+                    if current is None or price < current:
+                        existing_route_prices[date_iso] = price
 
         async def probe_date(source: str, target: str, date_iso: str) -> None:
+            scoped_exact_provider_ids = self._route_aware_provider_scope(
+                exact_provider_ids,
+                source=source,
+                destination=target,
+                support_cache=route_support_cache,
+            )
+            if not scoped_exact_provider_ids:
+                return
             async with sem:
                 try:
                     fn = partial(
@@ -4099,7 +5136,7 @@ class SplitTripOptimizer:
                         hand_bags=config.passengers.hand_bags,
                         hold_bags=config.passengers.hold_bags,
                         max_connection_layover_seconds=max_connection_layover_seconds,
-                        provider_ids=provider_ids,
+                        provider_ids=scoped_exact_provider_ids,
                     )
                     item = await loop.run_in_executor(io_pool, fn)
                 except Exception as exc:
@@ -4120,10 +5157,14 @@ class SplitTripOptimizer:
 
         await asyncio.gather(
             *(
+                probe_calendar_route(source, target, dates)
+                for (source, target), dates in route_dates.items()
+            ),
+            *(
                 probe_date(source, target, date_iso)
                 for (source, target), dates in route_dates.items()
                 for date_iso in dates
-            )
+            ),
         )
         return discovered, warnings
 
@@ -4251,9 +5292,19 @@ class SplitTripOptimizer:
         )
         discovered: dict[tuple[str, str, str, str], dict[str, Any]] = {}
         warnings: list[str] = []
+        route_support_cache: dict[tuple[str, str, str], bool] = {}
 
         async def probe_return(return_key: tuple[str, str, str, str]) -> None:
             source, target, outbound_iso, inbound_iso = return_key
+            scoped_provider_ids = self._route_aware_provider_scope(
+                provider_ids,
+                source=source,
+                destination=target,
+                roundtrip=True,
+                support_cache=route_support_cache,
+            )
+            if not scoped_provider_ids:
+                return
             async with sem:
                 try:
                     fn = partial(
@@ -4268,7 +5319,7 @@ class SplitTripOptimizer:
                         hand_bags=config.passengers.hand_bags,
                         hold_bags=config.passengers.hold_bags,
                         max_connection_layover_seconds=max_connection_layover_seconds,
-                        provider_ids=provider_ids,
+                        provider_ids=scoped_provider_ids,
                     )
                     item = await loop.run_in_executor(io_pool, fn)
                 except Exception as exc:
@@ -4714,9 +5765,7 @@ class SplitTripOptimizer:
         provider_ids = tuple(
             provider_id
             for provider_id in search_client.active_provider_ids
-            if provider_id in _FREE_PROVIDER_IDS
-            and provider_id != "kiwi"
-            and not bool(getattr(self.providers.get(provider_id), "supports_calendar", True))
+            if provider_id in _FREE_PROVIDER_IDS and provider_id != "kiwi"
         )
         if progress is not None:
             progress.set_runtime_data(
@@ -5230,11 +6279,11 @@ class SplitTripOptimizer:
 
         selected = dict(selected_item) if selected_item else None
         if selected:
-            selected["fare_mode"] = "selected_bags"
+            selected["fare_mode"] = selected.get("fare_mode") or "selected_bags"
 
         base = dict(base_item) if base_item else None
         if base:
-            base["fare_mode"] = "base_no_bags"
+            base["fare_mode"] = base.get("fare_mode") or "base_no_bags"
 
         if selected and base:
             selected["base_no_bags_price"] = base.get("price")
@@ -5602,7 +6651,6 @@ class SplitTripOptimizer:
             destination_total_chunks[destination] = destination_total_chunks.get(destination, 0) + 1
 
         if config.cpu_workers <= 1 or len(chunk_specs) == 1:
-            out: dict[str, list[dict[str, Any]]] = {}
             partial_batches: dict[str, list[list[dict[str, Any]]]] = {}
             completed_chunks = 0
             destination_completed_chunks: dict[str, int] = {}
@@ -5629,27 +6677,14 @@ class SplitTripOptimizer:
                             f"finished, latest {destination} {chunk['chunk_label']})."
                         ),
                     )
-            for destination, batches in partial_batches.items():
-                merged = [candidate for batch in batches for candidate in batch]
-                task_meta = compact_tasks[destination]
-                out[destination] = _finalize_estimated_candidates(
-                    merged,
-                    objective=str(task_meta["objective"]),
-                    max_candidates=int(task_meta["max_candidates"]),
-                    max_direct_candidates=int(task_meta["max_direct_candidates"]),
-                )
-            return out
+            return _merge_chunk_batches(partial_batches, compact_tasks)
 
         loop = asyncio.get_running_loop()
         results: dict[str, list[dict[str, Any]]] = {}
         partial_batches: dict[str, list[list[dict[str, Any]]]] = {}
         futures: list[asyncio.Task[tuple[str, list[dict[str, Any]]]]] = []
 
-        cpu_pool = ProcessPoolExecutor(
-            max_workers=min(config.cpu_workers, len(chunk_specs)),
-            initializer=_candidate_worker_init,
-            initargs=(compact_tasks,),
-        )
+        cpu_pool = ProcessPoolExecutor(max_workers=min(config.cpu_workers, len(chunk_specs)))
         wait_for_shutdown = True
         try:
 
@@ -5682,15 +6717,44 @@ class SplitTripOptimizer:
                             f"finished, latest {destination})."
                         ),
                     )
-            for destination, batches in partial_batches.items():
-                merged = [candidate for batch in batches for candidate in batch]
-                task_meta = compact_tasks[destination]
-                results[destination] = _finalize_estimated_candidates(
-                    merged,
-                    objective=str(task_meta["objective"]),
-                    max_candidates=int(task_meta["max_candidates"]),
-                    max_direct_candidates=int(task_meta["max_direct_candidates"]),
+            results = _merge_chunk_batches(partial_batches, compact_tasks)
+        except (BrokenProcessPool, MemoryError):
+            wait_for_shutdown = False
+            for future in futures:
+                future.cancel()
+            cpu_pool.shutdown(wait=False, cancel_futures=True)
+            if progress is not None:
+                progress.log_message(
+                    "Candidate scorer hit process-pool memory pressure; retrying in-process.",
+                    phase="candidates",
                 )
+            partial_batches = {}
+            completed_chunks = 0
+            destination_completed_chunks = {}
+            for chunk in chunk_specs:
+                destination, batch = _estimate_candidates_for_chunk(chunk)
+                partial_batches.setdefault(destination, []).append(batch)
+                destination_completed_chunks[destination] = (
+                    destination_completed_chunks.get(destination, 0) + 1
+                )
+                completed_chunks += 1
+                if progress is not None:
+                    finished_destinations = sum(
+                        1
+                        for key, total in destination_total_chunks.items()
+                        if destination_completed_chunks.get(key, 0) >= total
+                    )
+                    progress.advance_phase(
+                        "candidates",
+                        completed=completed_chunks,
+                        total=len(chunk_specs),
+                        detail=(
+                            f"Scored {completed_chunks}/{len(chunk_specs)} candidate chunks "
+                            f"({finished_destinations}/{len(destination_total_chunks)} destinations "
+                            f"finished, latest {destination} {chunk['chunk_label']})."
+                        ),
+                    )
+            results = _merge_chunk_batches(partial_batches, compact_tasks)
         except asyncio.CancelledError:
             wait_for_shutdown = False
             for future in futures:
@@ -6162,6 +7226,7 @@ class SplitTripOptimizer:
         total_return_trips = 0
         filtered_by_connection_layover = 0
         filtered_invalid_split_boundaries = 0
+        filtered_by_time_window = 0
         base_fare_selected_oneways = 0
         base_fare_selected_returns = 0
         max_connection_layover_seconds = (
@@ -6428,6 +7493,24 @@ class SplitTripOptimizer:
                     )
                     direct_trip_meta = return_trip_cache.get(direct_return_key)
                     if not direct_trip_meta:
+                        fallback_direct_result = self._build_direct_roundtrip_from_oneways(
+                            candidate=candidate,
+                            oneway_cache=oneway_entry_cache,
+                            config=config,
+                            distance_basis_km=distance_basis_km,
+                            destination_name=destination_name,
+                            notes=notes,
+                            max_connection_layover_seconds=max_connection_layover_seconds,
+                            comparison_links=cached_comparison_links(
+                                candidate["origin"],
+                                candidate["destination"],
+                                candidate["depart_origin_date"],
+                                candidate["return_origin_date"],
+                            ),
+                        )
+                        if fallback_direct_result is None:
+                            continue
+                        all_results.append(fallback_direct_result)
                         continue
                     direct_trip = direct_trip_meta["fare"]
 
@@ -7335,6 +8418,13 @@ class SplitTripOptimizer:
                 total=1,
                 detail="Ranking final results and packaging the response.",
             )
+        if all_results:
+            before_time_filter_count = len(all_results)
+            all_results = [
+                item for item in all_results if self._result_matches_time_windows(item, config)
+            ]
+            filtered_by_time_window = before_time_filter_count - len(all_results)
+
         all_results, dominated_removed = self._prune_dominated_split_results(all_results)
         if dominated_removed > 0:
             warnings.append(
@@ -7359,6 +8449,11 @@ class SplitTripOptimizer:
                 "Filtered "
                 f"{filtered_by_connection_layover} itineraries exceeding max connection layover "
                 f"of {config.max_connection_layover_hours}h."
+            )
+        if filtered_by_time_window > 0:
+            warnings.append(
+                "Filtered "
+                f"{filtered_by_time_window} itineraries outside the selected departure/arrival time windows."
             )
         if filtered_invalid_split_boundaries > 0:
             min_same_h = round(
@@ -7500,6 +8595,13 @@ class SplitTripOptimizer:
             config.top_results,
             config.destinations,
             required_by_destination=required_results_by_destination or None,
+        )
+        visible_provider_quotes = await self._collect_visible_provider_quotes(
+            search_client=search_client,
+            results=trimmed,
+            config=config,
+            io_pool=io_pool,
+            max_connection_layover_seconds=max_connection_layover_seconds,
         )
 
         provider_stats = search_client.stats_snapshot()
@@ -7687,6 +8789,7 @@ class SplitTripOptimizer:
                     "market_compare_fares": config.market_compare_fares,
                     "top_results_per_destination": config.top_results,
                     "results_count_by_destination": per_destination_counts,
+                    "visible_provider_quotes": visible_provider_quotes,
                     "max_transfers_per_direction": config.max_transfers_per_direction,
                     "max_stops_per_leg": config.max_stops_per_leg,
                     "base_fare_selected_oneways": base_fare_selected_oneways,
@@ -7694,6 +8797,25 @@ class SplitTripOptimizer:
                     "long_stopover_results": long_stopover_count,
                     "max_connection_layover_hours": config.max_connection_layover_hours,
                     "filtered_by_connection_layover": filtered_by_connection_layover,
+                    "filtered_by_time_window": filtered_by_time_window,
+                    "time_windows": {
+                        "outbound_departure": [
+                            config.outbound_departure_time_start,
+                            config.outbound_departure_time_end,
+                        ],
+                        "outbound_arrival": [
+                            config.outbound_arrival_time_start,
+                            config.outbound_arrival_time_end,
+                        ],
+                        "return_departure": [
+                            config.return_departure_time_start,
+                            config.return_departure_time_end,
+                        ],
+                        "return_arrival": [
+                            config.return_arrival_time_start,
+                            config.return_arrival_time_end,
+                        ],
+                    },
                     "filtered_invalid_split_boundaries": filtered_invalid_split_boundaries,
                     "min_split_connection_same_airport_hours": round(
                         MIN_SPLIT_CONNECTION_SAME_AIRPORT_SECONDS / SECONDS_PER_HOUR,
@@ -7790,10 +8912,10 @@ class SplitTripOptimizer:
                 "search_failed",
                 search_id=search_id,
                 elapsed_seconds=elapsed_seconds,
-                error=str(exc),
+                error=exception_message(exc),
             )
             if progress is not None:
-                progress.mark_failed(str(exc))
+                progress.mark_failed(exception_message(exc))
             raise
         finally:
             if wait_for_shutdown:

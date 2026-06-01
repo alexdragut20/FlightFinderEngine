@@ -16,6 +16,7 @@ from ..utils.constants import (
     SEARCH_STATUS_QUEUED,
     SEARCH_STATUS_RUNNING,
 )
+from ..utils.logging import exception_message
 from .progress import SearchProgressTracker
 
 
@@ -140,7 +141,7 @@ class SearchJobStore:
             self._update_job(
                 job_id,
                 status=SEARCH_STATUS_FAILED,
-                error=str(exc),
+                error=exception_message(exc),
                 finished_at=time.time(),
             )
             return

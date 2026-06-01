@@ -566,6 +566,9 @@ function formatPriceModeLabel(mode) {
   if (!normalized) return "";
   if (normalized === "explicit_total") return "explicit total from provider";
   if (normalized === "per_person_scaled") return "per-person fare scaled to total travelers";
+  if (normalized === "base_per_adult_scaled_converted") {
+    return "base fare scaled to adults and converted";
+  }
   if (normalized === "displayed") return "provider displayed fare";
   if (normalized === "missing_price") return "missing provider price";
   return normalized.replaceAll("_", " ");
@@ -1039,6 +1042,12 @@ function buildPdfReportHtml() {
     payload.max_connection_layover_hours && Number(payload.max_connection_layover_hours) > 0
       ? `${payload.max_connection_layover_hours}h`
       : "No cap";
+  const timeWindowSummary = [
+    `out dep ${payload.outbound_departure_time_start || "00:00"}-${payload.outbound_departure_time_end || "00:00"}`,
+    `out arr ${payload.outbound_arrival_time_start || "00:00"}-${payload.outbound_arrival_time_end || "00:00"}`,
+    `return dep ${payload.return_departure_time_start || "00:00"}-${payload.return_departure_time_end || "00:00"}`,
+    `return arr ${payload.return_arrival_time_start || "00:00"}-${payload.return_arrival_time_end || "00:00"}`,
+  ].join(", ");
   const criteria = [
     ["Origins", (payload.origins || []).join(", ") || "N/A"],
     ["Destinations", (payload.destinations || []).join(", ") || "N/A"],
@@ -1049,6 +1058,7 @@ function buildPdfReportHtml() {
     ["Rank by", objectiveLabels[payload.objective] || payload.objective || "Cheapest"],
     ["Max transfers/direction", payload.max_transfers_per_direction ?? "N/A"],
     ["Max connection layover", maxConnLayover],
+    ["Flight time windows", timeWindowSummary],
     [
       "Baggage profile",
       `${payload.passengers?.adults || 1} adult(s), cabin ${payload.passengers?.hand_bags || 0}, hold ${
@@ -1380,6 +1390,25 @@ function resolveWholeTripUrl(item, legs, comparisonLinks) {
   return legUrl || kiwiUrl || googleUrl || skyscannerUrl || kayakUrl || momondoUrl;
 }
 
+function formatProviderQuoteSummary(quotes, options = {}) {
+  if (!Array.isArray(quotes) || quotes.length < 2) return "";
+  const limit = Number.isFinite(Number(options.limit)) ? Math.max(1, Number(options.limit)) : 4;
+  const items = quotes.slice(0, limit).map((quote) => {
+    const provider = String(quote?.provider || "provider").toUpperCase();
+    const formatted =
+      quote?.formatted_price ||
+      (Number.isFinite(Number(quote?.price))
+        ? formatMoney(Number(quote.price), quote.currency || "")
+        : "N/A");
+    const selected = quote?.selected ? " selected" : "";
+    return `${provider} ${formatted}${selected}`;
+  });
+  if (quotes.length > limit) {
+    items.push(`+${quotes.length - limit} more`);
+  }
+  return items.join(" | ");
+}
+
 function renderLeg(leg, options = {}) {
   const showLink = options.showLink !== false;
   const bookingUrl = leg.booking_url || options.fallbackUrl || "https://www.kiwi.com/en/search/results/";
@@ -1421,6 +1450,10 @@ function renderLeg(leg, options = {}) {
     if (inboundLayovers.length > 0) {
       legDetails.push(`Inbound layovers: ${inboundLayovers.join(", ")}`);
     }
+    const providerQuoteSummary = formatProviderQuoteSummary(leg.provider_quotes);
+    if (providerQuoteSummary) {
+      legDetails.push(`Other provider quotes: ${providerQuoteSummary}`);
+    }
     node.querySelector(".leg-segments").textContent = legDetails.join("\n");
   } else {
     const route = `${leg.source} -> ${leg.destination} (${formatDateLabel(leg.date)})`;
@@ -1448,6 +1481,10 @@ function renderLeg(leg, options = {}) {
     const legDetails = [segmentText || "No segment details"];
     if (layovers.length > 0) {
       legDetails.push(`Layovers: ${layovers.join(", ")}`);
+    }
+    const providerQuoteSummary = formatProviderQuoteSummary(leg.provider_quotes);
+    if (providerQuoteSummary) {
+      legDetails.push(`Other provider quotes: ${providerQuoteSummary}`);
     }
     node.querySelector(".leg-segments").textContent = legDetails.join("\n");
   }
@@ -1546,6 +1583,13 @@ function renderResultCard(item) {
   const providerLine = fareProviders.length > 0
     ? `Fare provider(s): ${fareProviders.join(", ")}.`
     : "Fare provider(s): unknown.";
+  const wholeTripQuoteLine = formatProviderQuoteSummary(item.provider_quotes)
+    ? `Whole-trip provider quotes: ${formatProviderQuoteSummary(item.provider_quotes)}.`
+    : "";
+  const visibleQuoteCountLine = Number.isFinite(Number(item.provider_quote_count)) &&
+      Number(item.provider_quote_count) > 0
+    ? `Visible provider quotes retained: ${item.provider_quote_count}.`
+    : "";
   const adults = Number.parseInt(
     item.passengers_adults ?? lastSearchPayload?.passengers?.adults ?? 1,
     10,
@@ -1574,6 +1618,8 @@ function renderResultCard(item) {
     stayLine,
     fareModeLine,
     providerLine,
+    wholeTripQuoteLine,
+    visibleQuoteCountLine,
     perAdultLine,
     priceModeLine,
     pricingStrategyLine,
@@ -1813,6 +1859,14 @@ function collectPayload() {
     max_stopover_days: asInt("max-stopover"),
     max_connection_layover_hours: asInt("max-connection-layover-hours"),
     max_transfers_per_direction: maxTransfers,
+    outbound_departure_time_start: document.getElementById("outbound-departure-time-start").value || "00:00",
+    outbound_departure_time_end: document.getElementById("outbound-departure-time-end").value || "00:00",
+    outbound_arrival_time_start: document.getElementById("outbound-arrival-time-start").value || "00:00",
+    outbound_arrival_time_end: document.getElementById("outbound-arrival-time-end").value || "00:00",
+    return_departure_time_start: document.getElementById("return-departure-time-start").value || "00:00",
+    return_departure_time_end: document.getElementById("return-departure-time-end").value || "00:00",
+    return_arrival_time_start: document.getElementById("return-arrival-time-start").value || "00:00",
+    return_arrival_time_end: document.getElementById("return-arrival-time-end").value || "00:00",
     // Backward-compatible keys consumed by older server builds:
     max_stops_per_leg: maxTransfers,
     max_layovers_per_direction: maxTransfers,
@@ -1958,10 +2012,17 @@ async function runSearch(event) {
       const engine = meta?.engine || {};
       const maxConnHours = engine.max_connection_layover_hours;
       const filteredByConnection = engine.filtered_by_connection_layover || 0;
+      const filteredByTimeWindow = engine.filtered_by_time_window || 0;
       if (filteredByConnection > 0 && maxConnHours != null) {
         hints.push(
           `${filteredByConnection} itineraries were removed by max connection layover ${maxConnHours}h. ` +
           "Increase this cap or set 0 (no cap).",
+        );
+      }
+      if (filteredByTimeWindow > 0) {
+        hints.push(
+          `${filteredByTimeWindow} itineraries were removed by departure/arrival time windows. ` +
+          "Set all time windows to 00:00-00:00 to disable time filtering.",
         );
       }
       if (meta?.period_start && meta?.period_end) {
