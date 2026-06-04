@@ -106,7 +106,7 @@ function parseCodes(input) {
   return input
     .split(",")
     .map((item) => item.trim().toUpperCase())
-    .filter(Boolean);
+    .filter((item) => /^[A-Z]{3}$/.test(item));
 }
 
 function parseProviderIds(input) {

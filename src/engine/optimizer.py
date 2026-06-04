@@ -3099,6 +3099,194 @@ class SplitTripOptimizer:
             ],
         }
 
+    def _build_direct_roundtrip_from_return_meta(
+        self,
+        *,
+        candidate: dict[str, Any],
+        direct_trip_meta: dict[str, Any],
+        config: SearchConfig,
+        distance_basis_km: float | None,
+        destination_name: str,
+        notes: dict[str, str],
+        max_connection_layover_seconds: int | None,
+        comparison_links: dict[str, str],
+        allow_transfer_over_cap: bool = False,
+        recovery_note: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Build a direct round-trip result from a validated bundled fare."""
+        direct_trip = dict(direct_trip_meta.get("fare") or {})
+        outbound_layovers = int(
+            direct_trip.get("outbound_transfer_events") or direct_trip.get("outbound_stops") or 0
+        )
+        inbound_layovers = int(
+            direct_trip.get("inbound_transfer_events") or direct_trip.get("inbound_stops") or 0
+        )
+        if not allow_transfer_over_cap and (
+            outbound_layovers > config.max_layovers_per_direction
+            or inbound_layovers > config.max_layovers_per_direction
+        ):
+            return None
+
+        outbound_segments = direct_trip_meta.get("outbound_segments") or []
+        inbound_segments = direct_trip_meta.get("inbound_segments") or []
+        if self._exceeds_connection_layover_limit(
+            outbound_segments,
+            max_connection_layover_seconds,
+        ) or self._exceeds_connection_layover_limit(
+            inbound_segments,
+            max_connection_layover_seconds,
+        ):
+            return None
+
+        outbound_leg_source = str(direct_trip_meta.get("outbound_source") or "")
+        outbound_leg_destination = str(direct_trip_meta.get("outbound_destination") or "")
+        inbound_leg_source = str(direct_trip_meta.get("inbound_source") or "")
+        inbound_leg_destination = str(direct_trip_meta.get("inbound_destination") or "")
+        if not self._leg_matches_expected_route(
+            outbound_leg_source,
+            outbound_leg_destination,
+            candidate["origin"],
+            candidate["destination"],
+        ) or not self._leg_matches_expected_route(
+            inbound_leg_source,
+            inbound_leg_destination,
+            candidate["destination"],
+            candidate["arrival_origin"],
+        ):
+            return None
+
+        total_price = self._as_int(direct_trip.get("price"))
+        if total_price is None:
+            return None
+        score = self._score_candidate(
+            total_price,
+            distance_basis_km,
+            config.objective,
+        )
+        price_per_1000_km = (
+            round((total_price / distance_basis_km) * 1000.0, 1)
+            if distance_basis_km and distance_basis_km > 0
+            else None
+        )
+
+        outbound_time_to_destination_seconds = direct_trip_meta.get("outbound_duration_seconds")
+        inbound_time_to_origin_seconds = direct_trip_meta.get("inbound_duration_seconds")
+        out_transfers = self._transfer_airports(outbound_segments)
+        in_transfers = self._transfer_airports(inbound_segments)
+        roundtrip_url = kiwi_return_url(
+            outbound_leg_source,
+            outbound_leg_destination,
+            candidate["depart_origin_date"],
+            candidate["return_origin_date"],
+            config.max_stops_per_leg,
+        )
+        booking_url = direct_trip.get("booking_url") or roundtrip_url
+        legs = [
+            {
+                "source": outbound_leg_source,
+                "destination": outbound_leg_destination,
+                "date": candidate["depart_origin_date"],
+                "price": None,
+                "formatted_price": "Part of round-trip fare",
+                "stops": int(direct_trip.get("outbound_stops") or 0),
+                "segments": outbound_segments,
+                "duration_seconds": outbound_time_to_destination_seconds,
+                "departure_local": (
+                    outbound_segments[0].get("depart_local") if outbound_segments else None
+                ),
+                "arrival_local": (
+                    outbound_segments[-1].get("arrive_local") if outbound_segments else None
+                ),
+                "fare_mode": direct_trip.get("fare_mode", "selected_bags"),
+                "provider": direct_trip.get("provider", "kiwi"),
+                "price_mode": direct_trip.get("price_mode"),
+                "booking_url": booking_url,
+            },
+            {
+                "source": inbound_leg_source,
+                "destination": inbound_leg_destination,
+                "date": candidate["return_origin_date"],
+                "price": None,
+                "formatted_price": "Part of round-trip fare",
+                "stops": int(direct_trip.get("inbound_stops") or 0),
+                "segments": inbound_segments,
+                "duration_seconds": inbound_time_to_origin_seconds,
+                "departure_local": (
+                    inbound_segments[0].get("depart_local") if inbound_segments else None
+                ),
+                "arrival_local": (
+                    inbound_segments[-1].get("arrive_local") if inbound_segments else None
+                ),
+                "fare_mode": direct_trip.get("fare_mode", "selected_bags"),
+                "provider": direct_trip.get("provider", "kiwi"),
+                "price_mode": direct_trip.get("price_mode"),
+                "booking_url": booking_url,
+            },
+        ]
+        direct_price_mode = str(direct_trip.get("price_mode") or "").strip()
+        risk_notes = [
+            "Standard round-trip pricing can be lower than 2 separate one-ways.",
+            "Baggage and fare rules can differ by operating carrier.",
+        ]
+        if recovery_note:
+            risk_notes.insert(0, recovery_note)
+
+        result = {
+            "result_id": (
+                f"{candidate['destination']}|direct|{candidate['origin']}|"
+                f"{candidate['depart_origin_date']}|{candidate['return_origin_date']}"
+            ),
+            "itinerary_type": "direct_roundtrip",
+            "destination_code": candidate["destination"],
+            "destination_name": destination_name,
+            "destination_note": notes.get("note"),
+            "total_price": total_price,
+            "passengers_adults": int(config.passengers.adults),
+            "price_per_adult": round(total_price / max(1, int(config.passengers.adults)), 2),
+            "price_modes": [direct_price_mode] if direct_price_mode else [],
+            "currency": config.currency,
+            "formatted_total_price": direct_trip.get(
+                "formatted_price",
+                f"{total_price} {config.currency}",
+            ),
+            "price_per_1000_km": price_per_1000_km,
+            "distance_km": round(distance_basis_km, 1) if distance_basis_km else None,
+            "distance_basis": "direct_origin_to_destination",
+            "score": score,
+            "outbound_time_to_destination_seconds": outbound_time_to_destination_seconds,
+            "inbound_time_to_origin_seconds": inbound_time_to_origin_seconds,
+            "objective": config.objective,
+            "provider": direct_trip.get("provider", "kiwi"),
+            "outbound": {
+                "origin": candidate["origin"],
+                "hub": "/".join(out_transfers) if out_transfers else "DIRECT",
+                "transfer_airports": out_transfers,
+                "date_from_origin": candidate["depart_origin_date"],
+                "date_to_destination": candidate["depart_origin_date"],
+                "stopover_days": 0,
+                "layovers_count": outbound_layovers,
+                "provider": direct_trip.get("provider", "kiwi"),
+            },
+            "fare_mode": direct_trip.get("fare_mode", "selected_bags"),
+            "main_destination_stay_days": candidate["main_stay_days"],
+            "inbound": {
+                "hub": "/".join(in_transfers) if in_transfers else "DIRECT",
+                "transfer_airports": in_transfers,
+                "arrival_origin": candidate["arrival_origin"],
+                "date_from_destination": candidate["return_origin_date"],
+                "date_to_origin": candidate["return_origin_date"],
+                "stopover_days": 0,
+                "layovers_count": inbound_layovers,
+                "provider": direct_trip.get("provider", "kiwi"),
+            },
+            "comparison_links": comparison_links,
+            "legs": legs,
+            "risk_notes": risk_notes,
+        }
+        if recovery_note:
+            result["coverage_recovery"] = True
+        return result
+
     @staticmethod
     def _provider_quote_sort_key(quote: dict[str, Any]) -> tuple[int, int, int, str]:
         """Return a stable sort key for provider quote summaries."""
@@ -8468,6 +8656,188 @@ class SplitTripOptimizer:
                         "candidate itinerary checks."
                     ),
                 )
+
+        strict_result_destinations = {
+            str(item.get("destination_code") or "").strip().upper()
+            for item in all_results
+            if str(item.get("destination_code") or "").strip()
+        }
+        recovery_contexts = [
+            destination_context
+            for destination_context in prepared_destinations
+            if str(destination_context.get("destination") or "").strip().upper()
+            not in strict_result_destinations
+        ]
+        recovery_results_added = 0
+        if recovery_contexts and config.max_layovers_per_direction < 3:
+            recovery_provider_ids = tuple(
+                provider_id
+                for provider_id in (
+                    "kiwi",
+                    "amadeus",
+                    "travelpayouts",
+                    "serpapi",
+                    "azair",
+                    "ryanair",
+                )
+                if provider_id in active_provider_ids
+            )
+            if not recovery_provider_ids:
+                recovery_provider_ids = core_provider_ids
+
+            recovery_keys: list[tuple[str, str, str, str]] = []
+            recovery_key_seen: set[tuple[str, str, str, str]] = set()
+            recovery_candidates: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+            recovery_keys_by_destination: dict[str, list[tuple[str, str, str, str]]] = {}
+
+            for destination_context in recovery_contexts:
+                destination = str(destination_context.get("destination") or "").strip().upper()
+                direct_candidates_by_key: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+                for candidate in destination_context.get("limited_candidates") or []:
+                    candidate_type = str(
+                        candidate.get("_candidate_type")
+                        or candidate.get("candidate_type")
+                        or "split_stopover"
+                    )
+                    if candidate_type != "direct_roundtrip":
+                        continue
+                    direct_return_key = candidate.get("_direct_return_key") or (
+                        str(candidate.get("origin") or "").strip().upper(),
+                        str(candidate.get("destination") or destination).strip().upper(),
+                        str(candidate.get("depart_origin_date") or "")[:10],
+                        str(candidate.get("return_origin_date") or "")[:10],
+                    )
+                    if not all(direct_return_key):
+                        continue
+                    direct_candidates_by_key[direct_return_key] = candidate
+
+                for return_key in destination_context.get("ordered_return_keys") or []:
+                    normalized_key = tuple(str(value or "").strip() for value in return_key)
+                    if len(normalized_key) != 4:
+                        continue
+                    direct_candidate = direct_candidates_by_key.get(normalized_key)
+                    if direct_candidate is None:
+                        continue
+                    if normalized_key not in recovery_key_seen:
+                        recovery_key_seen.add(normalized_key)
+                        recovery_keys.append(normalized_key)
+                        recovery_candidates[normalized_key] = direct_candidate
+                    recovery_keys_by_destination.setdefault(destination, []).append(normalized_key)
+
+            if recovery_keys and recovery_provider_ids:
+                recovery_transfer_cap = 3
+                recovery_config = replace(
+                    config,
+                    max_transfers_per_direction=recovery_transfer_cap,
+                    max_stops_per_leg=recovery_transfer_cap,
+                    max_layovers_per_direction=recovery_transfer_cap,
+                )
+                recovery_provider_map = {
+                    return_key: recovery_provider_ids for return_key in recovery_keys
+                }
+                if progress is not None and not returns_phase_started:
+                    progress.start_phase(
+                        "returns",
+                        total=len(recovery_keys),
+                        detail="Recovering empty destinations with relaxed round-trip validation.",
+                    )
+                    returns_phase_started = True
+                (
+                    recovery_return_map,
+                    recovery_warnings,
+                    recovery_base_count,
+                ) = await self._fetch_returns_parallel(
+                    search_client,
+                    recovery_keys,
+                    recovery_config,
+                    io_pool,
+                    provider_map=recovery_provider_map,
+                    base_provider_ids=recovery_provider_ids,
+                    progress=progress,
+                    progress_completed_offset=total_return_trips,
+                    progress_total=total_return_trips + len(recovery_keys),
+                )
+                warnings.extend(recovery_warnings)
+                base_fare_selected_returns += recovery_base_count
+                total_return_trips += len(recovery_keys)
+                recovery_return_trip_cache = self._prepare_return_trip_cache(recovery_return_map)
+                recovery_note = (
+                    "Coverage recovery: no strict result survived for this destination, "
+                    f"so the engine relaxed the transfer cap to {recovery_transfer_cap} "
+                    "for this fallback option."
+                )
+                for destination_context in recovery_contexts:
+                    destination = str(destination_context.get("destination") or "").strip().upper()
+                    destination_name = str(destination_context["destination_name"])
+                    notes = destination_context["notes"]
+                    added_for_destination = 0
+                    relaxed_candidates: list[dict[str, Any]] = []
+                    for return_key in recovery_keys_by_destination.get(destination, []):
+                        direct_trip_meta = recovery_return_trip_cache.get(return_key)
+                        candidate = recovery_candidates.get(return_key)
+                        if not direct_trip_meta or candidate is None:
+                            continue
+                        strict_recovery_result = self._build_direct_roundtrip_from_return_meta(
+                            candidate=candidate,
+                            direct_trip_meta=direct_trip_meta,
+                            config=config,
+                            distance_basis_km=candidate.get("distance_basis_km"),
+                            destination_name=destination_name,
+                            notes=notes,
+                            max_connection_layover_seconds=max_connection_layover_seconds,
+                            comparison_links=cached_comparison_links(
+                                candidate["origin"],
+                                candidate["destination"],
+                                candidate["depart_origin_date"],
+                                candidate["return_origin_date"],
+                            ),
+                            allow_transfer_over_cap=False,
+                        )
+                        if strict_recovery_result is not None:
+                            all_results.append(strict_recovery_result)
+                            recovery_results_added += 1
+                            added_for_destination += 1
+                            if added_for_destination >= config.top_results:
+                                break
+                            continue
+
+                        relaxed_recovery_result = self._build_direct_roundtrip_from_return_meta(
+                            candidate=candidate,
+                            direct_trip_meta=direct_trip_meta,
+                            config=recovery_config,
+                            distance_basis_km=candidate.get("distance_basis_km"),
+                            destination_name=destination_name,
+                            notes=notes,
+                            max_connection_layover_seconds=max_connection_layover_seconds,
+                            comparison_links=cached_comparison_links(
+                                candidate["origin"],
+                                candidate["destination"],
+                                candidate["depart_origin_date"],
+                                candidate["return_origin_date"],
+                            ),
+                            allow_transfer_over_cap=True,
+                            recovery_note=recovery_note,
+                        )
+                        if relaxed_recovery_result is None:
+                            continue
+                        relaxed_candidates.append(relaxed_recovery_result)
+
+                    if added_for_destination <= 0:
+                        for recovery_result in relaxed_candidates:
+                            if added_for_destination >= config.top_results:
+                                break
+                            recovery_result["result_id"] = (
+                                f"{recovery_result['result_id']}|recovery"
+                            )
+                            all_results.append(recovery_result)
+                            recovery_results_added += 1
+                            added_for_destination += 1
+                if recovery_results_added > 0:
+                    warnings.append(
+                        "Coverage recovery added "
+                        f"{recovery_results_added} fallback itinerary option(s) for destinations "
+                        "that had no strict result."
+                    )
 
         if progress is not None:
             if returns_phase_started:

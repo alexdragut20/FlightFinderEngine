@@ -1330,6 +1330,118 @@ def test_search_builds_direct_and_standard_split_results_from_live_validation_pa
     assert totals["split_stopover"] == 1000
 
 
+def test_search_recovers_empty_destination_with_relaxed_transfer_cap() -> None:
+    def segment(
+        source: str,
+        destination: str,
+        depart_local: str,
+        arrive_local: str,
+    ) -> dict[str, str]:
+        return {
+            "from": source,
+            "to": destination,
+            "depart_local": depart_local,
+            "arrive_local": arrive_local,
+        }
+
+    class RecoveryProvider:
+        provider_id = "kiwi"
+        display_name = "Kiwi"
+        supports_calendar = True
+        requires_credentials = False
+        credential_env: tuple[str, ...] = ()
+        default_enabled = True
+
+        def __init__(self) -> None:
+            self.return_max_stops_seen: list[int] = []
+
+        def is_configured(self) -> bool:
+            return True
+
+        def get_calendar_prices(self, **kwargs):  # type: ignore[no-untyped-def]
+            route = (kwargs.get("source"), kwargs.get("destination"))
+            if route == ("OTP", "BKK"):
+                return {"2026-06-01": 950}
+            if route == ("BKK", "OTP"):
+                return {"2026-06-08": 980}
+            return {}
+
+        def get_best_oneway(self, **_kwargs):  # type: ignore[no-untyped-def]
+            return None
+
+        def get_best_return(self, **kwargs):  # type: ignore[no-untyped-def]
+            max_stops = int(kwargs.get("max_stops_per_leg") or 0)
+            self.return_max_stops_seen.append(max_stops)
+            if max_stops < 3:
+                return None
+            return {
+                "price": 4100,
+                "formatted_price": "4100 RON",
+                "currency": "RON",
+                "duration_seconds": 18 * 3600,
+                "outbound_duration_seconds": 9 * 3600,
+                "inbound_duration_seconds": 9 * 3600,
+                "outbound_stops": 2,
+                "inbound_stops": 2,
+                "outbound_transfer_events": 2,
+                "inbound_transfer_events": 2,
+                "booking_url": "https://example.test/otp-bkk-recovered",
+                "outbound_segments": [
+                    segment("OTP", "IST", "2026-06-01T08:00:00", "2026-06-01T09:30:00"),
+                    segment("IST", "DOH", "2026-06-01T11:00:00", "2026-06-01T15:00:00"),
+                    segment("DOH", "BKK", "2026-06-01T17:00:00", "2026-06-02T01:00:00"),
+                ],
+                "inbound_segments": [
+                    segment("BKK", "DOH", "2026-06-08T08:00:00", "2026-06-08T12:00:00"),
+                    segment("DOH", "IST", "2026-06-08T14:00:00", "2026-06-08T17:00:00"),
+                    segment("IST", "OTP", "2026-06-08T19:00:00", "2026-06-08T20:30:00"),
+                ],
+                "provider": "kiwi",
+                "fare_mode": "selected_bags",
+                "price_mode": "explicit_total",
+            }
+
+    class UnavailableRouteGraph:
+        def available(self) -> bool:
+            return False
+
+    provider = RecoveryProvider()
+    optimizer = SplitTripOptimizer({"kiwi": provider}, AirportCoordinates())
+    optimizer.route_graph = UnavailableRouteGraph()
+    config = optimizer.parse_search_config(
+        {
+            "origins": ["OTP"],
+            "destinations": ["BKK"],
+            "providers": ["kiwi"],
+            "period_start": "2026-06-01",
+            "period_end": "2026-06-08",
+            "hub_candidates": ["IST"],
+            "min_stay_days": 7,
+            "max_stay_days": 7,
+            "min_stopover_days": 0,
+            "max_stopover_days": 0,
+            "max_transfers_per_direction": 1,
+            "top_results": 3,
+            "validate_top_per_destination": 3,
+            "market_compare_fares": False,
+            "io_workers": 2,
+            "cpu_workers": 1,
+        }
+    )
+
+    result = optimizer.search(config)
+
+    assert provider.return_max_stops_seen == [1, 3]
+    assert len(result["results"]) == 1
+    recovered = result["results"][0]
+    assert recovered["destination_code"] == "BKK"
+    assert recovered["total_price"] == 4100
+    assert recovered["coverage_recovery"] is True
+    assert recovered["outbound"]["layovers_count"] == 2
+    assert recovered["inbound"]["layovers_count"] == 2
+    assert any("Coverage recovery added 1 fallback" in warning for warning in result["warnings"])
+
+
 def test_search_retains_visible_provider_quotes_for_same_exact_route(monkeypatch) -> None:
     def segment(
         source: str,
