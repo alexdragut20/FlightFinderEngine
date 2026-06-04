@@ -177,7 +177,7 @@
 
           <label>
             Validate top candidates / destination
-            <input id="validate-top" type="number" min="10" max="500" value="80" />
+            <input id="validate-top" type="number" min="10" max="500" value="120" />
           </label>
 
           <details class="full-row advanced">
@@ -261,7 +261,7 @@
 	                  >How many estimated routes are kept per destination before live validation. Higher improves
 	                  coverage but increases runtime.</small
                 >
-                <input id="pool-multiplier" type="number" min="2" max="50" value="4" />
+                <input id="pool-multiplier" type="number" min="2" max="50" value="8" />
               </label>
               <label>
                 Calendar hubs prefetch (API guardrail, 0 = all hubs)
@@ -269,21 +269,21 @@
                   >Limits how many hub airports are queried in the calendar stage before live
                   pricing.</small
                 >
-                <input id="calendar-hubs-prefetch" type="number" min="0" max="96" value="32" />
+                <input id="calendar-hubs-prefetch" type="number" min="0" max="96" value="48" />
               </label>
               <label>
                 Max validated one-way keys / destination (0 = no cap)
                 <small class="field-help"
                   >Hard cap for live one-way fare lookups per destination.</small
                 >
-                <input id="max-validate-oneway-keys" type="number" min="0" max="2000" value="300" />
+                <input id="max-validate-oneway-keys" type="number" min="0" max="2000" value="600" />
               </label>
               <label>
                 Max validated return keys / destination (0 = no cap)
                 <small class="field-help"
                   >Hard cap for live round-trip fare lookups per destination.</small
                 >
-                <input id="max-validate-return-keys" type="number" min="0" max="800" value="120" />
+                <input id="max-validate-return-keys" type="number" min="0" max="800" value="240" />
               </label>
               <label>
                 Max provider API calls / search (0 = no cap)

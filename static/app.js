@@ -518,10 +518,10 @@ function applyBudgetAwarePreset() {
   const providersForPreset = manuallySelectedProviders || enabledProviders || ["kiwi"];
   setSelectedProviderIds(providersForPreset);
 
-  // "Smart Budget" preset: exhaustive Kiwi + bounded provider validation.
+  // "Smart Budget" preset: broad candidate discovery + bounded provider validation.
   const validateTop = Math.max(
-    80,
-    Math.min(180, Math.round(60 + destinationsCount * 12 + periodWeeks * 4)),
+    120,
+    Math.min(240, Math.round(100 + destinationsCount * 14 + periodWeeks * 4)),
   );
   const amadeusCalls = amadeusConfigured
     ? Math.max(24, Math.min(120, Math.round(destinationsCount * 16 + periodWeeks * 6)))
@@ -543,13 +543,13 @@ function applyBudgetAwarePreset() {
   setInputValue("max-connection-layover-hours", 0);
   setInputValue("validate-top", validateTop);
   setInputValue("top-results", 20);
-  setInputValue("pool-multiplier", 12);
+  setInputValue("pool-multiplier", 16);
   setInputValue("io-workers", 32);
   document.getElementById("exhaustive-hubs").checked = true;
 
   setInputValue("calendar-hubs-prefetch", 48);
-  setInputValue("max-validate-oneway-keys", Math.max(160, Math.min(600, validateTop * 2)));
-  setInputValue("max-validate-return-keys", Math.max(80, Math.min(240, validateTop)));
+  setInputValue("max-validate-oneway-keys", Math.max(480, Math.min(1200, validateTop * 4)));
+  setInputValue("max-validate-return-keys", Math.max(220, Math.min(480, validateTop * 2)));
   setInputValue("max-total-provider-calls", totalPaidBudget || 0);
   setInputValue("max-calls-kiwi", 0);
   setInputValue("max-calls-amadeus", amadeusCalls);
@@ -564,7 +564,7 @@ function applyBudgetAwarePreset() {
   if (budgetPresetStatusEl) {
     budgetPresetStatusEl.textContent =
       `Budget-aware preset applied (Smart Budget): ` +
-      `providers ${providersForPreset.join("/")}, validate-top ${validateTop}, CPU auto-max, IO 32, pool x12 per destination, ` +
+      `providers ${providersForPreset.join("/")}, validate-top ${validateTop}, CPU auto-max, IO 32, pool x16 per destination, ` +
       `Travelpayouts ${travelpayoutsConfigured ? "on" : "off"}, Amadeus cap ${amadeusCalls || "off"}, SerpApi cap ${serpapiCalls || "off"}, total paid cap ${totalPaidBudget || "off"}.`;
   }
 }

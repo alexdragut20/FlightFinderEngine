@@ -1989,9 +1989,9 @@ def test_parse_config_uses_bounded_validation_defaults() -> None:
         }
     )
 
-    assert config.calendar_hubs_prefetch == 32
-    assert config.max_validate_oneway_keys_per_destination == 300
-    assert config.max_validate_return_keys_per_destination == 120
+    assert config.calendar_hubs_prefetch == 48
+    assert config.max_validate_oneway_keys_per_destination == 600
+    assert config.max_validate_return_keys_per_destination == 240
 
 
 def test_parse_config_zero_budget_values_disable_caps() -> None:
