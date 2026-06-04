@@ -3601,7 +3601,15 @@ def test_optimizer_whole_trip_discovery_helpers_promote_cheaper_bundle_fares() -
     )
 
     class _ReturnDiscoveryClient:
-        active_provider_ids = ["kiwi", "googleflights", "ryanair"]
+        active_provider_ids = ["kiwi", "googleflights", "azair", "ryanair"]
+        _providers = {
+            "azair": type("_CalendarProvider", (), {"supports_calendar": True})(),
+            "googleflights": type("_ExactProvider", (), {"supports_calendar": False})(),
+            "ryanair": type("_CalendarProvider", (), {"supports_calendar": True})(),
+        }
+
+        def provider_for_id(self, provider_id: str):  # type: ignore[no-untyped-def]
+            return self._providers.get(str(provider_id))
 
         def get_best_return(self, **kwargs):  # type: ignore[no-untyped-def]
             if kwargs["destination"] == "DXB":
@@ -3638,13 +3646,14 @@ def test_optimizer_whole_trip_discovery_helpers_promote_cheaper_bundle_fares() -
                 return {"price": 150, "provider": "ryanair", "formatted_price": "150 RON"}
             return None
 
-    class _UnsupportedRouteProvider:
+    class _SupportedRouteProvider:
         def _market_supported(self, source: str, destination: str) -> bool:
-            return False
+            return True
 
-    # Keep this unit test off the live Ryanair route graph. The synthetic USM/BKK
-    # market is meant to exercise Google Flights whole-trip discovery only.
-    optimizer.providers["ryanair"] = _UnsupportedRouteProvider()
+    # Keep this unit test off live provider route graphs. The synthetic USM/BKK
+    # market is meant to exercise fast whole-trip discovery deterministically.
+    optimizer.providers["azair"] = _SupportedRouteProvider()
+    optimizer.providers["ryanair"] = _SupportedRouteProvider()
 
     with ThreadPoolExecutor(max_workers=2) as io_pool:
         discovered, warnings = asyncio.run(
@@ -3700,10 +3709,10 @@ def test_optimizer_whole_trip_discovery_helpers_promote_cheaper_bundle_fares() -
 
     assert run_warnings == []
     assert metadata["USM"]["improved_candidates"] == 2
-    assert metadata["USM"]["provider_ids"] == ["googleflights", "ryanair"]
-    assert metadata["USM"]["selected_providers"]["googleflights"] == 2
-    assert updated_estimates["USM"][0]["estimated_total"] == 650
-    assert updated_estimates["USM"][1]["estimated_total"] == 700
+    assert metadata["USM"]["provider_ids"] == ["azair", "ryanair"]
+    assert metadata["USM"]["selected_providers"]["ryanair"] == 2
+    assert updated_estimates["USM"][0]["estimated_total"] == 610
+    assert updated_estimates["USM"][1]["estimated_total"] == 690
     snapshot = progress.snapshot()
     assert (
         snapshot["runtime_data"]["whole_trip_discovery"]["destinations"][0]["destination"] == "USM"

@@ -65,8 +65,6 @@ const fieldTooltips = {
   adults: "Number of adult passengers used in fare requests.",
   "hand-bags": "Cabin bags per adult used for fare estimation.",
   "hold-bags": "Checked bags per adult used for fare estimation.",
-  "market-compare-fares":
-    "Also tests no-bag base fare and keeps it if cheaper than selected baggage profile.",
   objective: "Ranking strategy for final results: best, cheapest, fastest, or price per 1000 km.",
   "top-results": "How many final itineraries are displayed.",
   "validate-top": "Top estimated candidates per destination sent to live fare validation.",
@@ -462,6 +460,25 @@ function setInputValue(id, value) {
   control.value = String(value);
 }
 
+function timeWindowsEnabled() {
+  return Boolean(document.getElementById("enable-time-windows")?.checked);
+}
+
+function timeWindowValue(id) {
+  return timeWindowsEnabled() ? document.getElementById(id).value || "00:00" : "00:00";
+}
+
+function syncTimeWindowControls() {
+  const enabled = timeWindowsEnabled();
+  const fields = document.getElementById("time-filter-fields");
+  if (fields) {
+    fields.hidden = !enabled;
+  }
+  for (const input of document.querySelectorAll("#time-filter-fields input[type='time']")) {
+    input.disabled = !enabled;
+  }
+}
+
 function parseDateInput(id) {
   const value = document.getElementById(id).value;
   if (!value) return null;
@@ -501,10 +518,10 @@ function applyBudgetAwarePreset() {
   const providersForPreset = manuallySelectedProviders || enabledProviders || ["kiwi"];
   setSelectedProviderIds(providersForPreset);
 
-  // "Smart Budget" preset: exhaustive Kiwi + higher-quality paid-provider comparison.
+  // "Smart Budget" preset: exhaustive Kiwi + bounded provider validation.
   const validateTop = Math.max(
-    180,
-    Math.min(320, Math.round(160 + destinationsCount * 18 + periodWeeks * 5)),
+    80,
+    Math.min(180, Math.round(60 + destinationsCount * 12 + periodWeeks * 4)),
   );
   const amadeusCalls = amadeusConfigured
     ? Math.max(24, Math.min(120, Math.round(destinationsCount * 16 + periodWeeks * 6)))
@@ -523,17 +540,16 @@ function applyBudgetAwarePreset() {
   const totalPaidBudget = amadeusCalls + serpapiCalls;
 
   setInputValue("objective", "cheapest");
-  document.getElementById("market-compare-fares").checked = true;
   setInputValue("max-connection-layover-hours", 0);
   setInputValue("validate-top", validateTop);
   setInputValue("top-results", 20);
-  setInputValue("pool-multiplier", 50);
+  setInputValue("pool-multiplier", 12);
   setInputValue("io-workers", 32);
   document.getElementById("exhaustive-hubs").checked = true;
 
-  setInputValue("calendar-hubs-prefetch", 0);
-  setInputValue("max-validate-oneway-keys", 0);
-  setInputValue("max-validate-return-keys", 0);
+  setInputValue("calendar-hubs-prefetch", 48);
+  setInputValue("max-validate-oneway-keys", Math.max(160, Math.min(600, validateTop * 2)));
+  setInputValue("max-validate-return-keys", Math.max(80, Math.min(240, validateTop)));
   setInputValue("max-total-provider-calls", totalPaidBudget || 0);
   setInputValue("max-calls-kiwi", 0);
   setInputValue("max-calls-amadeus", amadeusCalls);
@@ -548,7 +564,7 @@ function applyBudgetAwarePreset() {
   if (budgetPresetStatusEl) {
     budgetPresetStatusEl.textContent =
       `Budget-aware preset applied (Smart Budget): ` +
-      `providers ${providersForPreset.join("/")}, validate-top ${validateTop}, CPU auto-max, IO 32, pool x50 per destination, ` +
+      `providers ${providersForPreset.join("/")}, validate-top ${validateTop}, CPU auto-max, IO 32, pool x12 per destination, ` +
       `Travelpayouts ${travelpayoutsConfigured ? "on" : "off"}, Amadeus cap ${amadeusCalls || "off"}, SerpApi cap ${serpapiCalls || "off"}, total paid cap ${totalPaidBudget || "off"}.`;
   }
 }
@@ -1042,12 +1058,14 @@ function buildPdfReportHtml() {
     payload.max_connection_layover_hours && Number(payload.max_connection_layover_hours) > 0
       ? `${payload.max_connection_layover_hours}h`
       : "No cap";
-  const timeWindowSummary = [
-    `out dep ${payload.outbound_departure_time_start || "00:00"}-${payload.outbound_departure_time_end || "00:00"}`,
-    `out arr ${payload.outbound_arrival_time_start || "00:00"}-${payload.outbound_arrival_time_end || "00:00"}`,
-    `return dep ${payload.return_departure_time_start || "00:00"}-${payload.return_departure_time_end || "00:00"}`,
-    `return arr ${payload.return_arrival_time_start || "00:00"}-${payload.return_arrival_time_end || "00:00"}`,
-  ].join(", ");
+  const timeWindowSummary = payload.flight_time_windows_enabled
+    ? [
+        `out dep ${payload.outbound_departure_time_start || "00:00"}-${payload.outbound_departure_time_end || "00:00"}`,
+        `out arr ${payload.outbound_arrival_time_start || "00:00"}-${payload.outbound_arrival_time_end || "00:00"}`,
+        `return dep ${payload.return_departure_time_start || "00:00"}-${payload.return_departure_time_end || "00:00"}`,
+        `return arr ${payload.return_arrival_time_start || "00:00"}-${payload.return_arrival_time_end || "00:00"}`,
+      ].join(", ")
+    : "Off (24h search)";
   const criteria = [
     ["Origins", (payload.origins || []).join(", ") || "N/A"],
     ["Destinations", (payload.destinations || []).join(", ") || "N/A"],
@@ -1859,20 +1877,21 @@ function collectPayload() {
     max_stopover_days: asInt("max-stopover"),
     max_connection_layover_hours: asInt("max-connection-layover-hours"),
     max_transfers_per_direction: maxTransfers,
-    outbound_departure_time_start: document.getElementById("outbound-departure-time-start").value || "00:00",
-    outbound_departure_time_end: document.getElementById("outbound-departure-time-end").value || "00:00",
-    outbound_arrival_time_start: document.getElementById("outbound-arrival-time-start").value || "00:00",
-    outbound_arrival_time_end: document.getElementById("outbound-arrival-time-end").value || "00:00",
-    return_departure_time_start: document.getElementById("return-departure-time-start").value || "00:00",
-    return_departure_time_end: document.getElementById("return-departure-time-end").value || "00:00",
-    return_arrival_time_start: document.getElementById("return-arrival-time-start").value || "00:00",
-    return_arrival_time_end: document.getElementById("return-arrival-time-end").value || "00:00",
+    flight_time_windows_enabled: timeWindowsEnabled(),
+    outbound_departure_time_start: timeWindowValue("outbound-departure-time-start"),
+    outbound_departure_time_end: timeWindowValue("outbound-departure-time-end"),
+    outbound_arrival_time_start: timeWindowValue("outbound-arrival-time-start"),
+    outbound_arrival_time_end: timeWindowValue("outbound-arrival-time-end"),
+    return_departure_time_start: timeWindowValue("return-departure-time-start"),
+    return_departure_time_end: timeWindowValue("return-departure-time-end"),
+    return_arrival_time_start: timeWindowValue("return-arrival-time-start"),
+    return_arrival_time_end: timeWindowValue("return-arrival-time-end"),
     // Backward-compatible keys consumed by older server builds:
     max_stops_per_leg: maxTransfers,
     max_layovers_per_direction: maxTransfers,
     currency: document.getElementById("currency").value,
     objective: document.getElementById("objective").value,
-    market_compare_fares: document.getElementById("market-compare-fares").checked,
+    market_compare_fares: false,
     top_results: asInt("top-results"),
     validate_top_per_destination: asInt("validate-top"),
     auto_hubs_per_direction: asInt("auto-hubs"),
@@ -2069,19 +2088,16 @@ async function runSearch(event) {
     const budgetTotal = budgetMeta.max_total_calls == null
       ? "no cap"
       : `${budgetMeta.used_total_calls || 0}/${budgetMeta.max_total_calls}`;
-    const marketCompareLabel = meta.engine?.market_compare_fares ? "ON" : "OFF";
     const engineInfo = meta.engine
       ? `Engine: IO workers ${meta.engine.io_workers}, CPU workers ${cpuWorkersLabel}, ` +
         `hub pool ${hubPoolLabel}, ` +
         `providers requested ${providersRequestedLabel}, active ${providersActiveLabel}, used ${providersUsedLabel}, ` +
         `provider API budget ${budgetTotal}, ` +
-        `market compare ${marketCompareLabel}, ` +
         `exhaustive hubs ${meta.engine.exhaustive_hub_scan ? "ON" : "OFF"}, ` +
         `calendar hubs ${meta.engine.calendar_hubs_prefetched ?? "N/A"}, ` +
         `calendar routes ${meta.engine.calendar_routes_prefetched}, ` +
         `one-way legs ${meta.engine.oneway_legs_requested}, ` +
         `round-trip itineraries ${meta.engine.roundtrip_itineraries_requested ?? 0}, ` +
-        `base-fare selections ${meta.engine.base_fare_selected_returns ?? 0} RT / ${meta.engine.base_fare_selected_oneways ?? 0} OW, ` +
         `max connection layover ${maxConnectionLayoverLabel}, ` +
         `filtered by connection cap ${meta.engine.filtered_by_connection_layover ?? 0}, ` +
         `long-stopover results ${meta.engine.long_stopover_results ?? 0}.`
@@ -2188,8 +2204,10 @@ seedDates();
 resetProgressDisplay();
 loadPresets();
 syncAutoHubControls();
+syncTimeWindowControls();
 document.getElementById("exhaustive-hubs").addEventListener("change", syncAutoHubControls);
 document.getElementById("hub-candidates").addEventListener("input", syncAutoHubControls);
+document.getElementById("enable-time-windows").addEventListener("change", syncTimeWindowControls);
 if (applyProviderKeysBtn) {
   applyProviderKeysBtn.addEventListener("click", applyProviderKeys);
 }

@@ -2144,6 +2144,17 @@ class SplitTripOptimizer:
                 min(96, len(hub_candidates)),
             )
 
+        time_windows_enabled = to_bool(payload.get("flight_time_windows_enabled"), True)
+
+        def time_window_value(key: str, *aliases: str) -> str:
+            if not time_windows_enabled:
+                return "00:00"
+            for candidate in (key, *aliases):
+                value = payload.get(candidate)
+                if value not in (None, ""):
+                    return _normalize_time_of_day(value)
+            return "00:00"
+
         return SearchConfig(
             origins=normalize_codes(payload.get("origins"), ["OTP"]),
             destinations=normalize_codes(payload.get("destinations"), destinations_fallback),
@@ -2160,32 +2171,25 @@ class SplitTripOptimizer:
             max_stops_per_leg=max_stops_per_leg,
             max_layovers_per_direction=max_layovers_per_direction,
             max_connection_layover_hours=max_connection_layover_hours,
-            outbound_departure_time_start=_normalize_time_of_day(
-                payload.get("outbound_departure_time_start")
+            outbound_departure_time_start=time_window_value("outbound_departure_time_start"),
+            outbound_departure_time_end=time_window_value("outbound_departure_time_end"),
+            outbound_arrival_time_start=time_window_value("outbound_arrival_time_start"),
+            outbound_arrival_time_end=time_window_value("outbound_arrival_time_end"),
+            return_departure_time_start=time_window_value(
+                "return_departure_time_start",
+                "inbound_departure_time_start",
             ),
-            outbound_departure_time_end=_normalize_time_of_day(
-                payload.get("outbound_departure_time_end")
+            return_departure_time_end=time_window_value(
+                "return_departure_time_end",
+                "inbound_departure_time_end",
             ),
-            outbound_arrival_time_start=_normalize_time_of_day(
-                payload.get("outbound_arrival_time_start")
+            return_arrival_time_start=time_window_value(
+                "return_arrival_time_start",
+                "inbound_arrival_time_start",
             ),
-            outbound_arrival_time_end=_normalize_time_of_day(
-                payload.get("outbound_arrival_time_end")
-            ),
-            return_departure_time_start=_normalize_time_of_day(
-                payload.get("return_departure_time_start")
-                or payload.get("inbound_departure_time_start")
-            ),
-            return_departure_time_end=_normalize_time_of_day(
-                payload.get("return_departure_time_end")
-                or payload.get("inbound_departure_time_end")
-            ),
-            return_arrival_time_start=_normalize_time_of_day(
-                payload.get("return_arrival_time_start")
-                or payload.get("inbound_arrival_time_start")
-            ),
-            return_arrival_time_end=_normalize_time_of_day(
-                payload.get("return_arrival_time_end") or payload.get("inbound_arrival_time_end")
+            return_arrival_time_end=time_window_value(
+                "return_arrival_time_end",
+                "inbound_arrival_time_end",
             ),
             currency=currency,
             objective=objective,
@@ -5864,6 +5868,7 @@ class SplitTripOptimizer:
             for provider_id in search_client.active_provider_ids
             if provider_id in _FREE_PROVIDER_IDS and provider_id != "kiwi"
         )
+        provider_ids = self._free_provider_calendar_ids(search_client, provider_ids)
         if progress is not None:
             progress.set_runtime_data(
                 "whole_trip_discovery",

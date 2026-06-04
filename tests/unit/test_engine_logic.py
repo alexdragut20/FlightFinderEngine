@@ -1978,6 +1978,22 @@ def test_serpapi_stops_mapping_matches_api_semantics(max_stops: int, expected: i
     assert SerpApiGoogleFlightsClient._stops_param(max_stops) == expected
 
 
+def test_parse_config_uses_bounded_validation_defaults() -> None:
+    optimizer = SplitTripOptimizer(KiwiClient(), AirportCoordinates())
+    config = optimizer.parse_search_config(
+        {
+            "origins": ["OTP"],
+            "destinations": ["MRU"],
+            "period_start": "2026-12-26",
+            "period_end": "2027-01-15",
+        }
+    )
+
+    assert config.calendar_hubs_prefetch == 32
+    assert config.max_validate_oneway_keys_per_destination == 300
+    assert config.max_validate_return_keys_per_destination == 120
+
+
 def test_parse_config_zero_budget_values_disable_caps() -> None:
     optimizer = SplitTripOptimizer(KiwiClient(), AirportCoordinates())
     config = optimizer.parse_search_config(
@@ -2136,6 +2152,36 @@ def test_parse_config_defaults_time_windows_to_no_limit() -> None:
             "destinations": ["MRS"],
             "period_start": "2026-06-25",
             "period_end": "2026-07-02",
+        }
+    )
+
+    assert config.outbound_departure_time_start == "00:00"
+    assert config.outbound_departure_time_end == "00:00"
+    assert config.outbound_arrival_time_start == "00:00"
+    assert config.outbound_arrival_time_end == "00:00"
+    assert config.return_departure_time_start == "00:00"
+    assert config.return_departure_time_end == "00:00"
+    assert config.return_arrival_time_start == "00:00"
+    assert config.return_arrival_time_end == "00:00"
+
+
+def test_parse_config_disabled_time_windows_ignore_stale_values() -> None:
+    optimizer = SplitTripOptimizer(KiwiClient(), AirportCoordinates())
+    config = optimizer.parse_search_config(
+        {
+            "origins": ["OTP"],
+            "destinations": ["MRU"],
+            "period_start": "2026-12-26",
+            "period_end": "2027-01-15",
+            "flight_time_windows_enabled": False,
+            "outbound_departure_time_start": "21:00",
+            "outbound_departure_time_end": "23:00",
+            "outbound_arrival_time_start": "23:00",
+            "outbound_arrival_time_end": "00:30",
+            "return_departure_time_start": "17:00",
+            "return_departure_time_end": "19:00",
+            "return_arrival_time_start": "21:00",
+            "return_arrival_time_end": "22:00",
         }
     )
 

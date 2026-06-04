@@ -102,8 +102,14 @@
           </label>
 
           <div class="time-filter full-row">
-            <p class="time-filter-title">Flight time windows</p>
-            <div class="time-filter-grid">
+            <label class="time-filter-toggle">
+              <span>
+                Flight time windows
+                <small class="field-help">Default is a full 24h search with no departure/arrival constraints.</small>
+              </span>
+              <input id="enable-time-windows" type="checkbox" />
+            </label>
+            <div id="time-filter-fields" class="time-filter-grid" hidden>
               <label>
                 Outbound departure from
                 <input id="outbound-departure-time-start" type="time" value="00:00" />
@@ -155,11 +161,6 @@
           </label>
 
           <label>
-            Market compare: also fetch Kiwi base no-bag fares and keep them when cheaper
-            <input id="market-compare-fares" type="checkbox" checked />
-          </label>
-
-          <label>
             Rank by
             <select id="objective">
               <option value="best">Best (balanced price + time)</option>
@@ -176,7 +177,7 @@
 
           <label>
             Validate top candidates / destination
-            <input id="validate-top" type="number" min="10" max="500" value="140" />
+            <input id="validate-top" type="number" min="10" max="500" value="80" />
           </label>
 
           <details class="full-row advanced">
@@ -188,7 +189,7 @@
               </label>
               <label>
                 Exhaustive hub scan (slower, checks all hub candidates)
-                <input id="exhaustive-hubs" type="checkbox" />
+                <input id="exhaustive-hubs" type="checkbox" checked />
               </label>
               <label>
                 Hub candidate pool (optional IATA list)
@@ -260,7 +261,7 @@
 	                  >How many estimated routes are kept per destination before live validation. Higher improves
 	                  coverage but increases runtime.</small
                 >
-                <input id="pool-multiplier" type="number" min="2" max="50" value="8" />
+                <input id="pool-multiplier" type="number" min="2" max="50" value="4" />
               </label>
               <label>
                 Calendar hubs prefetch (API guardrail, 0 = all hubs)
@@ -268,21 +269,21 @@
                   >Limits how many hub airports are queried in the calendar stage before live
                   pricing.</small
                 >
-                <input id="calendar-hubs-prefetch" type="number" min="0" max="96" value="0" />
+                <input id="calendar-hubs-prefetch" type="number" min="0" max="96" value="32" />
               </label>
               <label>
                 Max validated one-way keys / destination (0 = no cap)
                 <small class="field-help"
                   >Hard cap for live one-way fare lookups per destination.</small
                 >
-                <input id="max-validate-oneway-keys" type="number" min="0" max="2000" value="0" />
+                <input id="max-validate-oneway-keys" type="number" min="0" max="2000" value="300" />
               </label>
               <label>
                 Max validated return keys / destination (0 = no cap)
                 <small class="field-help"
                   >Hard cap for live round-trip fare lookups per destination.</small
                 >
-                <input id="max-validate-return-keys" type="number" min="0" max="800" value="0" />
+                <input id="max-validate-return-keys" type="number" min="0" max="800" value="120" />
               </label>
               <label>
                 Max provider API calls / search (0 = no cap)
