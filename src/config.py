@@ -47,6 +47,13 @@ SUPPORTED_PROVIDER_IDS = (
     "serpapi",
 )
 _FREE_PROVIDER_IDS = {"kiwi", "azair", "ryanair", "kayak", "momondo", "googleflights", "skyscanner"}
+HUMAN_CHECK_PROVIDER_IDS = frozenset({"kayak", "momondo", "skyscanner"})
+HUMAN_CHECK_PROVIDER_REASON = (
+    "disabled for automated search because the site now frequently returns human security checks"
+)
+SERIAL_EXACT_PROVIDER_IDS = frozenset({"googleflights"})
+GOOGLEFLIGHTS_GLOBAL_PROBE_ONEWAY_KEYS = 24
+GOOGLEFLIGHTS_GLOBAL_PROBE_RETURN_KEYS = 6
 
 
 def _detect_playwright_browser_channel() -> str:

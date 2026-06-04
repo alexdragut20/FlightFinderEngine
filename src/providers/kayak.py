@@ -45,6 +45,7 @@ class KayakScrapeClient:
     requires_credentials = False
     credential_env: tuple[str, ...] = ()
     docs_url = "https://www.kayak.com/flights/"
+    default_enabled = False
     serialized_requests = True
     request_interval_seconds = 2.5
     _NO_RESULT_CODES = {"NO_RESULTS", "NO_RESULTS_FOUND", "NO_RESULTS_AVAILABLE"}
@@ -1609,6 +1610,7 @@ class MomondoScrapeClient(KayakScrapeClient):
     provider_id = "momondo"
     display_name = "Momondo Scrape"
     docs_url = "https://www.momondo.com/flight-search/"
+    default_enabled = False
 
     def __init__(
         self,

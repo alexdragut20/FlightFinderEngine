@@ -42,7 +42,7 @@ class SkyscannerScrapeClient:
     requires_credentials = False
     credential_env: tuple[str, ...] = ()
     docs_url = "https://www.skyscanner.com/transport/flights/"
-    default_enabled = True
+    default_enabled = False
     serialized_requests = True
     request_interval_seconds = 2.5
     _USER_AGENTS = (

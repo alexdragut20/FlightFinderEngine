@@ -160,6 +160,9 @@ function getSelectedProviderIds() {
 
 function providerPickerMeta(provider) {
   const typeLabel = provider.requires_credentials ? "API key provider" : "Free provider";
+  if (provider.automation_disabled) {
+    return `Manual comparison only. ${provider.disabled_reason || "Skipped for automated searches."}`;
+  }
   if (provider.configured) {
     return provider.requires_credentials
       ? `${typeLabel}. Ready in this session.`
@@ -178,6 +181,9 @@ function providerPickerMeta(provider) {
 }
 
 function providerStatusSuffix(provider, selected) {
+  if (provider.automation_disabled) {
+    return "manual only";
+  }
   if (selected && provider.configured) {
     return "active";
   }
@@ -197,7 +203,9 @@ function providerStatusSuffix(provider, selected) {
 }
 
 function setSelectedProviderIds(providerIds) {
-  const orderedIds = orderProviderIds(providerIds);
+  const orderedIds = orderProviderIds(providerIds).filter(
+    (providerId) => !providerAutomationDisabled(providerId),
+  );
   const selectedSet = new Set(orderedIds);
   if (providersInputEl) {
     providersInputEl.value = orderedIds.join(",");
@@ -251,12 +259,16 @@ function renderProviderPicker(selectedIds = getSelectedProviderIds()) {
       const providerId = String(provider.id || "").toLowerCase();
       const option = document.createElement("label");
       option.className = "provider-option";
+      if (provider.automation_disabled) {
+        option.classList.add("provider-option-disabled");
+      }
 
       const checkbox = document.createElement("input");
       checkbox.type = "checkbox";
       checkbox.value = providerId;
       checkbox.dataset.providerId = providerId;
-      checkbox.checked = selectedSet.has(providerId);
+      checkbox.disabled = Boolean(provider.automation_disabled);
+      checkbox.checked = !checkbox.disabled && selectedSet.has(providerId);
       checkbox.addEventListener("change", syncSelectedProvidersFromPicker);
 
       const body = document.createElement("span");
@@ -490,6 +502,11 @@ function parseDateInput(id) {
 function providerIsConfigured(providerId) {
   const target = providerCatalog.find((provider) => String(provider.id || "").toLowerCase() === providerId);
   return Boolean(target?.configured);
+}
+
+function providerAutomationDisabled(providerId) {
+  const target = providerCatalog.find((provider) => String(provider.id || "").toLowerCase() === providerId);
+  return Boolean(target?.automation_disabled);
 }
 
 function applyBudgetAwarePreset() {

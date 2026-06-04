@@ -1883,10 +1883,7 @@ def test_parse_config_auto_provider_defaults_to_configured() -> None:
         "kiwi",
         "azair",
         "ryanair",
-        "kayak",
-        "momondo",
         "googleflights",
-        "skyscanner",
     )
 
 
@@ -1914,13 +1911,36 @@ def test_runtime_provider_secrets_enable_optional_providers() -> None:
     assert catalog["serpapi"]["configured"]
 
 
-def test_provider_catalog_enables_free_scrapers_by_default() -> None:
+def test_provider_catalog_disables_human_check_scrapers_for_automation() -> None:
     optimizer = SplitTripOptimizer(KiwiClient(), AirportCoordinates())
     catalog = {item["id"]: item for item in optimizer.provider_catalog()}
     assert catalog["azair"]["default_enabled"] is True
     assert catalog["ryanair"]["default_enabled"] is True
     assert catalog["googleflights"]["default_enabled"] is True
-    assert catalog["skyscanner"]["default_enabled"] is True
+    for provider_id in ("kayak", "momondo", "skyscanner"):
+        assert catalog[provider_id]["default_enabled"] is False
+        assert catalog[provider_id]["automation_disabled"] is True
+        assert "human security checks" in str(catalog[provider_id]["disabled_reason"])
+
+
+def test_build_search_client_skips_human_check_scrapers_when_requested() -> None:
+    optimizer = SplitTripOptimizer(KiwiClient(), AirportCoordinates())
+    config = optimizer.parse_search_config(
+        {
+            "origins": ["OTP"],
+            "destinations": ["MAD"],
+            "period_start": "2026-04-01",
+            "period_end": "2026-04-20",
+            "providers": ["kiwi", "kayak", "momondo", "skyscanner"],
+        }
+    )
+
+    search_client, _provider_status, warnings = optimizer._build_search_client(config)
+
+    assert search_client.active_provider_ids == ["kiwi"]
+    assert any("Provider kayak skipped" in warning for warning in warnings)
+    assert any("Provider momondo skipped" in warning for warning in warnings)
+    assert any("Provider skyscanner skipped" in warning for warning in warnings)
 
 
 def test_multi_provider_budget_total_cap_applies_to_paid_only_not_kiwi() -> None:

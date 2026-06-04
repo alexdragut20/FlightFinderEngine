@@ -32,8 +32,13 @@ from ..config import (
     DEFAULT_SERPAPI_PROBE_ONEWAY_KEYS,
     DEFAULT_SERPAPI_PROBE_RETURN_KEYS,
     DESTINATION_NOTES,
+    GOOGLEFLIGHTS_GLOBAL_PROBE_ONEWAY_KEYS,
+    GOOGLEFLIGHTS_GLOBAL_PROBE_RETURN_KEYS,
+    HUMAN_CHECK_PROVIDER_IDS,
+    HUMAN_CHECK_PROVIDER_REASON,
     MIN_SPLIT_CONNECTION_CROSS_AIRPORT_SECONDS,
     MIN_SPLIT_CONNECTION_SAME_AIRPORT_SECONDS,
+    SERIAL_EXACT_PROVIDER_IDS,
     SUPPORTED_PROVIDER_IDS,
 )
 from ..data.airports import AirportCoordinates
@@ -1812,16 +1817,22 @@ class SplitTripOptimizer:
             credential_env = list(getattr(provider, "credential_env", ())) if provider else []
             missing_env = [env for env in credential_env if not os.getenv(env)]
             selected_by_request = provider_id in requested
-            active = bool(provider and selected_by_request and configured)
+            automation_disabled = provider_id in HUMAN_CHECK_PROVIDER_IDS
+            active = bool(
+                provider and selected_by_request and configured and not automation_disabled
+            )
             default_enabled = (
                 bool(getattr(provider, "default_enabled", True)) if provider else False
             )
+            if automation_disabled:
+                default_enabled = False
             configuration_hint = None
             if provider:
                 with contextlib.suppress(Exception):
                     hint_getter = getattr(provider, "configuration_hint", None)
                     if callable(hint_getter):
                         configuration_hint = hint_getter()
+            disabled_reason = HUMAN_CHECK_PROVIDER_REASON if automation_disabled else None
             catalog.append(
                 {
                     "id": provider_id,
@@ -1839,6 +1850,8 @@ class SplitTripOptimizer:
                     "missing_env": missing_env,
                     "default_enabled": default_enabled,
                     "configuration_hint": configuration_hint,
+                    "automation_disabled": automation_disabled,
+                    "disabled_reason": disabled_reason,
                 }
             )
         return catalog
@@ -1861,6 +1874,9 @@ class SplitTripOptimizer:
         ]
         warnings: list[str] = []
         for item in provider_status:
+            if item.get("selected_by_request") and item.get("automation_disabled"):
+                warnings.append(f"Provider {item['id']} skipped ({item['disabled_reason']}).")
+                continue
             if item.get("selected_by_request") and not item.get("configured"):
                 missing_env = item.get("missing_env") or []
                 if missing_env:
@@ -3642,6 +3658,8 @@ class SplitTripOptimizer:
             provider_id
             for provider_id in search_client.active_provider_ids
             if str(provider_id or "").strip().lower() in _FREE_PROVIDER_IDS
+            and provider_id not in HUMAN_CHECK_PROVIDER_IDS
+            and provider_id not in SERIAL_EXACT_PROVIDER_IDS
         )
         if len(free_provider_ids) < 2 or not results:
             return {
@@ -7525,12 +7543,28 @@ class SplitTripOptimizer:
             else None
         )
         active_provider_ids = tuple(search_client.active_provider_ids)
-        core_provider_ids = tuple(
-            provider for provider in active_provider_ids if provider != "serpapi"
+        broad_validation_excluded_provider_ids = (
+            set(HUMAN_CHECK_PROVIDER_IDS) | set(SERIAL_EXACT_PROVIDER_IDS) | {"serpapi"}
         )
+        core_provider_ids = tuple(
+            provider
+            for provider in active_provider_ids
+            if provider not in broad_validation_excluded_provider_ids
+        )
+        if not core_provider_ids:
+            core_provider_ids = tuple(
+                provider
+                for provider in active_provider_ids
+                if provider not in set(HUMAN_CHECK_PROVIDER_IDS) | {"serpapi"}
+            )
         if not core_provider_ids:
             core_provider_ids = active_provider_ids
         serpapi_active = "serpapi" in active_provider_ids
+        serialized_probe_provider_ids = tuple(
+            provider
+            for provider in active_provider_ids
+            if provider in SERIAL_EXACT_PROVIDER_IDS and provider not in core_provider_ids
+        )
         origin_rank = {origin: idx for idx, origin in enumerate(config.origins)}
         comparison_links_cache: dict[tuple[str, str, str, str], dict[str, str]] = {}
 
@@ -7652,6 +7686,64 @@ class SplitTripOptimizer:
                 "Reused "
                 f"{deduped_return_trips} duplicate round-trip validations across destinations."
             )
+
+        def add_serialized_probe_scopes(
+            provider_ids: tuple[str, ...],
+            *,
+            oneway_limit: int,
+            return_limit: int,
+        ) -> tuple[int, int]:
+            if not provider_ids:
+                return 0, 0
+            support_cache: dict[tuple[str, str, str], bool] = {}
+            added_oneway = 0
+            added_return = 0
+            for leg_key in global_ordered_oneway_keys[: max(0, int(oneway_limit))]:
+                source, destination, _date_iso = leg_key
+                scoped_provider_ids = self._route_aware_provider_scope(
+                    provider_ids,
+                    source=source,
+                    destination=destination,
+                    support_cache=support_cache,
+                )
+                if not scoped_provider_ids:
+                    continue
+                current_scope = tuple(global_oneway_provider_map.get(leg_key) or ())
+                next_scope = tuple(dict.fromkeys((*current_scope, *scoped_provider_ids)))
+                if next_scope != current_scope:
+                    global_oneway_provider_map[leg_key] = next_scope
+                    added_oneway += 1
+            for return_key in global_ordered_return_keys[: max(0, int(return_limit))]:
+                source, destination, _outbound_iso, _inbound_iso = return_key
+                scoped_provider_ids = self._route_aware_provider_scope(
+                    provider_ids,
+                    source=source,
+                    destination=destination,
+                    roundtrip=True,
+                    support_cache=support_cache,
+                )
+                if not scoped_provider_ids:
+                    continue
+                current_scope = tuple(global_return_provider_map.get(return_key) or ())
+                next_scope = tuple(dict.fromkeys((*current_scope, *scoped_provider_ids)))
+                if next_scope != current_scope:
+                    global_return_provider_map[return_key] = next_scope
+                    added_return += 1
+            return added_oneway, added_return
+
+        if serialized_probe_provider_ids:
+            serialized_probe_oneways, serialized_probe_returns = add_serialized_probe_scopes(
+                serialized_probe_provider_ids,
+                oneway_limit=GOOGLEFLIGHTS_GLOBAL_PROBE_ONEWAY_KEYS,
+                return_limit=GOOGLEFLIGHTS_GLOBAL_PROBE_RETURN_KEYS,
+            )
+            if serialized_probe_oneways > 0 or serialized_probe_returns > 0:
+                warnings.append(
+                    "Limited serialized exact providers "
+                    f"({'/'.join(serialized_probe_provider_ids)}) to "
+                    f"{serialized_probe_oneways} one-way and {serialized_probe_returns} "
+                    "round-trip probe key(s) to avoid local-browser validation stalls."
+                )
 
         returns_phase_started = False
         oneways_phase_started = False

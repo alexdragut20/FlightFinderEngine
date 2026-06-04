@@ -266,6 +266,18 @@ label {
   background: #f5faff;
 }
 
+.provider-option-disabled {
+  cursor: not-allowed;
+  background: #f6f3ee;
+  border-color: #dfd3c2;
+  opacity: 0.78;
+}
+
+.provider-option-disabled:hover {
+  background: #f6f3ee;
+  border-color: #dfd3c2;
+}
+
 .provider-option input[type="checkbox"] {
   margin-top: 2px;
 }
