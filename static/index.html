@@ -101,50 +101,6 @@
             <input id="max-transfers-direction" type="number" min="0" max="6" value="2" />
           </label>
 
-          <div class="time-filter full-row">
-            <label class="time-filter-toggle">
-              <span>
-                Flight time windows
-                <small class="field-help">Default is a full 24h search with no departure/arrival constraints.</small>
-              </span>
-              <input id="enable-time-windows" type="checkbox" />
-            </label>
-            <div id="time-filter-fields" class="time-filter-grid" hidden>
-              <label>
-                Outbound departure from
-                <input id="outbound-departure-time-start" type="time" value="00:00" />
-              </label>
-              <label>
-                Outbound departure to
-                <input id="outbound-departure-time-end" type="time" value="00:00" />
-              </label>
-              <label>
-                Outbound arrival from
-                <input id="outbound-arrival-time-start" type="time" value="00:00" />
-              </label>
-              <label>
-                Outbound arrival to
-                <input id="outbound-arrival-time-end" type="time" value="00:00" />
-              </label>
-              <label>
-                Return departure from
-                <input id="return-departure-time-start" type="time" value="00:00" />
-              </label>
-              <label>
-                Return departure to
-                <input id="return-departure-time-end" type="time" value="00:00" />
-              </label>
-              <label>
-                Return arrival from
-                <input id="return-arrival-time-start" type="time" value="00:00" />
-              </label>
-              <label>
-                Return arrival to
-                <input id="return-arrival-time-end" type="time" value="00:00" />
-              </label>
-            </div>
-          </div>
-
           <label>
             Adults
             <input id="adults" type="number" min="1" max="9" value="1" />
@@ -158,6 +114,11 @@
           <label>
             Hold bags per adult
             <input id="hold-bags" type="number" min="0" max="3" value="0" />
+          </label>
+
+          <label>
+            Market compare: also fetch Kiwi base no-bag fares and keep them when cheaper
+            <input id="market-compare-fares" type="checkbox" checked />
           </label>
 
           <label>
@@ -177,7 +138,7 @@
 
           <label>
             Validate top candidates / destination
-            <input id="validate-top" type="number" min="10" max="500" value="120" />
+            <input id="validate-top" type="number" min="10" max="500" value="140" />
           </label>
 
           <details class="full-row advanced">
@@ -189,7 +150,7 @@
               </label>
               <label>
                 Exhaustive hub scan (slower, checks all hub candidates)
-                <input id="exhaustive-hubs" type="checkbox" checked />
+                <input id="exhaustive-hubs" type="checkbox" />
               </label>
               <label>
                 Hub candidate pool (optional IATA list)
@@ -269,21 +230,21 @@
                   >Limits how many hub airports are queried in the calendar stage before live
                   pricing.</small
                 >
-                <input id="calendar-hubs-prefetch" type="number" min="0" max="96" value="48" />
+                <input id="calendar-hubs-prefetch" type="number" min="0" max="96" value="0" />
               </label>
               <label>
                 Max validated one-way keys / destination (0 = no cap)
                 <small class="field-help"
                   >Hard cap for live one-way fare lookups per destination.</small
                 >
-                <input id="max-validate-oneway-keys" type="number" min="0" max="2000" value="600" />
+                <input id="max-validate-oneway-keys" type="number" min="0" max="2000" value="0" />
               </label>
               <label>
                 Max validated return keys / destination (0 = no cap)
                 <small class="field-help"
                   >Hard cap for live round-trip fare lookups per destination.</small
                 >
-                <input id="max-validate-return-keys" type="number" min="0" max="800" value="240" />
+                <input id="max-validate-return-keys" type="number" min="0" max="800" value="0" />
               </label>
               <label>
                 Max provider API calls / search (0 = no cap)

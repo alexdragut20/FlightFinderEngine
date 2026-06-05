@@ -65,6 +65,8 @@ const fieldTooltips = {
   adults: "Number of adult passengers used in fare requests.",
   "hand-bags": "Cabin bags per adult used for fare estimation.",
   "hold-bags": "Checked bags per adult used for fare estimation.",
+  "market-compare-fares":
+    "Also tests no-bag base fare and keeps it if cheaper than selected baggage profile.",
   objective: "Ranking strategy for final results: best, cheapest, fastest, or price per 1000 km.",
   "top-results": "How many final itineraries are displayed.",
   "validate-top": "Top estimated candidates per destination sent to live fare validation.",
@@ -106,7 +108,7 @@ function parseCodes(input) {
   return input
     .split(",")
     .map((item) => item.trim().toUpperCase())
-    .filter((item) => /^[A-Z]{3}$/.test(item));
+    .filter(Boolean);
 }
 
 function parseProviderIds(input) {
@@ -160,9 +162,6 @@ function getSelectedProviderIds() {
 
 function providerPickerMeta(provider) {
   const typeLabel = provider.requires_credentials ? "API key provider" : "Free provider";
-  if (provider.automation_disabled) {
-    return `Manual comparison only. ${provider.disabled_reason || "Skipped for automated searches."}`;
-  }
   if (provider.configured) {
     return provider.requires_credentials
       ? `${typeLabel}. Ready in this session.`
@@ -181,9 +180,6 @@ function providerPickerMeta(provider) {
 }
 
 function providerStatusSuffix(provider, selected) {
-  if (provider.automation_disabled) {
-    return "manual only";
-  }
   if (selected && provider.configured) {
     return "active";
   }
@@ -203,9 +199,7 @@ function providerStatusSuffix(provider, selected) {
 }
 
 function setSelectedProviderIds(providerIds) {
-  const orderedIds = orderProviderIds(providerIds).filter(
-    (providerId) => !providerAutomationDisabled(providerId),
-  );
+  const orderedIds = orderProviderIds(providerIds);
   const selectedSet = new Set(orderedIds);
   if (providersInputEl) {
     providersInputEl.value = orderedIds.join(",");
@@ -259,16 +253,12 @@ function renderProviderPicker(selectedIds = getSelectedProviderIds()) {
       const providerId = String(provider.id || "").toLowerCase();
       const option = document.createElement("label");
       option.className = "provider-option";
-      if (provider.automation_disabled) {
-        option.classList.add("provider-option-disabled");
-      }
 
       const checkbox = document.createElement("input");
       checkbox.type = "checkbox";
       checkbox.value = providerId;
       checkbox.dataset.providerId = providerId;
-      checkbox.disabled = Boolean(provider.automation_disabled);
-      checkbox.checked = !checkbox.disabled && selectedSet.has(providerId);
+      checkbox.checked = selectedSet.has(providerId);
       checkbox.addEventListener("change", syncSelectedProvidersFromPicker);
 
       const body = document.createElement("span");
@@ -472,25 +462,6 @@ function setInputValue(id, value) {
   control.value = String(value);
 }
 
-function timeWindowsEnabled() {
-  return Boolean(document.getElementById("enable-time-windows")?.checked);
-}
-
-function timeWindowValue(id) {
-  return timeWindowsEnabled() ? document.getElementById(id).value || "00:00" : "00:00";
-}
-
-function syncTimeWindowControls() {
-  const enabled = timeWindowsEnabled();
-  const fields = document.getElementById("time-filter-fields");
-  if (fields) {
-    fields.hidden = !enabled;
-  }
-  for (const input of document.querySelectorAll("#time-filter-fields input[type='time']")) {
-    input.disabled = !enabled;
-  }
-}
-
 function parseDateInput(id) {
   const value = document.getElementById(id).value;
   if (!value) return null;
@@ -502,11 +473,6 @@ function parseDateInput(id) {
 function providerIsConfigured(providerId) {
   const target = providerCatalog.find((provider) => String(provider.id || "").toLowerCase() === providerId);
   return Boolean(target?.configured);
-}
-
-function providerAutomationDisabled(providerId) {
-  const target = providerCatalog.find((provider) => String(provider.id || "").toLowerCase() === providerId);
-  return Boolean(target?.automation_disabled);
 }
 
 function applyBudgetAwarePreset() {
@@ -535,10 +501,10 @@ function applyBudgetAwarePreset() {
   const providersForPreset = manuallySelectedProviders || enabledProviders || ["kiwi"];
   setSelectedProviderIds(providersForPreset);
 
-  // "Smart Budget" preset: broad candidate discovery + bounded provider validation.
+  // "Smart Budget" preset: exhaustive Kiwi + higher-quality paid-provider comparison.
   const validateTop = Math.max(
-    120,
-    Math.min(240, Math.round(100 + destinationsCount * 14 + periodWeeks * 4)),
+    180,
+    Math.min(320, Math.round(160 + destinationsCount * 18 + periodWeeks * 5)),
   );
   const amadeusCalls = amadeusConfigured
     ? Math.max(24, Math.min(120, Math.round(destinationsCount * 16 + periodWeeks * 6)))
@@ -557,16 +523,17 @@ function applyBudgetAwarePreset() {
   const totalPaidBudget = amadeusCalls + serpapiCalls;
 
   setInputValue("objective", "cheapest");
+  document.getElementById("market-compare-fares").checked = true;
   setInputValue("max-connection-layover-hours", 0);
   setInputValue("validate-top", validateTop);
   setInputValue("top-results", 20);
-  setInputValue("pool-multiplier", 16);
+  setInputValue("pool-multiplier", 50);
   setInputValue("io-workers", 32);
   document.getElementById("exhaustive-hubs").checked = true;
 
-  setInputValue("calendar-hubs-prefetch", 48);
-  setInputValue("max-validate-oneway-keys", Math.max(480, Math.min(1200, validateTop * 4)));
-  setInputValue("max-validate-return-keys", Math.max(220, Math.min(480, validateTop * 2)));
+  setInputValue("calendar-hubs-prefetch", 0);
+  setInputValue("max-validate-oneway-keys", 0);
+  setInputValue("max-validate-return-keys", 0);
   setInputValue("max-total-provider-calls", totalPaidBudget || 0);
   setInputValue("max-calls-kiwi", 0);
   setInputValue("max-calls-amadeus", amadeusCalls);
@@ -581,7 +548,7 @@ function applyBudgetAwarePreset() {
   if (budgetPresetStatusEl) {
     budgetPresetStatusEl.textContent =
       `Budget-aware preset applied (Smart Budget): ` +
-      `providers ${providersForPreset.join("/")}, validate-top ${validateTop}, CPU auto-max, IO 32, pool x16 per destination, ` +
+      `providers ${providersForPreset.join("/")}, validate-top ${validateTop}, CPU auto-max, IO 32, pool x50 per destination, ` +
       `Travelpayouts ${travelpayoutsConfigured ? "on" : "off"}, Amadeus cap ${amadeusCalls || "off"}, SerpApi cap ${serpapiCalls || "off"}, total paid cap ${totalPaidBudget || "off"}.`;
   }
 }
@@ -599,9 +566,6 @@ function formatPriceModeLabel(mode) {
   if (!normalized) return "";
   if (normalized === "explicit_total") return "explicit total from provider";
   if (normalized === "per_person_scaled") return "per-person fare scaled to total travelers";
-  if (normalized === "base_per_adult_scaled_converted") {
-    return "base fare scaled to adults and converted";
-  }
   if (normalized === "displayed") return "provider displayed fare";
   if (normalized === "missing_price") return "missing provider price";
   return normalized.replaceAll("_", " ");
@@ -1075,14 +1039,6 @@ function buildPdfReportHtml() {
     payload.max_connection_layover_hours && Number(payload.max_connection_layover_hours) > 0
       ? `${payload.max_connection_layover_hours}h`
       : "No cap";
-  const timeWindowSummary = payload.flight_time_windows_enabled
-    ? [
-        `out dep ${payload.outbound_departure_time_start || "00:00"}-${payload.outbound_departure_time_end || "00:00"}`,
-        `out arr ${payload.outbound_arrival_time_start || "00:00"}-${payload.outbound_arrival_time_end || "00:00"}`,
-        `return dep ${payload.return_departure_time_start || "00:00"}-${payload.return_departure_time_end || "00:00"}`,
-        `return arr ${payload.return_arrival_time_start || "00:00"}-${payload.return_arrival_time_end || "00:00"}`,
-      ].join(", ")
-    : "Off (24h search)";
   const criteria = [
     ["Origins", (payload.origins || []).join(", ") || "N/A"],
     ["Destinations", (payload.destinations || []).join(", ") || "N/A"],
@@ -1093,7 +1049,6 @@ function buildPdfReportHtml() {
     ["Rank by", objectiveLabels[payload.objective] || payload.objective || "Cheapest"],
     ["Max transfers/direction", payload.max_transfers_per_direction ?? "N/A"],
     ["Max connection layover", maxConnLayover],
-    ["Flight time windows", timeWindowSummary],
     [
       "Baggage profile",
       `${payload.passengers?.adults || 1} adult(s), cabin ${payload.passengers?.hand_bags || 0}, hold ${
@@ -1425,25 +1380,6 @@ function resolveWholeTripUrl(item, legs, comparisonLinks) {
   return legUrl || kiwiUrl || googleUrl || skyscannerUrl || kayakUrl || momondoUrl;
 }
 
-function formatProviderQuoteSummary(quotes, options = {}) {
-  if (!Array.isArray(quotes) || quotes.length < 2) return "";
-  const limit = Number.isFinite(Number(options.limit)) ? Math.max(1, Number(options.limit)) : 4;
-  const items = quotes.slice(0, limit).map((quote) => {
-    const provider = String(quote?.provider || "provider").toUpperCase();
-    const formatted =
-      quote?.formatted_price ||
-      (Number.isFinite(Number(quote?.price))
-        ? formatMoney(Number(quote.price), quote.currency || "")
-        : "N/A");
-    const selected = quote?.selected ? " selected" : "";
-    return `${provider} ${formatted}${selected}`;
-  });
-  if (quotes.length > limit) {
-    items.push(`+${quotes.length - limit} more`);
-  }
-  return items.join(" | ");
-}
-
 function renderLeg(leg, options = {}) {
   const showLink = options.showLink !== false;
   const bookingUrl = leg.booking_url || options.fallbackUrl || "https://www.kiwi.com/en/search/results/";
@@ -1485,10 +1421,6 @@ function renderLeg(leg, options = {}) {
     if (inboundLayovers.length > 0) {
       legDetails.push(`Inbound layovers: ${inboundLayovers.join(", ")}`);
     }
-    const providerQuoteSummary = formatProviderQuoteSummary(leg.provider_quotes);
-    if (providerQuoteSummary) {
-      legDetails.push(`Other provider quotes: ${providerQuoteSummary}`);
-    }
     node.querySelector(".leg-segments").textContent = legDetails.join("\n");
   } else {
     const route = `${leg.source} -> ${leg.destination} (${formatDateLabel(leg.date)})`;
@@ -1516,10 +1448,6 @@ function renderLeg(leg, options = {}) {
     const legDetails = [segmentText || "No segment details"];
     if (layovers.length > 0) {
       legDetails.push(`Layovers: ${layovers.join(", ")}`);
-    }
-    const providerQuoteSummary = formatProviderQuoteSummary(leg.provider_quotes);
-    if (providerQuoteSummary) {
-      legDetails.push(`Other provider quotes: ${providerQuoteSummary}`);
     }
     node.querySelector(".leg-segments").textContent = legDetails.join("\n");
   }
@@ -1618,13 +1546,6 @@ function renderResultCard(item) {
   const providerLine = fareProviders.length > 0
     ? `Fare provider(s): ${fareProviders.join(", ")}.`
     : "Fare provider(s): unknown.";
-  const wholeTripQuoteLine = formatProviderQuoteSummary(item.provider_quotes)
-    ? `Whole-trip provider quotes: ${formatProviderQuoteSummary(item.provider_quotes)}.`
-    : "";
-  const visibleQuoteCountLine = Number.isFinite(Number(item.provider_quote_count)) &&
-      Number(item.provider_quote_count) > 0
-    ? `Visible provider quotes retained: ${item.provider_quote_count}.`
-    : "";
   const adults = Number.parseInt(
     item.passengers_adults ?? lastSearchPayload?.passengers?.adults ?? 1,
     10,
@@ -1653,8 +1574,6 @@ function renderResultCard(item) {
     stayLine,
     fareModeLine,
     providerLine,
-    wholeTripQuoteLine,
-    visibleQuoteCountLine,
     perAdultLine,
     priceModeLine,
     pricingStrategyLine,
@@ -1894,21 +1813,12 @@ function collectPayload() {
     max_stopover_days: asInt("max-stopover"),
     max_connection_layover_hours: asInt("max-connection-layover-hours"),
     max_transfers_per_direction: maxTransfers,
-    flight_time_windows_enabled: timeWindowsEnabled(),
-    outbound_departure_time_start: timeWindowValue("outbound-departure-time-start"),
-    outbound_departure_time_end: timeWindowValue("outbound-departure-time-end"),
-    outbound_arrival_time_start: timeWindowValue("outbound-arrival-time-start"),
-    outbound_arrival_time_end: timeWindowValue("outbound-arrival-time-end"),
-    return_departure_time_start: timeWindowValue("return-departure-time-start"),
-    return_departure_time_end: timeWindowValue("return-departure-time-end"),
-    return_arrival_time_start: timeWindowValue("return-arrival-time-start"),
-    return_arrival_time_end: timeWindowValue("return-arrival-time-end"),
     // Backward-compatible keys consumed by older server builds:
     max_stops_per_leg: maxTransfers,
     max_layovers_per_direction: maxTransfers,
     currency: document.getElementById("currency").value,
     objective: document.getElementById("objective").value,
-    market_compare_fares: false,
+    market_compare_fares: document.getElementById("market-compare-fares").checked,
     top_results: asInt("top-results"),
     validate_top_per_destination: asInt("validate-top"),
     auto_hubs_per_direction: asInt("auto-hubs"),
@@ -2048,17 +1958,10 @@ async function runSearch(event) {
       const engine = meta?.engine || {};
       const maxConnHours = engine.max_connection_layover_hours;
       const filteredByConnection = engine.filtered_by_connection_layover || 0;
-      const filteredByTimeWindow = engine.filtered_by_time_window || 0;
       if (filteredByConnection > 0 && maxConnHours != null) {
         hints.push(
           `${filteredByConnection} itineraries were removed by max connection layover ${maxConnHours}h. ` +
           "Increase this cap or set 0 (no cap).",
-        );
-      }
-      if (filteredByTimeWindow > 0) {
-        hints.push(
-          `${filteredByTimeWindow} itineraries were removed by departure/arrival time windows. ` +
-          "Set all time windows to 00:00-00:00 to disable time filtering.",
         );
       }
       if (meta?.period_start && meta?.period_end) {
@@ -2105,16 +2008,19 @@ async function runSearch(event) {
     const budgetTotal = budgetMeta.max_total_calls == null
       ? "no cap"
       : `${budgetMeta.used_total_calls || 0}/${budgetMeta.max_total_calls}`;
+    const marketCompareLabel = meta.engine?.market_compare_fares ? "ON" : "OFF";
     const engineInfo = meta.engine
       ? `Engine: IO workers ${meta.engine.io_workers}, CPU workers ${cpuWorkersLabel}, ` +
         `hub pool ${hubPoolLabel}, ` +
         `providers requested ${providersRequestedLabel}, active ${providersActiveLabel}, used ${providersUsedLabel}, ` +
         `provider API budget ${budgetTotal}, ` +
+        `market compare ${marketCompareLabel}, ` +
         `exhaustive hubs ${meta.engine.exhaustive_hub_scan ? "ON" : "OFF"}, ` +
         `calendar hubs ${meta.engine.calendar_hubs_prefetched ?? "N/A"}, ` +
         `calendar routes ${meta.engine.calendar_routes_prefetched}, ` +
         `one-way legs ${meta.engine.oneway_legs_requested}, ` +
         `round-trip itineraries ${meta.engine.roundtrip_itineraries_requested ?? 0}, ` +
+        `base-fare selections ${meta.engine.base_fare_selected_returns ?? 0} RT / ${meta.engine.base_fare_selected_oneways ?? 0} OW, ` +
         `max connection layover ${maxConnectionLayoverLabel}, ` +
         `filtered by connection cap ${meta.engine.filtered_by_connection_layover ?? 0}, ` +
         `long-stopover results ${meta.engine.long_stopover_results ?? 0}.`
@@ -2221,10 +2127,8 @@ seedDates();
 resetProgressDisplay();
 loadPresets();
 syncAutoHubControls();
-syncTimeWindowControls();
 document.getElementById("exhaustive-hubs").addEventListener("change", syncAutoHubControls);
 document.getElementById("hub-candidates").addEventListener("input", syncAutoHubControls);
-document.getElementById("enable-time-windows").addEventListener("change", syncTimeWindowControls);
 if (applyProviderKeysBtn) {
   applyProviderKeysBtn.addEventListener("click", applyProviderKeys);
 }

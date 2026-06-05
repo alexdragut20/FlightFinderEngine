@@ -134,22 +134,6 @@ def test_run_job_marks_completion_and_failure() -> None:
     assert store._jobs["fail"].finished_at is not None
 
 
-def test_run_job_uses_non_empty_message_for_blank_exceptions() -> None:
-    store = SearchJobStore()
-    failure = SearchJob(job_id="fail", progress=SearchProgressTracker("fail"))
-    store._jobs = {"fail": failure}
-
-    class OptimizerFailure:
-        def search(self, config: object, search_id: str, progress: object) -> dict[str, object]:
-            raise MemoryError()
-
-    store._run_job(OptimizerFailure(), object(), "fail")
-
-    assert store._jobs["fail"].status == "failed"
-    assert store._jobs["fail"].error == "MemoryError"
-    assert store._jobs["fail"].finished_at is not None
-
-
 def test_run_job_returns_when_job_is_missing() -> None:
     store = SearchJobStore()
 

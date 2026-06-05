@@ -47,22 +47,6 @@ _FD_COUNT_CACHE_TS = 0.0
 _FD_COUNT_SAMPLE_INTERVAL_SECONDS = 1.0
 
 
-def exception_message(exc: BaseException) -> str:
-    """Return a stable human-readable message for an exception.
-
-    Args:
-        exc: Exception instance to describe.
-
-    Returns:
-        str: A non-empty message for the exception.
-    """
-    message = str(exc).strip()
-    if message:
-        return message
-    exc_type = type(exc).__name__.strip() or "Exception"
-    return exc_type
-
-
 def _response_capture_files() -> list[Path]:
     """Return the response capture files on disk.
 

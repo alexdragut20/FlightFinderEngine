@@ -32,14 +32,6 @@ class SearchConfig:
     max_stops_per_leg: int
     max_layovers_per_direction: int
     max_connection_layover_hours: int | None
-    outbound_departure_time_start: str
-    outbound_departure_time_end: str
-    outbound_arrival_time_start: str
-    outbound_arrival_time_end: str
-    return_departure_time_start: str
-    return_departure_time_end: str
-    return_arrival_time_start: str
-    return_arrival_time_end: str
     currency: str
     objective: str
     provider_ids: tuple[str, ...]

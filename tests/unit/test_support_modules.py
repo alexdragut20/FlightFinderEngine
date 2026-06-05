@@ -260,7 +260,6 @@ def test_airport_coordinates_loading_failures_cover_download_and_open_errors(
 
 def test_utils_cover_basic_normalization_and_ranges() -> None:
     assert utils_module.normalize_codes("otp; bbu,otp", ["OTP"]) == ("OTP", "BBU")
-    assert utils_module.normalize_codes("fara spatii jun 1 mru, MLE", ["OTP"]) == ("MLE",)
     assert utils_module.normalize_codes([], ["OTP"]) == ("OTP",)
     assert utils_module.normalize_provider_ids("all") == config_module.SUPPORTED_PROVIDER_IDS
     assert utils_module.normalize_provider_ids(["kiwi", "bad", "KIWI"]) == ("kiwi",)

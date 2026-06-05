@@ -360,93 +360,6 @@ def test_optimizer_runtime_helpers_cover_distances_names_and_best_value_scores(m
     assert results[0]["best_value_score"] < results[1]["best_value_score"]
 
 
-def test_attach_provider_quotes_to_results_keeps_visible_alternatives() -> None:
-    optimizer = SplitTripOptimizer(KiwiClient(), AirportCoordinates())
-    results = [
-        {
-            "itinerary_type": "direct_roundtrip",
-            "provider": "ryanair",
-            "total_price": 58,
-            "destination_code": "BGY",
-            "outbound": {"origin": "OTP", "date_from_origin": "2026-04-18"},
-            "inbound": {"date_from_destination": "2026-04-25"},
-            "legs": [
-                {
-                    "ticket_type": "roundtrip",
-                    "provider": "ryanair",
-                }
-            ],
-        },
-        {
-            "itinerary_type": "split_stopover",
-            "provider": "kiwi",
-            "total_price": 500,
-            "destination_code": "MAD",
-            "legs": [
-                {
-                    "source": "OTP",
-                    "destination": "MAD",
-                    "date": "2026-04-18",
-                    "price": 121,
-                    "provider": "ryanair",
-                },
-                {
-                    "source": "MAD",
-                    "destination": "OTP",
-                    "date": "2026-04-25",
-                    "price": 194,
-                    "provider": "ryanair",
-                },
-            ],
-        },
-    ]
-    summary = optimizer._attach_provider_quotes_to_results(
-        results,
-        oneway_quotes={
-            ("OTP", "MAD", "2026-04-18"): optimizer._sorted_provider_quotes(
-                [
-                    {"provider": "kiwi", "price": 200, "formatted_price": "200 EUR"},
-                    {"provider": "ryanair", "price": 121, "formatted_price": "121 EUR"},
-                ]
-            ),
-            ("MAD", "OTP", "2026-04-25"): optimizer._sorted_provider_quotes(
-                [
-                    {"provider": "kiwi", "price": 493, "formatted_price": "493 EUR"},
-                    {"provider": "ryanair", "price": 194, "formatted_price": "194 EUR"},
-                ]
-            ),
-        },
-        return_quotes={
-            ("OTP", "BGY", "2026-04-18", "2026-04-25"): optimizer._sorted_provider_quotes(
-                [
-                    {"provider": "kiwi", "price": 190, "formatted_price": "190 EUR"},
-                    {"provider": "ryanair", "price": 58, "formatted_price": "58 EUR"},
-                ]
-            )
-        },
-    )
-
-    assert summary["results_with_quotes"] == 2
-    assert summary["total_quote_entries"] == 6
-    assert summary["providers"] == ["kiwi", "ryanair"]
-
-    direct_quotes = results[0]["provider_quotes"]
-    assert len(direct_quotes) == 2
-    assert [quote["provider"] for quote in direct_quotes] == ["ryanair", "kiwi"]
-    assert direct_quotes[0]["selected"] is True
-    assert direct_quotes[1]["selected"] is False
-    assert results[0]["provider_quote_count"] == 2
-
-    outbound_quotes = results[1]["legs"][0]["provider_quotes"]
-    inbound_quotes = results[1]["legs"][1]["provider_quotes"]
-    assert len(outbound_quotes) == 2
-    assert len(inbound_quotes) == 2
-    assert outbound_quotes[0]["provider"] == "ryanair"
-    assert outbound_quotes[0]["selected"] is True
-    assert inbound_quotes[1]["provider"] == "kiwi"
-    assert results[1]["provider_quote_count"] == 4
-
-
 def test_optimizer_validation_context_and_provider_fallback_helpers_cover_budget_paths() -> None:
     optimizer = SplitTripOptimizer(KiwiClient(), AirportCoordinates())
 
@@ -665,78 +578,6 @@ def test_optimizer_validation_context_and_provider_fallback_helpers_cover_budget
     filtered_ids = {item["result_id"] for item in filtered}
     assert removed == 2
     assert filtered_ids == {"direct-best", "split-kept"}
-
-
-def test_prepare_destination_validation_context_filters_unsupported_route_providers() -> None:
-    optimizer = SplitTripOptimizer(KiwiClient(), AirportCoordinates())
-
-    class _RouteProvider:
-        def __init__(self, provider_id: str, supported_routes: set[tuple[str, str]]) -> None:
-            self.provider_id = provider_id
-            self._supported_routes = set(supported_routes)
-
-        def _market_supported(self, source: str, destination: str) -> bool:
-            return (str(source), str(destination)) in self._supported_routes
-
-    optimizer.providers["azair"] = _RouteProvider("azair", {("OTP", "IST"), ("IST", "OTP")})
-    optimizer.providers["ryanair"] = _RouteProvider("ryanair", {("OTP", "BGY"), ("BGY", "OTP")})
-
-    config = optimizer.parse_search_config(
-        {
-            "origins": ["OTP"],
-            "destinations": ["USM"],
-            "providers": ["kiwi", "azair", "ryanair"],
-            "period_start": "2026-04-18",
-            "period_end": "2026-04-28",
-            "min_stay_days": 5,
-            "max_stay_days": 5,
-            "min_stopover_days": 1,
-            "max_stopover_days": 1,
-            "max_transfers_per_direction": 1,
-            "validate_top_per_destination": 8,
-            "cpu_workers": 1,
-        }
-    )
-    estimated_candidates = [
-        {
-            "candidate_type": "split_stopover",
-            "destination": "USM",
-            "origin": "OTP",
-            "arrival_origin": "OTP",
-            "outbound_hub": "BKK",
-            "inbound_hub": "BKK",
-            "depart_origin_date": "2026-04-18",
-            "depart_destination_date": "2026-04-19",
-            "leave_destination_date": "2026-04-23",
-            "return_origin_date": "2026-04-24",
-            "outbound_stopover_days": 1,
-            "inbound_stopover_days": 1,
-            "main_stay_days": 5,
-            "estimated_total": 1600,
-            "estimated_score": 1600.0,
-            "estimated_outbound_time_to_destination_seconds": 48_000,
-        }
-    ]
-
-    context, _warnings = optimizer._prepare_destination_validation_context(
-        destination="USM",
-        estimated_candidates=estimated_candidates,
-        config=config,
-        validation_target_per_destination=8,
-        origin_rank={"OTP": 0},
-        core_provider_ids=("kiwi", "azair", "ryanair"),
-        serpapi_active=False,
-    )
-
-    assert context["ordered_oneway_keys"]
-    assert all(
-        context["oneway_provider_map"][leg_key] == ("kiwi",)
-        for leg_key in context["ordered_oneway_keys"]
-    )
-    assert all(
-        context["return_provider_map"][return_key] == ("kiwi",)
-        for return_key in context["ordered_return_keys"]
-    )
 
 
 def test_prepare_destination_validation_context_preserves_price_floor_candidates_for_best_objective() -> (
@@ -1416,16 +1257,6 @@ def test_optimizer_async_fetch_and_search_wrapper_cover_base_compare_and_failure
     with pytest.raises(ValueError, match="boom"):
         optimizer.search(config, search_id="error-id", progress=error_progress)
     assert error_progress.snapshot()["status"] == "failed"
-
-    async def _blank_error_search_async(*_args, **_kwargs) -> dict[str, object]:
-        raise MemoryError()
-
-    blank_error_progress = SearchProgressTracker("search-blank-error")
-    monkeypatch.setattr(optimizer, "_search_async", _blank_error_search_async)
-    with pytest.raises(MemoryError):
-        optimizer.search(config, search_id="blank-error-id", progress=blank_error_progress)
-    assert blank_error_progress.snapshot()["status"] == "failed"
-    assert blank_error_progress.snapshot()["error"] == "MemoryError"
 
 
 def test_optimizer_search_async_covers_empty_finalize_and_mixed_itinerary_build_paths(
@@ -2726,9 +2557,9 @@ def test_optimizer_chunked_candidate_parallelism_and_progress_cover_chunk_schedu
 
         def __init__(self, max_workers: int, initializer=None, initargs=()) -> None:  # type: ignore[no-untyped-def]
             self.max_workers = max_workers
-            self.initializer = initializer
-            self.initargs = initargs
             self.shutdown_calls: list[tuple[bool, bool]] = []
+            if initializer is not None:
+                initializer(*initargs)
             self.__class__.created.append(self)
 
         def submit(self, fn, *args, **kwargs):  # type: ignore[no-untyped-def]
@@ -2832,387 +2663,9 @@ def test_optimizer_chunked_candidate_parallelism_and_progress_cover_chunk_schedu
     assert _FakeChunkProcessPool.created[0].max_workers == min(
         config.cpu_workers, len(captured_chunks)
     )
-    assert _FakeChunkProcessPool.created[0].initializer is None
-    assert _FakeChunkProcessPool.created[0].initargs == ()
     assert _FakeChunkProcessPool.created[0].shutdown_calls[-1] == (True, False)
     assert all("chunk_label" in chunk for chunk in captured_chunks)
     assert "candidate chunks" in progress.snapshot()["phase_detail"]
-
-
-def test_search_async_builds_direct_roundtrip_from_validated_oneways_when_return_missing(
-    monkeypatch,
-) -> None:
-    optimizer = SplitTripOptimizer(KiwiClient(), AirportCoordinates())
-
-    def seg(
-        source: str,
-        destination: str,
-        depart: str,
-        arrive: str,
-    ) -> dict[str, str]:
-        return {
-            "from": source,
-            "to": destination,
-            "depart_local": depart,
-            "arrive_local": arrive,
-        }
-
-    class _StatsOnlyClient:
-        active_provider_ids = ["kiwi"]
-
-        def stats_snapshot(self) -> dict[str, dict[str, int]]:
-            return {"budget": {}}
-
-        def health_snapshot(self) -> dict[str, object]:
-            return {
-                "providers": {
-                    "kiwi": {
-                        "provider_id": "kiwi",
-                        "status": "selected",
-                        "calls": 0,
-                        "blocked": 0,
-                        "selected": 0,
-                        "no_result": 0,
-                        "errors": 0,
-                        "skipped_budget": 0,
-                        "skipped_cooldown": 0,
-                        "cooldown_seconds": 0,
-                        "last_issue_type": None,
-                        "last_issue_message": None,
-                        "manual_search_url": None,
-                        "calendar_calls": 0,
-                        "calendar_selected": 0,
-                        "oneway_calls": 0,
-                        "oneway_selected": 0,
-                        "return_calls": 0,
-                        "return_selected": 0,
-                    }
-                },
-                "budget": {},
-            }
-
-    direct_candidate = {
-        "candidate_type": "direct_roundtrip",
-        "destination": "BGY",
-        "origin": "OTP",
-        "arrival_origin": "OTP",
-        "depart_origin_date": "2026-04-18",
-        "return_origin_date": "2026-04-25",
-        "main_stay_days": 7,
-        "estimated_total": 1220,
-        "estimated_score": 1220.0,
-        "estimated_outbound_time_to_destination_seconds": 7200,
-        "distance_basis_km": 1210.0,
-    }
-    built_oneway_map = {
-        ("OTP", "BGY", "2026-04-18"): {
-            "price": 560,
-            "formatted_price": "560 RON",
-            "currency": "RON",
-            "duration_seconds": 2 * 3600,
-            "stops": 0,
-            "transfer_events": 0,
-            "booking_url": "https://example.test/kiwi/out",
-            "segments": [seg("OTP", "BGY", "2026-04-18T08:00:00", "2026-04-18T10:00:00")],
-            "provider": "kiwi",
-            "fare_mode": "selected_bags",
-            "price_mode": "explicit_total",
-        },
-        ("BGY", "OTP", "2026-04-25"): {
-            "price": 610,
-            "formatted_price": "610 RON",
-            "currency": "RON",
-            "duration_seconds": 2 * 3600,
-            "stops": 1,
-            "transfer_events": 1,
-            "booking_url": "https://example.test/kiwi/in",
-            "segments": [
-                seg("BGY", "VIE", "2026-04-25T18:00:00", "2026-04-25T19:00:00"),
-                seg("VIE", "OTP", "2026-04-25T20:00:00", "2026-04-25T22:00:00"),
-            ],
-            "provider": "kiwi",
-            "fare_mode": "selected_bags",
-            "price_mode": "explicit_total",
-        },
-    }
-
-    config = optimizer.parse_search_config(
-        {
-            "origins": ["OTP"],
-            "destinations": ["BGY"],
-            "providers": ["kiwi"],
-            "period_start": "2026-04-18",
-            "period_end": "2026-04-25",
-            "min_stay_days": 7,
-            "max_stay_days": 7,
-            "max_transfers_per_direction": 1,
-            "max_connection_layover_hours": 24,
-            "top_results": 3,
-            "validate_top_per_destination": 4,
-            "market_compare_fares": False,
-            "io_workers": 2,
-            "cpu_workers": 1,
-        }
-    )
-
-    monkeypatch.setattr(
-        optimizer,
-        "_expand_route_graph_hub_candidates",
-        lambda cfg: (
-            cfg,
-            {
-                "hub_candidates_graph_applied": False,
-                "hub_candidates_graph_count": 0,
-                "hub_candidates_graph_available": True,
-                "hub_candidates_input_count": len(cfg.hub_candidates),
-                "hub_candidates_graph_source": "test",
-            },
-            [],
-        ),
-    )
-    monkeypatch.setattr(
-        optimizer,
-        "_build_search_client",
-        lambda cfg: (
-            _StatsOnlyClient(),
-            [{"id": "kiwi", "configured": True}],
-            [],
-        ),
-    )
-    monkeypatch.setattr(
-        optimizer,
-        "_fetch_calendars_parallel",
-        lambda *_args, **_kwargs: asyncio.sleep(0, result=({}, [])),
-    )
-    monkeypatch.setattr(
-        optimizer,
-        "_estimate_candidates_parallel",
-        lambda *_args, **_kwargs: asyncio.sleep(0, result={"BGY": [dict(direct_candidate)]}),
-    )
-    monkeypatch.setattr(
-        optimizer,
-        "_prepare_destination_validation_context",
-        lambda **_kwargs: (
-            {
-                "destination": "BGY",
-                "destination_name": "Bergamo",
-                "notes": {"note": "Direct fallback test."},
-                "limited_candidates": [
-                    {
-                        **direct_candidate,
-                        "_direct_return_key": ("OTP", "BGY", "2026-04-18", "2026-04-25"),
-                        "_leg_keys": (
-                            ("OTP", "BGY", "2026-04-18"),
-                            ("BGY", "OTP", "2026-04-25"),
-                        ),
-                    }
-                ],
-                "ordered_return_keys": [("OTP", "BGY", "2026-04-18", "2026-04-25")],
-                "ordered_oneway_keys": [
-                    ("OTP", "BGY", "2026-04-18"),
-                    ("BGY", "OTP", "2026-04-25"),
-                ],
-                "estimated_candidates_count": 1,
-                "validation_target": 1,
-                "oneway_provider_map": {
-                    ("OTP", "BGY", "2026-04-18"): ("kiwi",),
-                    ("BGY", "OTP", "2026-04-25"): ("kiwi",),
-                },
-                "return_provider_map": {
-                    ("OTP", "BGY", "2026-04-18", "2026-04-25"): ("kiwi",),
-                },
-            },
-            [],
-        ),
-    )
-    monkeypatch.setattr(
-        optimizer,
-        "_fetch_returns_parallel",
-        lambda *_args, **_kwargs: asyncio.sleep(0, result=({}, [], 0)),
-    )
-    monkeypatch.setattr(
-        optimizer,
-        "_fetch_oneways_parallel",
-        lambda *_args, **_kwargs: asyncio.sleep(0, result=(dict(built_oneway_map), [], 0)),
-    )
-
-    progress = SearchProgressTracker("direct-fallback")
-    with ThreadPoolExecutor(max_workers=2) as io_pool:
-        result = asyncio.run(
-            optimizer._search_async(
-                config,
-                io_pool,
-                search_id="direct-fallback",
-                progress=progress,
-            )
-        )
-
-    assert len(result["results"]) == 1
-    selected = result["results"][0]
-    assert selected["itinerary_type"] == "direct_roundtrip"
-    assert selected["pricing_strategy"] == "separate_oneways"
-    assert selected["total_price"] == 1170
-    assert selected["outbound"]["layovers_count"] == 0
-    assert selected["inbound"]["layovers_count"] == 1
-    assert len(selected["legs"]) == 2
-
-
-def test_optimizer_chunked_candidate_parallelism_retries_in_process_after_memory_error(
-    monkeypatch,
-) -> None:
-    optimizer = SplitTripOptimizer(KiwiClient(), AirportCoordinates())
-    captured_chunks: list[dict[str, object]] = []
-
-    class _FailingChunkProcessPool:
-        created: list[_FailingChunkProcessPool] = []
-
-        def __init__(self, max_workers: int) -> None:
-            self.max_workers = max_workers
-            self.shutdown_calls: list[tuple[bool, bool]] = []
-            self.__class__.created.append(self)
-
-        def submit(self, fn, *args, **kwargs):  # type: ignore[no-untyped-def]
-            future: Future = Future()
-            future.set_exception(MemoryError())
-            return future
-
-        def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
-            self.shutdown_calls.append((wait, cancel_futures))
-
-    def _fake_chunk_estimator(chunk: dict[str, object]) -> tuple[str, list[dict[str, object]]]:
-        captured_chunks.append(chunk)
-        destination = str(chunk["destination"])
-        return (
-            destination,
-            [
-                {
-                    "candidate_type": "direct_roundtrip",
-                    "destination": destination,
-                    "origin": "OTP",
-                    "arrival_origin": "OTP",
-                    "depart_origin_date": "2026-04-10",
-                    "return_origin_date": "2026-04-12",
-                    "estimated_total": 900,
-                    "distance_basis_km": 1000.0,
-                    "estimated_score": 900.0,
-                    "estimated_outbound_time_to_destination_seconds": 7200,
-                }
-            ],
-        )
-
-    monkeypatch.setattr(optimizer_module, "ProcessPoolExecutor", _FailingChunkProcessPool)
-    monkeypatch.setattr(optimizer_module, "_estimate_candidates_for_chunk", _fake_chunk_estimator)
-
-    progress = SearchProgressTracker("chunked-fallback")
-    progress.start_phase("candidates", total=2, detail="Scoring candidate pools.")
-    config = optimizer.parse_search_config(
-        {
-            "origins": ["OTP"],
-            "destinations": ["USM", "MGA"],
-            "period_start": "2026-04-10",
-            "period_end": "2026-04-15",
-            "cpu_workers": 8,
-        }
-    )
-    task_template = {
-        "origins": ["OTP"],
-        "outbound_hubs": ["IST"],
-        "inbound_hubs": ["IST"],
-        "period_start": "2026-04-10",
-        "period_end": "2026-04-15",
-        "min_stay_days": 1,
-        "max_stay_days": 1,
-        "min_stopover_days": 0,
-        "max_stopover_days": 0,
-        "objective": "cheapest",
-        "max_candidates": 10,
-        "max_direct_candidates": 4,
-        "max_transfers_per_direction": 1,
-        "origin_to_hub": {"OTP|IST": {"2026-04-10": 100}},
-        "hub_to_origin": {"IST|OTP": {"2026-04-12": 100}},
-        "hub_to_destination": {"IST": {"2026-04-11": 100}},
-        "destination_to_hub": {"IST": {"2026-04-12": 100}},
-        "hub_to_hub": {},
-        "origin_to_destination": {"OTP|USM": {"2026-04-10": 200}},
-        "destination_to_origin": {"USM|OTP": {"2026-04-12": 200}},
-        "destination_distance_map": {"OTP|USM": 1000.0},
-    }
-
-    results = asyncio.run(
-        optimizer._estimate_candidates_parallel(
-            [
-                {**task_template, "destination": "USM"},
-                {
-                    **task_template,
-                    "destination": "MGA",
-                    "origin_to_destination": {"OTP|MGA": {"2026-04-10": 220}},
-                    "destination_to_origin": {"MGA|OTP": {"2026-04-12": 220}},
-                    "destination_distance_map": {"OTP|MGA": 1200.0},
-                },
-            ],
-            config,
-            progress,
-        )
-    )
-
-    assert set(results) == {"USM", "MGA"}
-    assert _FailingChunkProcessPool.created[0].shutdown_calls[-1] == (False, True)
-    assert len(captured_chunks) >= 2
-    assert any(
-        "retrying in-process" in event["message"].lower() for event in progress.snapshot()["events"]
-    )
-
-
-def test_chunk_estimator_uses_chunk_payload_without_worker_cache() -> None:
-    fresh_task = {
-        "destination": "USM",
-        "origins": ["OTP"],
-        "outbound_hubs": ["IST"],
-        "inbound_hubs": ["IST"],
-        "date_keys": ["2026-04-10", "2026-04-11"],
-        "min_stay_days": 1,
-        "max_stay_days": 1,
-        "min_stopover_days": 0,
-        "max_stopover_days": 0,
-        "objective": "cheapest",
-        "max_candidates": 5,
-        "max_direct_candidates": 2,
-        "max_transfers_per_direction": 1,
-        "origin_to_hub": {},
-        "hub_to_origin": {},
-        "hub_to_destination": {},
-        "destination_to_hub": {},
-        "hub_to_hub": {},
-        "origin_to_destination": {("OTP", "USM"): (450, None)},
-        "destination_to_origin": {("USM", "OTP"): (None, 470)},
-        "destination_distance_map": {("OTP", "USM"): 1000.0},
-    }
-
-    destination, estimated = optimizer_module._estimate_candidates_for_chunk(
-        {
-            "task_id": "USM",
-            "destination": "USM",
-            "chunk_start_index": 0,
-            "chunk_end_index": 2,
-            "chunk_label": "2026-04-10..2026-04-11",
-            "base_task": fresh_task,
-        }
-    )
-
-    assert destination == "USM"
-    assert estimated
-    assert estimated[0]["estimated_total"] == 920
-
-    with pytest.raises(ValueError, match="Missing base candidate task payload"):
-        optimizer_module._estimate_candidates_for_chunk(
-            {
-                "task_id": "USM",
-                "destination": "USM",
-                "chunk_start_index": 0,
-                "chunk_end_index": 2,
-                "chunk_label": "2026-04-10..2026-04-11",
-            }
-        )
 
 
 def test_optimizer_free_provider_discovery_helpers_cover_sampling_seed_build_probe_and_run(
@@ -3270,25 +2723,10 @@ def test_optimizer_free_provider_discovery_helpers_cover_sampling_seed_build_pro
     )
 
     class _DiscoveryClient:
-        active_provider_ids = ["kiwi", "azair", "kayak", "momondo"]
+        active_provider_ids = ["kiwi", "kayak", "momondo"]
 
         def __init__(self) -> None:
             self._calls: dict[tuple[str, str, str], int] = {}
-            self._providers = {
-                "azair": type("_CalendarProvider", (), {"supports_calendar": True})(),
-                "kayak": type("_ExactProvider", (), {"supports_calendar": False})(),
-                "momondo": type("_ExactProvider", (), {"supports_calendar": False})(),
-            }
-
-        def provider_for_id(self, provider_id: str):  # type: ignore[no-untyped-def]
-            return self._providers.get(str(provider_id))
-
-        def get_calendar_prices(self, **kwargs):  # type: ignore[no-untyped-def]
-            if tuple(kwargs.get("provider_ids") or ()) != ("azair",):
-                return {}
-            if kwargs["source"] == "OTP" and kwargs["destination"] == "IST":
-                return {"2026-04-20": 130, "2026-04-21": 140}
-            return {}
 
         def get_best_oneway(self, **kwargs):  # type: ignore[no-untyped-def]
             source = kwargs["source"]
@@ -3311,7 +2749,7 @@ def test_optimizer_free_provider_discovery_helpers_cover_sampling_seed_build_pro
         discovered, warnings = asyncio.run(
             optimizer._probe_free_provider_discovery(
                 search_client=discovery_client,  # type: ignore[arg-type]
-                provider_ids=("azair", "kayak", "momondo"),
+                provider_ids=("kayak", "momondo"),
                 route_dates={
                     ("OTP", "IST"): ("2026-04-20", "2026-04-20", "2026-04-21"),
                     ("OTP", "LCA"): ("2026-04-20",),
@@ -3331,34 +2769,14 @@ def test_optimizer_free_provider_discovery_helpers_cover_sampling_seed_build_pro
                 io_pool=io_pool,
             )
         )
-        calendar_only_discovered, calendar_only_warnings = asyncio.run(
-            optimizer._probe_free_provider_discovery(
-                search_client=_DiscoveryClient(),  # type: ignore[arg-type]
-                provider_ids=("azair", "kayak", "momondo"),
-                route_dates={
-                    ("OTP", "IST"): ("2026-04-20",),
-                    ("OTP", "DXB"): ("2026-04-20",),
-                },
-                config=config,
-                io_pool=io_pool,
-                io_cap=2,
-                include_exact_providers=False,
-            )
-        )
-    assert discovered == {("OTP", "IST"): {"2026-04-20": 120, "2026-04-21": 140}}
+    assert discovered == {("OTP", "IST"): {"2026-04-20": 120}}
     assert any("OTP->DXB 2026-04-20" in warning for warning in warnings)
     assert empty_discovered == {}
     assert empty_warnings == []
-    assert calendar_only_discovered == {("OTP", "IST"): {"2026-04-20": 130, "2026-04-21": 140}}
-    assert calendar_only_warnings == []
 
     progress = SearchProgressTracker("free-discovery")
-    probe_provider_ids = []
-    probe_include_exact = []
 
     async def _fake_probe(**kwargs):  # type: ignore[no-untyped-def]
-        probe_provider_ids.append(tuple(kwargs.get("provider_ids") or ()))
-        probe_include_exact.append(bool(kwargs.get("include_exact_providers")))
         if kwargs["route_dates"]:
             return ({("OTP", "USM"): {"2026-04-20": 111}}, ["probe warning"])
         return ({}, [])
@@ -3394,8 +2812,6 @@ def test_optimizer_free_provider_discovery_helpers_cover_sampling_seed_build_pro
     assert metadata["USM"]["discovered_routes"] == 1
     assert metadata["USM"]["discovered_price_points"] == 1
     assert run_warnings == ["probe warning"]
-    assert probe_provider_ids == [("azair",)]
-    assert probe_include_exact == [False]
     messages = [event["message"] for event in progress.snapshot()["events"]]
     assert any("Free-provider discovery" in message for message in messages)
     assert any("USM: probing" in message for message in messages)
@@ -3415,15 +2831,7 @@ def test_optimizer_coverage_audit_helpers_cover_empty_and_success_paths(monkeypa
     )
 
     class _AuditClient:
-        active_provider_ids = ["kiwi", "azair", "kayak", "momondo"]
-        _providers = {
-            "azair": type("_CalendarProvider", (), {"supports_calendar": True})(),
-            "kayak": type("_ExactProvider", (), {"supports_calendar": False})(),
-            "momondo": type("_ExactProvider", (), {"supports_calendar": False})(),
-        }
-
-        def provider_for_id(self, provider_id: str):  # type: ignore[no-untyped-def]
-            return self._providers.get(str(provider_id))
+        active_provider_ids = ["kiwi", "kayak", "momondo"]
 
     with ThreadPoolExecutor(max_workers=2) as io_pool:
         empty_audit = asyncio.run(
@@ -3601,15 +3009,7 @@ def test_optimizer_whole_trip_discovery_helpers_promote_cheaper_bundle_fares() -
     )
 
     class _ReturnDiscoveryClient:
-        active_provider_ids = ["kiwi", "googleflights", "azair", "ryanair"]
-        _providers = {
-            "azair": type("_CalendarProvider", (), {"supports_calendar": True})(),
-            "googleflights": type("_ExactProvider", (), {"supports_calendar": False})(),
-            "ryanair": type("_CalendarProvider", (), {"supports_calendar": True})(),
-        }
-
-        def provider_for_id(self, provider_id: str):  # type: ignore[no-untyped-def]
-            return self._providers.get(str(provider_id))
+        active_provider_ids = ["kiwi", "googleflights"]
 
         def get_best_return(self, **kwargs):  # type: ignore[no-untyped-def]
             if kwargs["destination"] == "DXB":
@@ -3619,41 +3019,16 @@ def test_optimizer_whole_trip_discovery_helpers_promote_cheaper_bundle_fares() -
                 and kwargs["destination"] == "USM"
                 and kwargs["outbound_iso"] == "2026-04-20"
                 and kwargs["inbound_iso"] == "2026-04-25"
-                and tuple(kwargs.get("provider_ids") or ()) == ("googleflights",)
             ):
                 return {"price": 650, "provider": "googleflights", "formatted_price": "650 RON"}
             if (
-                kwargs["source"] == "OTP"
-                and kwargs["destination"] == "USM"
-                and kwargs["outbound_iso"] == "2026-04-20"
-                and kwargs["inbound_iso"] == "2026-04-25"
-            ):
-                return {"price": 610, "provider": "ryanair", "formatted_price": "610 RON"}
-            if (
                 kwargs["source"] == "BKK"
                 and kwargs["destination"] == "USM"
                 and kwargs["outbound_iso"] == "2026-04-21"
                 and kwargs["inbound_iso"] == "2026-04-24"
-                and tuple(kwargs.get("provider_ids") or ()) == ("googleflights",)
             ):
                 return {"price": 160, "provider": "googleflights", "formatted_price": "160 RON"}
-            if (
-                kwargs["source"] == "BKK"
-                and kwargs["destination"] == "USM"
-                and kwargs["outbound_iso"] == "2026-04-21"
-                and kwargs["inbound_iso"] == "2026-04-24"
-            ):
-                return {"price": 150, "provider": "ryanair", "formatted_price": "150 RON"}
             return None
-
-    class _SupportedRouteProvider:
-        def _market_supported(self, source: str, destination: str) -> bool:
-            return True
-
-    # Keep this unit test off live provider route graphs. The synthetic USM/BKK
-    # market is meant to exercise fast whole-trip discovery deterministically.
-    optimizer.providers["azair"] = _SupportedRouteProvider()
-    optimizer.providers["ryanair"] = _SupportedRouteProvider()
 
     with ThreadPoolExecutor(max_workers=2) as io_pool:
         discovered, warnings = asyncio.run(
@@ -3709,10 +3084,9 @@ def test_optimizer_whole_trip_discovery_helpers_promote_cheaper_bundle_fares() -
 
     assert run_warnings == []
     assert metadata["USM"]["improved_candidates"] == 2
-    assert metadata["USM"]["provider_ids"] == ["azair", "ryanair"]
-    assert metadata["USM"]["selected_providers"]["ryanair"] == 2
-    assert updated_estimates["USM"][0]["estimated_total"] == 610
-    assert updated_estimates["USM"][1]["estimated_total"] == 690
+    assert metadata["USM"]["selected_providers"]["googleflights"] == 2
+    assert updated_estimates["USM"][0]["estimated_total"] == 650
+    assert updated_estimates["USM"][1]["estimated_total"] == 700
     snapshot = progress.snapshot()
     assert (
         snapshot["runtime_data"]["whole_trip_discovery"]["destinations"][0]["destination"] == "USM"

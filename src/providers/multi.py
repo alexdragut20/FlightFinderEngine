@@ -101,13 +101,6 @@ class MultiProviderClient:
             str(getattr(provider, "provider_id", "") or "").lower() for provider in self.providers
         ]
 
-    def provider_for_id(self, provider_id: str) -> Any | None:
-        """Return the provider instance for a normalized provider identifier."""
-        normalized_provider_id = str(provider_id or "").strip().lower()
-        if not normalized_provider_id:
-            return None
-        return self._provider_by_id.get(normalized_provider_id)
-
     def _bump(self, bucket: str, provider_id: str, amount: int = 1) -> None:
         """Handle bump.
 
@@ -599,13 +592,13 @@ class MultiProviderClient:
         Returns:
             tuple[Any, ...]: Providers eligible for the current selection scope.
         """
-        if provider_ids is None:
+        if not provider_ids:
             return self.providers
         requested = {
             str(provider_id).strip().lower() for provider_id in provider_ids if provider_id
         }
         if not requested:
-            return ()
+            return self.providers
         return tuple(
             provider
             for provider in self.providers

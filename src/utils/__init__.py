@@ -42,7 +42,7 @@ def normalize_codes(value: Any, fallback: list[str]) -> tuple[str, ...]:
     out: list[str] = []
     for item in raw:
         code = str(item).strip().upper()
-        if not re.fullmatch(r"[A-Z0-9]{3}", code):
+        if not code:
             continue
         if code not in out:
             out.append(code)
