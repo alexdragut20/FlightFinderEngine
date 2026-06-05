@@ -19,11 +19,19 @@ from src.providers.travelpayouts import TravelpayoutsDataClient
 
 class _FakeResponse:
     def __init__(
-        self, payload: object, *, status_code: int = 200, headers: dict[str, str] | None = None
+        self,
+        payload: object,
+        *,
+        text: str = "",
+        status_code: int = 200,
+        headers: dict[str, str] | None = None,
+        url: str = "https://example.test/path",
     ):
         self._payload = payload
+        self.text = text
         self.status_code = status_code
         self.headers = headers or {}
+        self.url = url
 
     def json(self) -> object:
         if isinstance(self._payload, Exception):
@@ -952,6 +960,266 @@ def test_ryanair_client_parses_calendar_and_exact_fares() -> None:
     assert roundtrip["outbound_stops"] == 0
     assert roundtrip["inbound_stops"] == 0
     assert "dateIn=2026-04-25" in roundtrip["booking_url"]
+
+
+def test_travelpayouts_client_edge_paths_cover_errors_and_filters(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "src.providers.travelpayouts._capture_provider_response",
+        lambda *args, **kwargs: None,
+    )
+
+    unconfigured = TravelpayoutsDataClient(api_token="")
+    assert unconfigured.is_configured() is False
+    assert "API token" in str(unconfigured.configuration_hint())
+    with pytest.raises(RuntimeError, match="token is missing"):
+        unconfigured._request("/v3/prices_for_dates", {})
+
+    market_client = TravelpayoutsDataClient(api_token="token", market="RO")
+    assert market_client.configuration_hint() == "Cached fare data enabled for market ro."
+    assert market_client._session() is market_client._session()
+    assert TravelpayoutsDataClient._safe_json(_FakeResponse(["bad"])) == {}
+    assert TravelpayoutsDataClient._month_starts_between("2026-05-01", "2026-04-01") == ()
+    assert TravelpayoutsDataClient._absolute_aviasales_url("") is None
+    assert TravelpayoutsDataClient._absolute_aviasales_url("https://book.example") == (
+        "https://book.example"
+    )
+    assert TravelpayoutsDataClient._absolute_aviasales_url("search/OTP") == (
+        "https://www.aviasales.com/search/OTP"
+    )
+    assert TravelpayoutsDataClient._int_value({"bad": "x", "good": "42"}, "bad", "good") == 42
+    assert TravelpayoutsDataClient._int_value({"bad": "x"}, "bad") is None
+
+    http_error = TravelpayoutsDataClient(api_token="token")
+    http_error._session = lambda: _FakeSession(  # type: ignore[assignment]
+        get_responses=[_FakeResponse({"error": "quota"}, status_code=429)]
+    )
+    with pytest.raises(RuntimeError, match="quota"):
+        http_error._request("/v3/prices_for_dates", {})
+
+    success_false = TravelpayoutsDataClient(api_token="token")
+    success_false._session = lambda: _FakeSession(  # type: ignore[assignment]
+        get_responses=[_FakeResponse({"success": False, "error": "disabled"})]
+    )
+    with pytest.raises(RuntimeError, match="disabled"):
+        success_false._request("/v3/prices_for_dates", {})
+
+    data_dict = TravelpayoutsDataClient(api_token="token")
+    data_dict._session = lambda: _FakeSession(  # type: ignore[assignment]
+        get_responses=[_FakeResponse({"success": True, "data": {"price": 123}})]
+    )
+    assert data_dict._request("/v3/prices_for_dates", {}) == [{"price": 123}]
+
+    filtered = TravelpayoutsDataClient(api_token="token")
+    filtered._prices_for_dates_month = lambda *args, **kwargs: (  # type: ignore[assignment]
+        {"departure_at": "", "price": 100},
+        {"departure_at": "2026-04-09", "price": 100},
+        {"departure_at": "2026-04-10", "price": None},
+        {"departure_at": "2026-04-10", "price": 300, "transfers": 3},
+        {"departure_at": "2026-04-10", "price": 250, "number_of_changes": 1},
+        {"departure_at": "2026-04-10", "value": 240, "number_of_changes": 1},
+    )
+    assert filtered.get_calendar_prices(
+        "OTP", "FCO", "2026-04-10", "2026-04-11", "EUR", 1, 1, 0, 0
+    ) == {"2026-04-10": 240}
+
+    no_oneway = TravelpayoutsDataClient(api_token="token")
+    no_oneway._prices_for_dates_month = lambda *args, **kwargs: (  # type: ignore[assignment]
+        {"departure_at": "2026-04-11", "price": 10},
+        {"departure_at": "2026-04-10", "price": 20, "transfers": 3},
+        {"departure_at": "2026-04-10", "price": None},
+    )
+    with pytest.raises(ProviderNoResultError, match="no exact one-way"):
+        no_oneway.get_best_oneway("OTP", "FCO", "2026-04-10", "EUR", 1, 1, 0, 0)
+
+    no_return = TravelpayoutsDataClient(api_token="token")
+    no_return._prices_for_dates_month = lambda *args, **kwargs: (  # type: ignore[assignment]
+        {"departure_at": "2026-04-11", "return_at": "2026-04-17", "price": 10},
+        {"departure_at": "2026-04-10", "return_at": "2026-04-18", "price": 10},
+        {
+            "departure_at": "2026-04-10",
+            "return_at": "2026-04-17",
+            "price": 20,
+            "return_transfers": 3,
+        },
+        {"departure_at": "2026-04-10", "return_at": "2026-04-17", "price": None},
+    )
+    with pytest.raises(ProviderNoResultError, match="no exact round-trip"):
+        no_return.get_best_return("OTP", "FCO", "2026-04-10", "2026-04-17", "EUR", 1, 1, 0, 0)
+
+
+def test_azair_client_edge_paths_cover_helpers_and_no_result_branches(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "src.providers.azair._capture_provider_response",
+        lambda *args, **kwargs: None,
+    )
+
+    client = AzairScrapeClient(base_url="https://www.azair.eu")
+    assert client._session() is client._session()
+    assert client._coord_supported(None) is False
+    assert client._coord_supported((50.0, 20.0)) is True
+    assert client._airport_field("") == ""
+    assert client._parse_date_label("not a date") is None
+    assert client._parse_duration_seconds("") is None
+    assert client._parse_duration_seconds("45 m") == 2700
+    assert client._parse_duration_seconds("2 h") == 7200
+    assert client._parse_duration_seconds("2:15 h") == 8100
+    assert client._parse_stops("direct flight") == 0
+    assert client._parse_stops("7 h / 2 changes") == 2
+    assert client._absolute_url("") is None
+    assert client._absolute_url("https://book.example") == "https://book.example"
+    assert client._absolute_url("/azfin.php") == "https://www.azair.eu/azfin.php"
+    assert client._absolute_url("azfin.php") == "https://www.azair.eu/azfin.php"
+    assert client._sort_key({"price": 0, "duration_seconds": 0}) == (10**9, 0, 10**9)
+    assert (
+        client._parse_results(
+            '<div class="result "><span class="bp">0</span></div>', currency="EUR"
+        )
+        == ()
+    )
+
+    unsupported = AzairScrapeClient(base_url="https://www.azair.eu")
+    unsupported._market_supported = lambda *_args, **_kwargs: False  # type: ignore[assignment]
+    assert (
+        unsupported._search_results(
+            "OTP", "JFK", "2026-04-10", "2026-04-12", "EUR", 1, one_way=True, stay_nights=None
+        )
+        == ()
+    )
+    with pytest.raises(ProviderNoResultError, match="does not cover"):
+        unsupported.get_best_oneway("OTP", "JFK", "2026-04-10", "EUR", 1, 1, 0, 0)
+    with pytest.raises(ProviderNoResultError, match="does not cover"):
+        unsupported.get_best_return("OTP", "JFK", "2026-04-10", "2026-04-17", "EUR", 1, 1, 0, 0)
+
+    error_client = AzairScrapeClient(base_url="https://www.azair.eu")
+    error_client._market_supported = lambda *_args, **_kwargs: True  # type: ignore[assignment]
+    error_client._session = lambda: _FakeSession(  # type: ignore[assignment]
+        get_responses=[_FakeResponse({}, text="", status_code=503, url="https://azair.test/error")]
+    )
+    with pytest.raises(RuntimeError, match="HTTP 503"):
+        error_client._search_results(
+            "OTP", "FCO", "2026-04-10", "2026-04-12", "EUR", 1, one_way=True, stay_nights=None
+        )
+
+    no_exact = AzairScrapeClient(base_url="https://www.azair.eu")
+    no_exact._market_supported = lambda *_args, **_kwargs: True  # type: ignore[assignment]
+    no_exact._search_results = lambda *args, **kwargs: (  # type: ignore[assignment]
+        {"departure_iso": "2026-04-11", "price": 100},
+    )
+    with pytest.raises(ProviderNoResultError, match="no exact one-way"):
+        no_exact.get_best_oneway("OTP", "FCO", "2026-04-10", "EUR", 1, 1, 0, 0)
+
+    no_exact._search_results = lambda *args, **kwargs: (  # type: ignore[assignment]
+        {"outbound_iso": "2026-04-10", "inbound_iso": "2026-04-18", "price": 100},
+    )
+    with pytest.raises(ProviderNoResultError, match="no exact round-trip"):
+        no_exact.get_best_return("OTP", "FCO", "2026-04-10", "2026-04-17", "EUR", 1, 1, 0, 0)
+
+
+def test_ryanair_client_edge_paths_cover_errors_and_empty_markets(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "src.providers.ryanair._capture_provider_response",
+        lambda *args, **kwargs: None,
+    )
+
+    client = RyanairFareFinderClient(base_url="https://www.ryanair.com")
+    assert client._session() is client._session()
+    assert client._month_starts_between("2026-05-01", "2026-04-01") == ()
+    assert client._parse_duration_seconds(None, "2026-04-10T10:00:00") is None
+    assert client._parse_duration_seconds("bad", "2026-04-10T10:00:00") is None
+    assert client._parse_duration_seconds("2026-04-10T23:00:00", "2026-04-10T01:00:00") == 7200
+    assert client._price_int({"price": {}}) is None
+
+    invalid_json = RyanairFareFinderClient(base_url="https://www.ryanair.com")
+    invalid_json._session = lambda: _FakeSession(  # type: ignore[assignment]
+        get_responses=[_FakeResponse(ValueError("bad json"))]
+    )
+    with pytest.raises(RuntimeError, match="Invalid JSON"):
+        invalid_json._request_json("/api/test")
+
+    http_error = RyanairFareFinderClient(base_url="https://www.ryanair.com")
+    http_error._session = lambda: _FakeSession(  # type: ignore[assignment]
+        get_responses=[_FakeResponse({}, status_code=500)]
+    )
+    with pytest.raises(RuntimeError, match="HTTP 500"):
+        http_error._request_json("/api/test")
+
+    bad_routes = RyanairFareFinderClient(base_url="https://www.ryanair.com")
+    bad_routes._request_json = lambda *args, **kwargs: {"not": "a list"}  # type: ignore[assignment]
+    assert bad_routes._route_destinations("OTP") == ()
+    assert bad_routes._market_supported("", "BGY") is False
+
+    route_client = RyanairFareFinderClient(base_url="https://www.ryanair.com")
+    route_client._request_json = lambda *args, **kwargs: [  # type: ignore[assignment]
+        "bad",
+        {"arrivalAirport": "bad"},
+        {"arrivalAirport": {"code": ""}},
+        {"arrivalAirport": {"code": "BGY"}},
+        {"arrivalAirport": {"code": "BGY"}},
+    ]
+    assert route_client._route_destinations("OTP") == ("BGY",)
+
+    unsupported = RyanairFareFinderClient(base_url="https://www.ryanair.com")
+    unsupported._market_supported = lambda *_args, **_kwargs: False  # type: ignore[assignment]
+    assert unsupported._oneway_month("OTP", "JFK", "2026-04-01", "EUR") == ()
+    assert unsupported._return_month("OTP", "JFK", "2026-04-01", "2026-04-01", "EUR") == ((), ())
+    with pytest.raises(ProviderNoResultError, match="does not serve"):
+        unsupported.get_best_oneway("OTP", "JFK", "2026-04-10", "EUR", 1, 1, 0, 0)
+    with pytest.raises(ProviderNoResultError, match="does not serve"):
+        unsupported.get_best_return("OTP", "JFK", "2026-04-10", "2026-04-17", "EUR", 1, 1, 0, 0)
+
+    reverse_unsupported = RyanairFareFinderClient(base_url="https://www.ryanair.com")
+    reverse_unsupported._market_supported = lambda source, destination: destination == "BGY"  # type: ignore[assignment]
+    assert reverse_unsupported._return_month("OTP", "BGY", "2026-04-01", "2026-04-01", "EUR") == (
+        (),
+        (),
+    )
+    with pytest.raises(ProviderNoResultError, match="BGY->OTP"):
+        reverse_unsupported.get_best_return(
+            "OTP", "BGY", "2026-04-10", "2026-04-17", "EUR", 1, 1, 0, 0
+        )
+
+    non_dict_month = RyanairFareFinderClient(base_url="https://www.ryanair.com")
+    non_dict_month._market_supported = lambda *_args, **_kwargs: True  # type: ignore[assignment]
+    non_dict_month._request_json = lambda *args, **kwargs: []  # type: ignore[assignment]
+    assert non_dict_month._oneway_month("OTP", "BGY", "2026-04-01", "EUR") == ()
+    assert non_dict_month._return_month("OTP", "BGY", "2026-04-01", "2026-04-01", "EUR") == ((), ())
+
+    filtered = RyanairFareFinderClient(base_url="https://www.ryanair.com")
+    filtered._oneway_month = lambda *args, **kwargs: (  # type: ignore[assignment]
+        {"day": "", "price": {"value": 10}},
+        {"day": "2026-04-09", "price": {"value": 10}},
+        {"day": "2026-04-10", "price": {}},
+        {"day": "2026-04-10", "price": {"value": 50}},
+        {"day": "2026-04-10", "price": {"value": 40}},
+    )
+    assert filtered.get_calendar_prices(
+        "OTP", "BGY", "2026-04-10", "2026-04-11", "EUR", 1, 1, 0, 0
+    ) == {"2026-04-10": 40}
+
+    no_oneway = RyanairFareFinderClient(base_url="https://www.ryanair.com")
+    no_oneway._market_supported = lambda *_args, **_kwargs: True  # type: ignore[assignment]
+    no_oneway._oneway_month = lambda *args, **kwargs: (  # type: ignore[assignment]
+        {"day": "2026-04-11", "price": {"value": 10}},
+        {"day": "2026-04-10", "price": {}},
+    )
+    with pytest.raises(ProviderNoResultError, match="no exact one-way"):
+        no_oneway.get_best_oneway("OTP", "BGY", "2026-04-10", "EUR", 1, 1, 0, 0)
+
+    no_return = RyanairFareFinderClient(base_url="https://www.ryanair.com")
+    no_return._market_supported = lambda *_args, **_kwargs: True  # type: ignore[assignment]
+    no_return._return_month = lambda *args, **kwargs: (  # type: ignore[assignment]
+        ({"day": "2026-04-11", "price": {"value": 10}},),
+        ({"day": "2026-04-17", "price": {"value": 10}},),
+    )
+    with pytest.raises(ProviderNoResultError, match="no exact round-trip"):
+        no_return.get_best_return("OTP", "BGY", "2026-04-10", "2026-04-17", "EUR", 1, 1, 0, 0)
+
+    no_return._return_month = lambda *args, **kwargs: (  # type: ignore[assignment]
+        ({"day": "2026-04-10", "price": {}},),
+        ({"day": "2026-04-17", "price": {"value": 10}},),
+    )
+    with pytest.raises(ProviderNoResultError, match="no exact round-trip"):
+        no_return.get_best_return("OTP", "BGY", "2026-04-10", "2026-04-17", "EUR", 1, 1, 0, 0)
 
 
 def test_multi_provider_client_internal_selection_pause_and_tiebreak_paths(monkeypatch) -> None:
